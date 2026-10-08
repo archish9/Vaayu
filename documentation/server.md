@@ -714,10 +714,14 @@ DeepSeek-V4) that entry serves only a request that contains all of it, so a retr
 same request prefills in full. A request that continues from the partial reply is reused
 only if its history carries the reply exactly as far as the server got, which can be a
 token or more past what the client received. The entry a turn was reusing is **dropped**
-only when that turn ends in an error, and only on those models (a hybrid model's if a
-forward pass had already run, DeepSeek-V4's always): the next turn then prefills in full.
-On every other model a turn that ends in an error leaves the entry restored at the prefix
-it had reused.
+only when that turn ends in an error, and only on those models — always, because an
+interrupted forward pass can change their state without changing any length: the next
+turn then prefills in full. On every other model a turn that ends in an error puts the
+entry back, cut to the part of the prefix it had reused that every layer still holds —
+except a greedy request with prompt lookup on (the dense default), whose loop does not
+put it back, so the next turn prefills in full. With `MAX_BATCH_SIZE >= 2`, a batched
+turn that ends in an error can still store an inconsistent entry (a known open bug); keep
+the default of 1.
 
 ---
 

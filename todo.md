@@ -10,7 +10,7 @@ Status keys: `[ ]` pending · `[~]` in progress · `[!]` blocked · `[bug]` open
 Protocol: `CLAUDE.md` §6 (this ledger), §7 (all plans / RESULTS go in `docs/`, which is gitignored — so every row here
 carries its own numbers), §8 (every change must reach the server; say if it is banked).
 
-**Suite floor: `3815 passed, 26 skipped, 538 warnings`** (231.79 s, FOREGROUND, `main` at `e7c69ea`, 2026-10-08, S34 MERGED; first taken on the branch at `75c4278`, 242.38 s: +38 = `tests/test_one_length_cache.py` 27 + `tests/test_deepseek_v4_cache.py` 8 + `tests/test_deepseek_v4_engine.py` 3; before it **`3777 passed, 0 failed, 0 errors, 26 skipped`** (240.05 s, FOREGROUND, merged `main` `6c9a31f`, 2026-10-07, S33: +38 =
+**Suite floor: `3827 passed, 26 skipped, 538 warnings`** (229.62 s, FOREGROUND, branch `i4-remove-oom-retry` at `3defef1`, 2026-10-08, re-run by the controller, awaiting the USER's merge; +12 = `tests/test_oom_layer_is_not_retried.py` 9 + 4 new in `tests/test_prefix_restore_on_abort.py`, −1 deleted in `tests/test_oom_does_not_truncate_kv.py`; before it **`3815 passed, 26 skipped, 538 warnings`** (231.79 s, FOREGROUND, `main` at `e7c69ea`, 2026-10-08, S34 MERGED; first taken on the branch at `75c4278`, 242.38 s: +38 = `tests/test_one_length_cache.py` 27 + `tests/test_deepseek_v4_cache.py` 8 + `tests/test_deepseek_v4_engine.py` 3; before it **`3777 passed, 0 failed, 0 errors, 26 skipped`** (240.05 s, FOREGROUND, merged `main` `6c9a31f`, 2026-10-07, S33: +38 =
 `tests/test_s33_host_edits.py` 37 + 1 in `tests/test_docs_reporting.py`, and +1 skip = the new on-device test in
 `tests/test_server_smoke.py`; before it 3739 / 25 skipped at `b3404d3`, S29: +4 net in
 `tests/test_direct_io_choice.py`; before it 3735 at `6fd79fa`, S28: +51 = `tests/test_routing_sync.py` 13 +
@@ -75,7 +75,7 @@ closed accumulates in this file again.
 - **Earlier Qwen3-Next decode censuses (s7/row26/r36/s11 probes) repeated ONE request per arm** — that re-decodes
   what the warm arm loaded (S21 dry run: 480/480 VRAM-tier hits, 0 disk reads). Row 36's "disk = 0.42 % of a decode
   token" and S11's 15 reads/token come from that shape. **Any decode probe: a different prompt per arm.**
-- **DeepSeek-V4-Flash now has a cross-turn prefix cache (S34, 2026-10-08; MERGED `e7c69ea` the same day on the USER's word; final whole-branch review 2026-10-08: no Critical issue; the one open item, `[bug]` I4 under "DeepSeek-V4-Flash", is fixed NEXT in its own fresh session — the USER's decision at the merge).** The rule: only a turn that APPENDS to the previous one (it contains the whole previous prompt and reply) is served from the pool; anything else prefills in full. A turn that ends in an ERROR drops the entry; a cancelled / disconnected turn is stored at its partial reply, which a retry of the same request cannot use. Reuse needs `ENABLE_THINKING=False` (the default): none with thinking on (lead I3). Measured TTFT of the appending turns, pool ON vs OFF: **10.26 s vs 51.08 s at a 1.3-1.8k context, 11.33 s vs 165.00 s at 4.3-4.9k** (the 4k OFF figure is ONE turn); decode -0.72 % at the own RAM budget (+0.4 % without the slow first OFF arm — no measurable cost; not a speed-up) and -0.10 % at `BALLAST_GB=15`, inside the 5 % rule; turn 1 unchanged (~32.7 s at 1k, ~146 s at 4k). `RESULTS docs/2026-10-08-S34-deepseek-prefix-cache-RESULTS.md`.
+- **DeepSeek-V4-Flash now has a cross-turn prefix cache (S34, 2026-10-08; MERGED `e7c69ea` the same day on the USER's word; final whole-branch review 2026-10-08: no Critical issue; its one open item, `[bug]` I4, is CLOSED 2026-10-08 on branch `i4-remove-oom-retry`, awaiting the USER's merge; NEXT is S35, in its own fresh session).** The rule: only a turn that APPENDS to the previous one (it contains the whole previous prompt and reply) is served from the pool; anything else prefills in full. A turn that ends in an ERROR drops the entry; a cancelled / disconnected turn is stored at its partial reply, which a retry of the same request cannot use. Reuse needs `ENABLE_THINKING=False` (the default): none with thinking on (lead I3). Measured TTFT of the appending turns, pool ON vs OFF: **10.26 s vs 51.08 s at a 1.3-1.8k context, 11.33 s vs 165.00 s at 4.3-4.9k** (the 4k OFF figure is ONE turn); decode -0.72 % at the own RAM budget (+0.4 % without the slow first OFF arm — no measurable cost; not a speed-up) and -0.10 % at `BALLAST_GB=15`, inside the 5 % rule; turn 1 unchanged (~32.7 s at 1k, ~146 s at 4k). `RESULTS docs/2026-10-08-S34-deepseek-prefix-cache-RESULTS.md`.
 - **gpt-oss-20b** 67.1 / 79.1 / 129.1 ms/token at 2k / 8k / 30.7k (S18); **DeepSeek-V4-Flash** 1.78 tok/s (S15);
   **MiniMax-M2.7** (module-list, EXL3); **Llama-3.3-70B** (dense, streamed): **1.96 s/token** decode, TTFT 3.34 s on a
   short prompt (S29, 2026-10-07: O_DIRECT, the engine's own choice since S29; server knobs, prompt lookup on, 16
@@ -115,7 +115,7 @@ so B0 measured first would be priced in the mode about to change.
 S25.** The rest of S24's decisions — wiring `batched_generate`, the host-side levers, `fla`, the S20 VRAM-plan
 follow-up — move to **S26**, taken with S25's measured number. The reason, by the ordering rule: *(a)* it is the
 agent's model, *(b)* the largest single N=1 lever priced (≈ 1.5–2 s of a ~19 s agent turn if real), *(c)* days, and
-its answer decides a ≥ 1-week build either way. **S25 RAN 2026-10-05 and REFUTED S11-L7 (+5.56 %). S26 decided 2026-10-06 (below). S27 CLOSED 2026-10-06: nothing clears alone. S28 CLOSED 2026-10-07: KEEP, merged `6fd79fa` (HIT decode −5.94 ms/token, HIT turn −8.9 %). S29 CLOSED 2026-10-07: FIXED for dense, merged `b3404d3` (Llama-3.3-70B decode −21.0 %), gpt-oss stays buffered. S30 CLOSED 2026-10-07: PARKED by the USER (the batching design is backlog #37). S31 DECIDED 2026-10-07 (below). S32 CLOSED 2026-10-07: unflagged FAILS; flagged bundle-b STRADDLES 2.71–3.19 on the clean processes (bar 3.133; the 3-process 3.07–3.70 included p2's post-CUPTI probe artefact); the USER decided (below): S33-A0 = ≤1 h CUPTI confirmation, then S33 staged. S33-A0 CLOSED 2026-10-07: CONFIRMED, a probe artefact (one Kineto window makes every later graph replay 4.58× slower on the host; the server never profiles), so S32's clean price stands. S33 STAGE 1 CLOSED 2026-10-07: KEEP, merged `6c9a31f` (E1–E7; S = 4.727 ms/token of HIT decode against a bar of 3.133; HIT turn 16.84 → 15.65 s, −7.1 %). S33-C8b CLOSED 2026-10-08 by the USER: NOT BUILT, closed with S32's price (≤ 0.45–0.56 ms/token over the built E-edits, ≈ 0.8 % of a turn; hard ceiling 1.10–1.21, under the 3.133 bar; week-class on the shared loop). S34 CLOSED 2026-10-08: built, measured and gated on branch `s34-deepseek-prefix-cache` (appending turns: 1k TTFT 10.26 s vs 51.08 s, 4k 11.33 s vs 165.00 s (one turn); decode -0.72 % (+0.4 % without the slow first OFF arm — no measurable cost) / -0.10 %, inside the 5 % rule); MERGED `e7c69ea` 2026-10-08 on the USER's word (suite on `main`: 3815 passed, 26 skipped). Final whole-branch review 2026-10-08: no Critical issue (the server gate and the docs were fixed in its fix wave, test commit `5a920ee`). USER 2026-10-08, at the merge: "merge and fix bug in fresh session" → NEXT: `[bug]` I4 (a successful OOM retry pools a wrong one-length cache; under "DeepSeek-V4-Flash"), in its own fresh session. S35 (gpt-oss 47-m4, then the elastic tier) follows it, in its own fresh session, as already sequenced.**
+its answer decides a ≥ 1-week build either way. **S25 RAN 2026-10-05 and REFUTED S11-L7 (+5.56 %). S26 decided 2026-10-06 (below). S27 CLOSED 2026-10-06: nothing clears alone. S28 CLOSED 2026-10-07: KEEP, merged `6fd79fa` (HIT decode −5.94 ms/token, HIT turn −8.9 %). S29 CLOSED 2026-10-07: FIXED for dense, merged `b3404d3` (Llama-3.3-70B decode −21.0 %), gpt-oss stays buffered. S30 CLOSED 2026-10-07: PARKED by the USER (the batching design is backlog #37). S31 DECIDED 2026-10-07 (below). S32 CLOSED 2026-10-07: unflagged FAILS; flagged bundle-b STRADDLES 2.71–3.19 on the clean processes (bar 3.133; the 3-process 3.07–3.70 included p2's post-CUPTI probe artefact); the USER decided (below): S33-A0 = ≤1 h CUPTI confirmation, then S33 staged. S33-A0 CLOSED 2026-10-07: CONFIRMED, a probe artefact (one Kineto window makes every later graph replay 4.58× slower on the host; the server never profiles), so S32's clean price stands. S33 STAGE 1 CLOSED 2026-10-07: KEEP, merged `6c9a31f` (E1–E7; S = 4.727 ms/token of HIT decode against a bar of 3.133; HIT turn 16.84 → 15.65 s, −7.1 %). S33-C8b CLOSED 2026-10-08 by the USER: NOT BUILT, closed with S32's price (≤ 0.45–0.56 ms/token over the built E-edits, ≈ 0.8 % of a turn; hard ceiling 1.10–1.21, under the 3.133 bar; week-class on the shared loop). S34 CLOSED 2026-10-08: built, measured and gated on branch `s34-deepseek-prefix-cache` (appending turns: 1k TTFT 10.26 s vs 51.08 s, 4k 11.33 s vs 165.00 s (one turn); decode -0.72 % (+0.4 % without the slow first OFF arm — no measurable cost) / -0.10 %, inside the 5 % rule); MERGED `e7c69ea` 2026-10-08 on the USER's word (suite on `main`: 3815 passed, 26 skipped). Final whole-branch review 2026-10-08: no Critical issue (the server gate and the docs were fixed in its fix wave, test commit `5a920ee`). USER 2026-10-08, at the merge: "merge and fix bug in fresh session" → `[bug]` I4 (a successful OOM retry pools a wrong cache) CLOSED 2026-10-08: the retry is removed and the abort rule never pools a ragged or advanced-state cache, on branch `i4-remove-oom-retry` (`504fc19`, `3defef1`), awaiting the USER's merge. NEXT: S35 (gpt-oss 47-m4, then the elastic tier), in its own fresh session.**
 
 **USER rule (2026-10-05, end of the S25 session): every S-row runs in its OWN fresh session, S26 included.** A
 session that finishes its row updates this file and stops; it does not start the next row. S26 is a conversation:
@@ -217,7 +217,7 @@ the clean 0.45–0.56 ms/token before any build.
       coder → verify → tester → reviewer one at a time, so the only concurrency it could produce is deepagents' `task`
       tool fanning out inside one turn. Batching the agent's model would also give up Qwen3-Next's prefix cache (its
       top TTFT lever), and sdpa costs −4.1 %. The design, with inputs re-verified at `fc06d8b`, is backlog **#37**
-      (re-open when a client that sends concurrent requests targets Vaayu). Backlog #5, #6 and #33 re-open with it.
+      (re-open when a client that sends concurrent requests targets Vaayu). Backlog #5, #6, #33 and #38 re-open with it.
       §8: nothing built, so nothing banked. Full row: `todo-backlog.md` "Closed after the 2026-10-03 cleanup".
 
 - [x] **S31 — re-prioritise with the USER — ✅ DECIDED 2026-10-07.** The USER picked all four offered rows: S32
@@ -467,46 +467,13 @@ at HEAD before acting.
 Engine files were frozen for its fix wave, so nothing below is built. The items about the shared prefix store and the
 server are under "Engine-wide — reliability and minors".*
 
-- **[bug] I4 — NEXT, IN ITS OWN FRESH SESSION (USER 2026-10-08, at S34's merge: "merge and fix bug in fresh
-  session"; S34 itself is merged, `e7c69ea`): a SUCCESSFUL OOM retry in the layer loop pools a
-  silently wrong one-length cache.** `vaayu/vaayu_base.py:5965-6001`: on `torch.cuda.OutOfMemoryError` the layer loop
-  re-calls `layer(seq, **kwargs)`; the `start_pos` check (`:5961`) sits outside the loop and is not re-run. DeepSeek's
-  layer has already written the ring, the Compressor / Indexer state and `cumulative_length`
-  (`vaayu/model_code/deepseek_v4/modeling_deepseek_v4.py:1380-1392`) before the likely OOM sites (`sparse_attn`, the
-  MoE expert transfers). The reviewer's CPU check on a `DeepseekV4CacheLayer`: after a 512-token chunk's write,
-  `history(start_pos)` no longer equals what the first attempt read; a one-token step's ring is idempotent; by
-  reading, the overlap carry at `:1155-1156` is not idempotent on a block flush either. The mechanism PREDATES S34 (it
-  could corrupt the rest of one request); what S34 adds is persistence: the request completes, the cache is stored,
-  and every later appending turn inherits it. **Same hazard for a hybrid's recurrent state** (Qwen3-Next, pooled since
-  42-B). **Reachability UNCONFIRMED:** no `OOM on` line in any S34 log; the only one in all probe logs is a gpt-oss
-  limit run that did not recover. **Two fix shapes, the USER's choice:** (a) do not retry when the cache is
-  one-length — raise, so the abort rule drops the entry; (b) mark the request and skip the store. Not built in the
-  S34 branch: it is outside the approved spec's change list and it edits the layer loop every model runs — SHARED
-  INFRA, so every on-device gate re-runs (dense on both Llama, accumulator, server, prefix). To confirm before
-  building: force one OOM inside a DeepSeek layer on a multi-token chunk, let the retry succeed, and compare the
-  stored cache with a clean run's. Until a guard exists, a recovered mid-layer OOM on DeepSeek-V4 would poison that
-  session's later appending turns silently.
-  **Inputs gathered for that session (2026-10-08, `main` at `e7c69ea`; nothing built):** (1) the retry is the
-  `for _oom_retry in range(_MAX_OOM_RETRIES + 1)` loop at `vaayu_base.py:5965-6001`; a recovered retry prints
-  `[Vaayu] ⚠️ OOM on <layer> (attempt k/2). Clearing cache and retrying...` — grep that line to know one
-  happened. (2) The store is `_persist_and_store`, called at `vaayu_base.py:6358` after `super().generate`
-  returns (and at `:6649` / `:6802` in the speculative loop); the drop-on-error rule is `restore_on_abort`
-  (`vaayu/prefix_cache.py`), reached only from the `except BaseException` at `:6349`. (3) The model's flags are
-  `self._cache_is_one_length` and `self._cache_holds_recurrent_state` (`vaayu_base.py:4294-4302`, set by
-  `_refuse_unsupported_prefix_cache`; DeepSeek's override sets its own); the predicate is
-  `vaayu.batch.cache_is_one_length`. (4) The reviewer's CPU repro of the non-idempotent write is kept at
-  `plans/probes/s34_retry_check.py`; the finding's full text at `docs/2026-10-08-S34-final-review-findings.md`
-  (I4). (5) OPEN QUESTION, not read: is a PLAIN K/V cache safe under the same retry (does `update` append this
-  layer's K/V twice if the first attempt had written it before the OOM)? Answer it before scoping the guard to
-  one-length caches only. (6) Order of work: price reachability first (force one OOM inside a layer on a
-  multi-token chunk), settle (a) raise vs (b) skip-the-store with the USER, then build and re-run every gate —
-  it is the layer loop all models share.
+- [x] **I4 — ✅ CLOSED 2026-10-08: FIXED on branch `i4-remove-oom-retry` (`504fc19`, `3defef1`), awaiting the USER's merge to `main`.** The layer loop's OOM retry is removed: the first `torch.cuda.OutOfMemoryError` in a layer raises the lever-naming error, for every model (no layer's forward is idempotent, so a retry that succeeded answered from a cache the failed attempt had already written, and the pool kept it). Pre-fix, one injected OOM: Llama-3.2-1B 16/34 tensors wrong and the reply text changed (96-token replies: 34/34, text differs), Qwen3-Next 47-51/172, DeepSeek-V4 92/237. Post-fix on device (client retries the 500 once): 6 gated arms bitwise clean (B-vs-A 0 on every turn: 1B prefill t1, 1B t2 `LOOKUP=0`, 1B decode, Qwen L24, Qwen L23, DeepSeek L22 t1) and 3 reported arms whose retry is a full prefill, each equal bitwise to a COLD reference session (D-vs-B 0 on all turns: 1B default 0/34, Qwen L1 t2 0/172, DeepSeek L22 t2 0/237). Scope grew by ruling to Task 1b: two pre-existing `restore_on_abort` defects, found on device, fixed in `3defef1` (plain K/V entries stored RAGGED after a forward died inside a layer: 1B `LOOKUP=0` retry differed 15/34, `_seq_len` 121 x9 / 120 x7, now 0/34; hybrid entries restored with an advanced recurrent state at an unchanged KV length: Qwen L1 t2 95/172, now dropped and the retry equals a cold reference 0/172). Pool after an error: `generate()` crops a plain K/V entry and drops a hybrid / one-length entry; `speculative_generate` (the dense server default, prompt lookup ON) has no `restore_on_abort`, so the entry is LOST and the retry re-prefills (reuse lost, nothing corrupt; M2). Cost: a request the retry might have rescued now fails; no recovered retry is on record anywhere. Gates green (dense 1B + 70B, accumulator Qwen + MiniMax, server on 1B / Qwen / MiniMax / gpt-oss / DeepSeek, prefix 1B); dense gate ppl not captured this run (5/5 under the < 25 ceiling on both Llama); suite 3827 passed, 26 skipped. Batched turns (`MAX_BATCH_SIZE >= 2`) still store an inconsistent entry after an error: same defect, N>1-only, backlog #38. §8: no knob, n/a plumbing, reachable on every model at N=1 on the server default, SHIPPED on the branch. RESULTS `docs/2026-10-08-I4-oom-retry-RESULTS.md`; full row: `todo-backlog.md` "Closed after the 2026-10-03 cleanup".
 
 - **[bug] M2 — `USE_PROMPT_LOOKUP=True` is not refused on DeepSeek-V4**, though S34's spec §4.5 says speculative
   decoding stays refused there: `spec_recurrent_refusal` (`vaayu/batch.py:550`, called at
   `vaayu/vaayu_base.py:2935`) only knows recurrent state. The first partially rejected draft reaches
   `_trim_kv_cache` (`vaayu_base.py:6766`) and `crop` raises → a 500 / SSE error. Predates S34; what S34 adds is that
-  the checked-out pool entry is lost too (the speculative loop has no `restore_on_abort`). Not the default knob
+  the checked-out pool entry is lost too (the speculative loop has no `restore_on_abort`). Measured 2026-10-08 (I4, Task 2): on the dense default, prompt lookup ON, an error also LOSES the checked-out entry — the 1B `TURN=2` arm's client retry was a full prefill equal bitwise to a cold reference (D-vs-B 0/34). Not the default knob
   (`"auto"` resolves OFF on MoE). Fix: refuse a declared one-length cache in `spec_recurrent_refusal` (covers S35's
   window cache too), with a test; it touches speculative decoding, which S34's plan listed as do-not-touch.
 
@@ -710,7 +677,7 @@ arithmetic, not the repack.**
       fast path repeats the serial loop's view-building lines (the serial loop was to stay unedited).
 
 *From the S34 final whole-branch review (2026-10-08). Engine files were frozen for its fix wave, so nothing here is
-built; the DeepSeek-specific items (`[bug]` I4, `[bug]` M2, lead I3) are under "DeepSeek-V4-Flash".*
+built; the DeepSeek-specific items (`[bug]` M2, lead I3; I4 is closed) are under "DeepSeek-V4-Flash".*
 
 - **[bug] (cosmetic) M1 — the prefix pool's capacity WARNING advises `prefix_compress=9` on a pool whose entries
   refuse it.** `PrefixCacheStore._warn_over_capacity` (`vaayu/prefix_cache.py:241-244`) says "Set
@@ -751,6 +718,12 @@ built; the DeepSeek-specific items (`[bug]` I4, `[bug]` M2, lead I3) are under "
       are off by one ("prefill only 11 new positions" when 12 are fed), every cache class; `vaayu/vaayu_deepseek_v4.py`
       docstrings carry stale `vaayu_base.py` line numbers (`:3770`, `:2274`); and the same file's docstring (~`:86-87`)
       and comment (~`:108`) carry a ragged rewrap from S34 Task 2.
+- [ ] Minor (I4 final record, 2026-10-08; extend this bullet with any later I4 review minors): (a)
+      `tests/test_oom_does_not_truncate_kv.py:49` slices the source at the FIRST `except torch.cuda.OutOfMemoryError`
+      in forward, a source-text test that would silently pass if an earlier unrelated handler appeared (behaviour is now
+      pinned by `tests/test_oom_layer_is_not_retried.py`); (b) the `(... if hasattr(...) else None) or [...]` expression
+      in `restore_on_abort` (`vaayu/prefix_cache.py`) is dense; (c) no test covers a ragged cache where a LATER layer is
+      longer than layer 0 (covered only by the min over all lengths).
 
 *From the old STILL OPEN section.*
 
@@ -825,7 +798,9 @@ built; the DeepSeek-specific items (`[bug]` I4, `[bug]` M2, lead I3) are under "
       **Why it is not a quick follow-up regardless:** turning `warn` + `return None` into a raise on
       the module-list forward still needs that on-device MoE accumulator gate green AND a deliberate
       decision about raising mid-decode (today a dropped expert degrades output silently; a raise
-      would kill the request instead). Not started.
+      would kill the request instead). Not started. I4 (2026-10-08, USER) settled the layer loop's side of "raise
+      mid-decode vs degrade": an OOM there now raises. This row's H2D OOM is still swallowed (warn + `return None` →
+      the expert's contribution is silently dropped on the module-list forward), so the layer loop never sees it.
 
 - [ ] **Four deferred minors from A5.7c's final whole-branch review (2026-09-25). Recorded here
       because `docs/` is gitignored and the review document did not survive the workspace cleanup.**

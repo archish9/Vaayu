@@ -1227,7 +1227,7 @@ def _inject_no_cast(tensor, target, target_dtype, device, submod_path, base,
         ).view(target_dtype)
     except torch.cuda.OutOfMemoryError:
         # A transient VRAM shortage, not a packed-dtype defect: it must keep its
-        # own type so vaayu_base's isinstance-based OOM retry can still see it,
+        # own type so vaayu_base's isinstance-based OOM handler can still see it,
         # and so it is not reported as "the bytes are right, the engine is wrong".
         raise
     except Exception as e:

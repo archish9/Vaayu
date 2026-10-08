@@ -3,6 +3,7 @@
 lookup() POPS; store() only re-inserts after generate() returns. Without this,
 an aborted SSE stream drains the pool permanently.
 """
+import pytest
 import torch
 
 from vaayu.prefix_cache import PrefixCacheStore, restore_on_abort
@@ -116,8 +117,76 @@ def test_a_recurrent_cache_advanced_past_prefix_len_is_not_restored():
     assert len(s._pool) == 0
 
 
-def test_a_recurrent_cache_exactly_at_prefix_len_is_still_restored():
+# ── I4: a forward that died inside a layer leaves the KV layers RAGGED ──────
+#
+# Measured on device (Llama-3.2-1B, generate() path, OOM at the end of layer 8
+# on a HIT turn, 2026-10-08): the adopted cache held 87 positions (the stored
+# turn's last sampled token is never fed) against match_len 88, the failed
+# forward appended to layers 0-8 only, and restoring at
+# min(prefix_len, get_seq_length()) = 88 left layers 0-8 at 88 and 9-15 at 87.
+# The client's retry then answered from that entry: 15 of 34 cache tensors
+# differed from a clean session's.
+
+# (layers, kv heads, head dim) -- two contrasting plain-K/V geometries.
+_KV_GEOMETRIES = {"minimax-like": (62, 8, 128), "llama-3.2-1b-like": (16, 8, 64)}
+
+
+def _adopted_cache(layers, heads, head_dim, fed):
+    cache = FP8DynamicCache(quantize=False)
+    for i in range(layers):
+        k = torch.randn(1, heads, fed, head_dim)
+        cache.update(k, k.clone(), i)
+    return cache
+
+
+@pytest.mark.parametrize("geometry", sorted(_KV_GEOMETRIES))
+def test_a_forward_that_died_inside_a_layer_is_restored_at_a_length_every_layer_holds(geometry):
+    layers, heads, head_dim = _KV_GEOMETRIES[geometry]
+    fed, match_len, chunk = 7, 8, 5           # adopted one short of match_len, as on device
+    cache = _adopted_cache(layers, heads, head_dim, fed)
+    before = [cache.key_cache[i][..., :fed, :].clone() for i in range(layers)]
+    died_in = layers // 2
+    for i in range(died_in + 1):              # layers 0..died_in appended, the rest did not
+        k = torch.randn(1, heads, chunk, head_dim)
+        cache.update(k, k.clone(), i)
+    ids = list(range(100, 100 + fed + chunk))
+
     s = _store()
-    cache = _hybrid_cache_at(4)  # aborted before any forward past the prefix ran
-    assert restore_on_abort(s, "agent-a", list(range(4)), cache, prefix_len=4) is True
-    assert len(s._pool) == 1
+    assert restore_on_abort(s, "agent-a", ids, cache, prefix_len=match_len) is True
+
+    entry = s._pool["agent-a"]
+    assert entry.cache.kv_layer_lengths() == [fed] * layers, "a ragged entry was stored"
+    assert entry.token_ids == ids[:fed]
+    for i in range(layers):
+        assert torch.equal(entry.cache.key_cache[i][..., :fed, :], before[i])
+
+
+@pytest.mark.parametrize("geometry", sorted(_KV_GEOMETRIES))
+def test_a_forward_that_finished_every_layer_is_restored_at_the_whole_prefix(geometry):
+    layers, heads, head_dim = _KV_GEOMETRIES[geometry]
+    fed, match_len, chunk = 7, 8, 5
+    cache = _adopted_cache(layers, heads, head_dim, fed)
+    for i in range(layers):                   # e.g. the turn died in a later step
+        k = torch.randn(1, heads, chunk, head_dim)
+        cache.update(k, k.clone(), i)
+    ids = list(range(100, 100 + fed + chunk))
+
+    s = _store()
+    assert restore_on_abort(s, "agent-a", ids, cache, prefix_len=match_len) is True
+
+    entry = s._pool["agent-a"]
+    assert entry.cache.kv_layer_lengths() == [match_len] * layers
+    assert entry.token_ids == ids[:match_len]
+
+
+def test_a_recurrent_cache_is_dropped_even_at_an_unchanged_kv_length(capsys):
+    """A forward advances a linear-attention layer's state before any KV length
+    moves, so no length can vouch for it. Measured on device (Qwen3-Next, OOM at
+    the end of linear-attention layer 1 on a HIT turn, I4, 2026-10-08): every KV
+    length stayed at the adopted value, the old rule restored the entry, and the
+    client's retry diverged in 95 of 172 cache tensors."""
+    s = _store()
+    cache = _hybrid_cache_at(4)  # KV at the adopted length; state may have moved
+    assert restore_on_abort(s, "agent-a", list(range(4)), cache, prefix_len=4) is False
+    assert len(s._pool) == 0
+    assert "dropping the entry" in capsys.readouterr().out

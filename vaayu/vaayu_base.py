@@ -5962,66 +5962,66 @@ class VaayuBaseModel(GenerationMixin):
                                                                       layer=layer)
                             kwargs = {**_base, **_mask_args} if _mask_args else _base
 
-                            _MAX_OOM_RETRIES = 2
-                            layer_out = None
-                            for _oom_retry in range(_MAX_OOM_RETRIES + 1):
-                                try:
-                                    # Unreachable from __init__ (resolve_use_torch_compile refuses
-                                    # it, row 48); kept as the landing spot for a step-boundary fix.
-                                    # Setting the attribute after load still hits the row-48 crash.
-                                    if self.use_torch_compile:
-                                        if self._compiled_layer_fn is None:
-                                            self._compiled_layer_fn = torch.compile(
-                                                lambda m, x, **kw: m(x, **kw),
-                                                mode="reduce-overhead",
-                                                fullgraph=False,
-                                            )
-                                        _tl = time.perf_counter(); _t = time.time(); layer_out = self._compiled_layer_fn(layer, seq, **kwargs); _compute_s += time.time() - _t; _lt_compute_us += int((time.perf_counter() - _tl) * 1e6)
-                                    else:
-                                        _tl = time.perf_counter()
-                                        _t = time.time()
-                                        layer_out = (_dg.run(layer_name, layer, seq, kwargs) if _dg_on
-                                                     else layer(seq, **kwargs))
-                                        _compute_s += time.time() - _t
-                                        _lt_compute_us += int((time.perf_counter() - _tl) * 1e6)
-                                    break
-                                except torch.cuda.OutOfMemoryError as _oom_err:
-                                    if _oom_retry == _MAX_OOM_RETRIES:
-                                        raise RuntimeError(
-                                            f"CUDA OOM on {layer_name} after "
-                                            f"{_MAX_OOM_RETRIES} non-destructive retries "
-                                            f"(empty_cache + gc). The KV cache is NOT truncated "
-                                            f"to recover — see below. Reduce prefill_chunk_size, "
-                                            f"the batch width N, the context length, or the "
-                                            f"expert VRAM budget."
-                                        ) from _oom_err
-                                    print(f"[Vaayu] ⚠️ OOM on {layer_name} (attempt {_oom_retry + 1}/{_MAX_OOM_RETRIES}). "
-                                          f"Clearing cache and retrying...")
-                                    torch.cuda.empty_cache()
-                                    gc.collect()
-                                    # This handler used to halve the KV cache here
-                                    # (`_oom_seq_len // 2` + _trim_kv_cache_front) and retry.
-                                    # REMOVED 2026-08-09 -- it was the root cause of two
-                                    # mask/KV mismatches, both landing on exact `// 2`:
-                                    # F3 Task 6's unreproduced 1127-vs-1690 (563 = 1127 // 2)
-                                    # and Plan K's 7770-vs-3885 at N=3 x 7.7k.
-                                    #
-                                    # It is not merely a shape bug. crop_front drops the
-                                    # OLDEST tokens, so every survivor's position shifts
-                                    # relative to both the caller's attention mask and the
-                                    # RoPE positions already baked into the cached keys --
-                                    # and the caller is never told, so its mask still
-                                    # describes the full sequence. A run that "recovered"
-                                    # and completed had silently answered from a truncated,
-                                    # position-shifted context. Worse per-layer: the OOM
-                                    # lands at layer i, so layers before it keep the
-                                    # pre-crop length while later ones get post-crop plus
-                                    # the retried chunk, leaving _seq_len ragged.
-                                    #
-                                    # Silently shrinking the user's context to survive is
-                                    # the degradation CLAUDE.md §5 forbids, and D3 already
-                                    # settled that a VRAM wall must raise and name the real
-                                    # levers rather than fabricate a recovery.
+                            # An OOM here is NOT retried (I4, 2026-10-08). The
+                            # handler used to empty the CUDA cache and call the
+                            # layer again, up to twice. No layer's forward can run
+                            # twice: each writes this sequence's cache -- a K/V
+                            # append at the layer's current length, a hybrid's
+                            # recurrent state, DeepSeek-V4's ring and Compressor --
+                            # BEFORE the allocations that fail. A retry that
+                            # succeeded answered from a corrupt cache, and the
+                            # prefix pool kept it for the session's later turns
+                            # (measured through the server, one injected OOM:
+                            # Llama-3.2-1B 16 of 34 cache tensors wrong and the
+                            # reply text changed; Qwen3-Next and DeepSeek-V4 too).
+                            # Raising hands the request to the abort rule: generate()
+                            # puts a plain K/V pool entry back, cut to the reused prefix
+                            # every layer still holds, and drops a one-length one;
+                            # speculative_generate loses the entry; batched_generate's
+                            # store-back does not apply the rule yet (todo-backlog #38).
+                            try:
+                                # Unreachable from __init__ (resolve_use_torch_compile refuses
+                                # it, row 48); kept as the landing spot for a step-boundary fix.
+                                # Setting the attribute after load still hits the row-48 crash.
+                                if self.use_torch_compile:
+                                    if self._compiled_layer_fn is None:
+                                        self._compiled_layer_fn = torch.compile(
+                                            lambda m, x, **kw: m(x, **kw),
+                                            mode="reduce-overhead",
+                                            fullgraph=False,
+                                        )
+                                    _tl = time.perf_counter(); _t = time.time(); layer_out = self._compiled_layer_fn(layer, seq, **kwargs); _compute_s += time.time() - _t; _lt_compute_us += int((time.perf_counter() - _tl) * 1e6)
+                                else:
+                                    _tl = time.perf_counter()
+                                    _t = time.time()
+                                    layer_out = (_dg.run(layer_name, layer, seq, kwargs) if _dg_on
+                                                 else layer(seq, **kwargs))
+                                    _compute_s += time.time() - _t
+                                    _lt_compute_us += int((time.perf_counter() - _tl) * 1e6)
+                            except torch.cuda.OutOfMemoryError as _oom_err:
+                                # Nor is the KV cache truncated to make room. This
+                                # handler used to halve it (`_oom_seq_len // 2` +
+                                # _trim_kv_cache_front) and retry. REMOVED 2026-08-09
+                                # -- it was the root cause of two mask/KV mismatches,
+                                # both landing on exact `// 2`: F3 Task 6's
+                                # unreproduced 1127-vs-1690 (563 = 1127 // 2) and
+                                # Plan K's 7770-vs-3885 at N=3 x 7.7k. crop_front
+                                # drops the OLDEST tokens, so every survivor's position
+                                # shifts against both the caller's attention mask and
+                                # the RoPE positions baked into the cached keys, and
+                                # the caller is never told. Silently shrinking the
+                                # user's context to survive is the degradation
+                                # CLAUDE.md §5 forbids, and D3 already settled that a
+                                # VRAM wall must raise and name the real levers rather
+                                # than fabricate a recovery.
+                                raise RuntimeError(
+                                    f"CUDA OOM on {layer_name}. Not retried: the layer "
+                                    f"had already written this sequence's cache, so a "
+                                    f"second run would corrupt it; the KV cache is not "
+                                    f"truncated to make room either. Reduce "
+                                    f"prefill_chunk_size, the batch width N, the context "
+                                    f"length, or the expert VRAM budget."
+                                ) from _oom_err
                             new_seq = layer_out[0] if isinstance(layer_out, tuple) else layer_out
 
                             batch[j] = new_seq
