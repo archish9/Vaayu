@@ -3052,17 +3052,13 @@ class VaayuBaseModel(GenerationMixin):
             # sessions we intend to guarantee is subtracted first. Measured
             # 2026-08-16 on Qwen3-235B: raising the stale 8.5 GiB literal took
             # the warm wall 36.6 -> 27.3 s with prefix reuse unchanged at 83 %.
-            from .vram_plan import kv_bytes_per_token as _kv_per_tok
             try:
-                from .batch import kv_bearing_layer_count
-                _kv_tok = _kv_per_tok(
-                    num_hidden_layers=kv_bearing_layer_count(self),
-                    num_key_value_heads=getattr(self.config, "num_key_value_heads",
-                                                self.config.num_attention_heads),
-                    head_dim=getattr(self.config, "head_dim",
-                                     self.config.hidden_size
-                                     // self.config.num_attention_heads),
-                    kv_cache_mode=self.kv_cache_mode)
+                # The model's OWN KV cost per token (the figure the VRAM plan
+                # charges since S15 L-b), not the config formula inlined here
+                # before S34: a model whose cache is not a per-layer K/V stack
+                # overrides it, and the formula priced one such prefix session at
+                # 13x its real size. Unchanged for every model that does not.
+                _kv_tok = int(self.planned_kv_bytes_per_token()[0])
             except Exception:
                 _kv_tok = 0        # D3: a sizing helper must not become the crash
             _prefix_on = bool(getattr(self, "enable_prefix_cache", False))
@@ -3532,6 +3528,11 @@ class VaayuBaseModel(GenerationMixin):
                   "(linear-attention) layers and an on-disk record holds K/V only, "
                   "so a restored turn would run against a state that never saw the "
                   "persisted tokens. The in-RAM prefix cache still works (42-B).")
+        elif (getattr(self, "enable_kv_persist", False)
+                and getattr(self, "_cache_is_one_length", False)):
+            print("[KV] enable_kv_persist=True ignored: this model's KV cache is "
+                  "servable at one length only and is not the per-token K/V layout "
+                  "an on-disk record holds. The in-RAM prefix cache still works.")
         elif getattr(self, "enable_kv_persist", False):
             import shutil
             from .kv_persist import DiskWriter, KvDiskLoader
@@ -4291,11 +4292,14 @@ class VaayuBaseModel(GenerationMixin):
         # channels (disk persistence, TurboQuant pooling) read it, and it must
         # be False -- not absent -- when the prefix cache is off entirely.
         self._cache_holds_recurrent_state = False
+        self._cache_is_one_length = False
         if not getattr(self, "enable_prefix_cache", False):
             return
-        from .batch import cache_holds_recurrent_state, prefix_cache_refusal_reason
+        from .batch import (cache_holds_recurrent_state, cache_is_one_length,
+                            prefix_cache_refusal_reason)
         _probe = self._create_kv_cache()
         self._cache_holds_recurrent_state = cache_holds_recurrent_state(_probe)
+        self._cache_is_one_length = cache_is_one_length(_probe)
         _refusal = prefix_cache_refusal_reason(_probe, self.kv_cache_mode)
         if _refusal is not None:
             print(f"[Vaayu-Prefix] WARNING: cross-turn prefix cache DISABLED — "
@@ -6363,6 +6367,12 @@ class VaayuBaseModel(GenerationMixin):
                   "container carries K/V only, so a rebuilt entry would restore a "
                   "state that never saw the pooled tokens. Pooling uncompressed.")
             bits = None
+        elif bits is not None and getattr(self, "_cache_is_one_length", False):
+            print("[Vaayu-Prefix] WARNING: prefix_compress ignored on this model — "
+                  "its KV cache is servable at one length only and is not the "
+                  "per-token K/V layout the packed container carries. Pooling "
+                  "uncompressed.")
+            bits = None
         if bits is not None and bits < 9:
             print(f"[Vaayu-Prefix] WARNING: prefix_compress={bits} is below the 9 "
                   f"bits/channel that passes the quality gate on both on-device "
@@ -6931,6 +6941,15 @@ class VaayuBaseModel(GenerationMixin):
                       "(linear-attention) state -- skipping both the lookup and "
                       "the store-back for this batch; every stream prefills in "
                       "full.")
+                pc = None
+            elif pc is not None and getattr(self, "_cache_is_one_length", False):
+                # A declared one-length cache (S34) has no per-row K/V buffers to
+                # broadcast or splice either, and a lookup hit would pop its entry
+                # before that is discovered.
+                print("[Vaayu-Prefix] WARNING: batched_generate does not support "
+                      "the cross-turn prefix cache on a KV cache that is servable "
+                      "at one length only -- skipping both the lookup and the "
+                      "store-back for this batch; every stream prefills in full.")
                 pc = None
             common_ids = batch_common_prefix(requests) if pc is not None else []
             kv, m = (pc.lookup(None, common_ids, device=device)

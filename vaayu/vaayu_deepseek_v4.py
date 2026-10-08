@@ -80,10 +80,12 @@ class VaayuDeepseekV4(VaayuBaseModel):
         without constructing a probe cache (Task 6a: the base's own probe,
         `vaayu_base.py:3770`, constructs one via `_create_kv_cache` and
         crashes there -- `DeepseekV4Cache` is preallocated from `max_seq_len`,
-        which is still `None` at the point this runs). It still finds no
-        prefix-store surface on `DeepseekV4Cache`, warns once and clears the
-        flag; `kv_persist` then prints `ignored: enable_prefix_cache is False`
-        (`:3097`). That matters because a hard refusal here used to run FIRST
+        which is still `None` at the point this runs). Since S34 it finds the
+        prefix-store surface on `DeepseekV4Cache` and leaves the pool ON: the
+        cache declares itself servable at one length, so the store hands an
+        entry back only to a prompt that contains all of it, and `kv_persist`
+        prints that it is ignored for such a cache. A hard refusal here used
+        to run FIRST
         and make the prefix-cache check dead code on this path, which left the
         server's DEFAULT config (`ENABLE_PREFIX_CACHE = True`, passed
         unconditionally at `app.py:406`) unable to load this model at all.
@@ -100,10 +102,11 @@ class VaayuDeepseekV4(VaayuBaseModel):
         # own `_refuse_unsupported_prefix_cache` override (below) does it, by
         # detection against the CLASSES rather than by probing an instance --
         # see that method's docstring for why (Task 6a: the base's instance
-        # probe, vaayu_base.py:3770, crashes on this model). It finds no
-        # prefix-store surface on `DeepseekV4Cache`, prints one WARNING and
-        # clears the flag; `kv_persist` then prints `ignored:
-        # enable_prefix_cache is False` (`:3097`). A hard refusal here ran
+        # probe, vaayu_base.py:3770, crashes on this model). Since S34 it finds
+        # the prefix-store surface on `DeepseekV4Cache` and leaves the pool ON
+        # (a one-length cache: served only to a prompt that contains the whole
+        # entry); `kv_persist` prints that it is ignored for such a cache. A
+        # hard refusal here ran
         # FIRST and made that check dead code on this path, which meant the
         # server's DEFAULT config (`ENABLE_PREFIX_CACHE = True`, passed
         # unconditionally at `app.py:406`) could not load this model at all.
@@ -507,17 +510,19 @@ class VaayuDeepseekV4(VaayuBaseModel):
           are class-level (methods) or absent either way, so the class
           answers exactly as a real instance would.
 
-        If `DeepseekV4Cache` ever grows `to_cpu`/`to_device`/`resident_bytes`,
-        `cache_supports_prefix_store` starts returning `True` off the class
-        alone and this override starts ALLOWING prefix caching automatically
-        -- exactly as the base's instance probe would. Do not delete this as
+        Since S34 `DeepseekV4Cache` HAS `to_cpu`/`to_device`/`resident_bytes`,
+        so `cache_supports_prefix_store` returns `True` off the class alone and
+        this override ALLOWS prefix caching -- exactly as the base's instance
+        probe would. The WARNING below is what a checkpoint shipping modeling
+        code without those methods still gets. Do not delete this as
         redundant with the base: the base's own probe is unreachable here (it
         would raise before it could answer), which is the whole reason this
         override exists.
         """
         from types import SimpleNamespace
 
-        from .batch import cache_holds_recurrent_state, cache_supports_prefix_store
+        from .batch import (cache_holds_recurrent_state, cache_is_one_length,
+                            cache_supports_prefix_store)
 
         DeepseekV4Cache = self._running_symbol("DeepseekV4Cache")
         DeepseekV4CacheLayer = self._running_symbol("DeepseekV4CacheLayer")
@@ -528,6 +533,9 @@ class VaayuDeepseekV4(VaayuBaseModel):
         # absent, when the prefix cache is off entirely.
         self._cache_holds_recurrent_state = cache_holds_recurrent_state(
             SimpleNamespace(layers=[DeepseekV4CacheLayer]))
+        # False, not absent, when the pool is off -- the base's contract for
+        # its own copy of this flag (S34).
+        self._cache_is_one_length = False
         if not getattr(self, "enable_prefix_cache", False):
             return
         if not cache_supports_prefix_store(DeepseekV4Cache):
@@ -537,6 +545,11 @@ class VaayuDeepseekV4(VaayuBaseModel):
                   f"other cache layout to fall back to (kv_cache_mode is "
                   f"ignored for this model -- see _create_kv_cache above).")
             self.enable_prefix_cache = False
+            return
+        # Read off the CLASS, like the two answers above: the store serves this
+        # cache only at the one length it has reached, and the K/V-only side
+        # channels (disk persistence, TurboQuant pooling) refuse it.
+        self._cache_is_one_length = cache_is_one_length(DeepseekV4Cache)
 
     def generate(self, *args, **kwargs):
         """Seed a real `DeepseekV4Cache` before delegating, so the ordinary
@@ -549,8 +562,9 @@ class VaayuDeepseekV4(VaayuBaseModel):
 
         `VaayuBaseModel.generate` (`vaayu_base.py:5548`) only seeds
         `past_key_values` on the prefix-cache path; when `self._prefix_cache`
-        is `None` -- always true here, since `_refuse_unsupported_prefix_cache`
-        above force-disables it -- it delegates straight to `transformers`'
+        is `None` -- always true here before S34, when
+        `_refuse_unsupported_prefix_cache` above force-disabled it -- it
+        delegated straight to `transformers`'
         own `generate()` with no cache in `kwargs`. That manufactures a stock
         `DynamicCache` itself (`GenerationMixin._prepare_cache_for_generation`,
         `transformers/generation/utils.py:1898`) -- this is NOT specific to
@@ -568,12 +582,17 @@ class VaayuDeepseekV4(VaayuBaseModel):
         just silently ignoring `kv_cache_mode` the way it would for every
         other model.
 
-        A caller-supplied `past_key_values` wins -- this only fills the gap.
-        If `self._prefix_cache` is ever not `None` again in the future, the
-        base's own `pc.lookup()` miss path builds a fresh cache and
-        overwrites this one, so that path is untouched.
+        A caller-supplied `past_key_values` wins -- this only fills the gap,
+        and only when the pool is off. With the pool on (S34) the base's own
+        `pc.lookup()` either restores a pooled entry or builds a fresh cache,
+        and would overwrite anything seeded here.
         """
-        if kwargs.get("past_key_values") is None:
+        # Only when the pool is off (S34): with it on, the base either restores
+        # a pooled entry or builds a fresh cache itself, so seeding one here
+        # would allocate and zero a second preallocated cache per request and
+        # throw it away.
+        if (kwargs.get("past_key_values") is None
+                and getattr(self, "_prefix_cache", None) is None):
             kwargs["past_key_values"] = self._create_kv_cache()
         return super().generate(*args, **kwargs)
 

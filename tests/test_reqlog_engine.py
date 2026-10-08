@@ -333,7 +333,7 @@ def test_a_streamed_hit_row_carries_the_match_too(tmp_path):
 
 
 def test_a_model_with_no_prefix_pool_reports_zero_not_null(tmp_path):
-    """DeepSeek-V4 has no prefix cache; a dense load with it off has none either.
+    """A load with the prefix pool off (`KV_CACHE_MODE="fp16"`, or the flag) has none.
     An engine row is never null here -- null means "refused before generation"."""
     e = EngineHandle(M(), log_dir=tmp_path)
     asyncio.run(e.generate(_req()))

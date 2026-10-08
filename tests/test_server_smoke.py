@@ -18,6 +18,7 @@ cgroup cap (todo.md, "Never load a model twice in one pytest process").
 """
 import json
 import os
+import re
 
 import pytest
 
@@ -200,20 +201,74 @@ def test_oversized_prompt_refused(client):
     assert r.status_code == 400, r.text[:200]
 
 
-def test_prefix_reuse(client):
-    # ── 4. the prefix pool was exercised by the two identical turns ──
+def _prefix_counts(client):
+    """(hits, matched prompt tokens) off /health's prefix line; None when the
+    pool is off."""
     stats = client.get("/health").json()["prefix_cache"]
-    print(f"prefix cache: {stats}")
-    # Assert the PREMISE, not just the field: "stats is non-empty" passes
-    # even when the pool is disabled, which is how the first run of this
-    # gate reported green while prefix reuse was off entirely.
     if stats == "disabled":
-        # Expected only with an explicit KV_CACHE_MODE="fp16": the bare
-        # DynamicCache has no to_cpu/to_device/resident_bytes. Since row 3
-        # (2026-09-11) "auto" enables the pool on every loader.
-        print("  (pool disabled -- expected only with KV_CACHE_MODE='fp16', todo row 3)")
-    else:
-        assert "hits=0" not in stats, stats
+        return None
+    m = re.match(r"(\d+)hit/\d+miss/\d+evict .*saved=(\d+)/\d+ tok", stats)
+    assert m, f"unrecognised prefix stats line: {stats!r}"
+    return int(m.group(1)), int(m.group(2))
+
+
+def test_prefix_reuse(client):
+    # ── 4. a turn that EXTENDS the previous one is served from the prefix pool ──
+    # Until S34 this asserted `"hits=0" not in stats`, a substring the stats
+    # line never contains (it reads `0hit/1miss/...`), so it passed with zero
+    # hits. It also leaned on the two IDENTICAL turns above, which a cache
+    # servable at one length (a hybrid model's, DeepSeek-V4's) cannot serve:
+    # the stored entry is prompt + reply, and the same prompt does not contain
+    # the reply. So this runs its own session, sends a second turn that
+    # APPENDS to the first, and reads the pool's counters before and after.
+    if _prefix_counts(client) is None:
+        # A disabled pool passes ONLY when this server's own configuration
+        # asked for one: ENABLE_PREFIX_CACHE off, or an explicit
+        # KV_CACHE_MODE="fp16" (the bare DynamicCache has no
+        # to_cpu/to_device/resident_bytes; since row 3, 2026-09-11, "auto"
+        # enables the pool on every loader). Anything else is the engine
+        # switching the pool off at load by itself, which is a regression --
+        # and printing a note about it was a pass with nothing tested.
+        cfg = client.app.state.config
+        assert not cfg.enable_prefix_cache or cfg.kv_cache_mode == "fp16", (
+            f"the prefix pool is disabled although the server's configuration "
+            f"enables it (enable_prefix_cache={cfg.enable_prefix_cache}, "
+            f"kv_cache_mode={cfg.kv_cache_mode!r}). If the engine refused it at "
+            f"load, server.log has a '[Vaayu-Prefix] WARNING: cross-turn prefix "
+            f"cache DISABLED' line saying why")
+        print("  (pool disabled, as this server's configuration asked)")
+        return
+    first = dict(BODY, session_id="smoke-prefix", stream=False)
+    r = client.post("/v1/chat/completions", json=first)
+    assert r.status_code == 200, r.text[:200]
+    b = r.json()
+    reply = b["choices"][0]["message"].get("content") or ""
+    hits0, matched0 = _prefix_counts(client)
+    second = dict(first, messages=first["messages"] + [
+        {"role": "assistant", "content": reply},
+        {"role": "user", "content": "Now add a docstring to it."}])
+    r = client.post("/v1/chat/completions", json=second)
+    assert r.status_code == 200, r.text[:200]
+    hits1, matched1 = _prefix_counts(client)
+    prompt_tokens = b["usage"]["prompt_tokens"]
+    print(f"prefix reuse: hits {hits0} -> {hits1}, matched tokens {matched0} -> "
+          f"{matched1}, first prompt {prompt_tokens} tokens")
+    assert hits1 == hits0 + 1, (
+        f"the appending turn was not served from the pool: hits {hits0} -> {hits1}. "
+        f"{client.get('/health').json()['prefix_cache']}")
+    # A hit alone is not reuse: a named session whose context diverged still
+    # counts one with nothing matched. So the appending turn must also reuse
+    # MORE THAN HALF of the first prompt's tokens. Not the whole first prompt:
+    # a chat template may re-render the previous assistant header differently
+    # from the generation prompt the first turn ended with (MiniMax-M2.7's
+    # does: its generation prompt opens a think block that the history
+    # rendering of the same turn does not carry), so the common prefix can
+    # stop a few tokens short of the first prompt. That diverged session
+    # still fails this bar, because it matches almost nothing.
+    reused = matched1 - matched0
+    assert 2 * reused > prompt_tokens, (
+        f"the appending turn reused {reused} tokens, not more than half of the "
+        f"first turn's {prompt_tokens}-token prompt")
 
 
 def _run_dir():

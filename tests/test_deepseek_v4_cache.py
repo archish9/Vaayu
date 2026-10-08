@@ -235,3 +235,133 @@ def test_update_with_a_mismatched_chunk_dtype_does_not_corrupt_the_ring():
     layer.update(chunk, chunk, start_pos=0)
     assert layer.keys.dtype is torch.bfloat16
     assert layer.keys[0, :2, 0].tolist() == [3.5, 3.5]
+
+
+# ── S34: the surface Vaayu's prefix store drives ────────────────────────────
+
+_BUFFERS = ("keys", "kv_state", "score_state", "index_keys", "index_kv_state",
+            "index_score_state")
+
+
+def _filled(context: int = 256) -> "modeling.DeepseekV4Cache":
+    """A small cache whose every buffer holds distinct data, 200 tokens in."""
+    cache = build(context)
+    gen = torch.Generator().manual_seed(0)
+    for layer in cache.layers:
+        for name in _BUFFERS:
+            tensor = getattr(layer, name)
+            if tensor is not None:
+                tensor.copy_(torch.randn(tensor.shape, generator=gen))
+    cache.advance(200)
+    return cache
+
+
+def test_the_cache_carries_the_three_methods_the_prefix_store_drives():
+    """`VaayuDeepseekV4._refuse_unsupported_prefix_cache` asks the CLASS, since
+    no instance can exist that early in a load; an instance answers the same."""
+    from vaayu.batch import cache_supports_prefix_store
+    assert cache_supports_prefix_store(modeling.DeepseekV4Cache)
+    assert cache_supports_prefix_store(build(256))
+
+
+def test_the_cache_declares_itself_one_length():
+    """By declaration, not by recurrent state: the two kinds take different
+    paths on an aborted turn and print different refusals."""
+    from vaayu.batch import cache_holds_recurrent_state, cache_is_one_length
+    assert modeling.DeepseekV4Cache.is_one_length is True
+    assert cache_is_one_length(modeling.DeepseekV4Cache)
+    assert cache_is_one_length(build(256))
+    assert cache_holds_recurrent_state(build(256)) is False
+
+
+def test_parking_and_restoring_changes_no_byte_and_keeps_the_alias():
+    cache = _filled()
+    before = [{name: getattr(layer, name).clone() for name in _BUFFERS
+               if getattr(layer, name) is not None} for layer in cache.layers]
+    cache.to_cpu()
+    cache.to_device(torch.device("cpu"))
+    for layer, want in zip(cache.layers, before):
+        assert layer.values is layer.keys
+        assert layer.cumulative_length == 200
+        for name, tensor in want.items():
+            assert torch.equal(getattr(layer, name), tensor), name
+
+
+def test_to_cpu_and_to_device_ask_every_layer_for_the_right_move(monkeypatch):
+    """The cpu round trip above cannot tell a move from a no-op, nor
+    `to_device(device)` from one that ignores its argument, nor a blocking
+    copy from one that is not. Record what each layer is asked to do instead.
+
+    `to_cpu` must ask for a BLOCKING move: the non-blocking form returns before
+    the bytes are in host memory (see the CUDA test below)."""
+    seen = []
+    monkeypatch.setattr(
+        modeling.DeepseekV4CacheLayer, "_move",
+        lambda self, device, non_blocking=True: seen.append((device, non_blocking)))
+    cache = build(256)
+    cache.to_cpu()
+    assert seen == [("cpu", False)] * len(cache.layers)
+    seen.clear()
+    cache.to_device("cuda:7")
+    assert seen == [("cuda:7", True)] * len(cache.layers)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")
+def test_to_cpu_returns_with_the_bytes_already_in_host_memory():
+    """The defect the blocking move exists for, on a real device.
+
+    Work is queued on the stream AHEAD of the copy, then the parked tensors are
+    read with no synchronize -- which is what the pool does: it budgets, evicts
+    and hands an entry back as soon as `store()` returns. With a non-blocking
+    GPU -> pageable-host copy every element read here is still wrong (S34
+    measured 220,000,000 of 220,000,000)."""
+    cache = modeling.DeepseekV4Cache(shipped_config(), max_seq_len=256,
+                                     device=torch.device("cuda"))
+    for layer in cache.layers:
+        layer.keys.fill_(3.0)
+    busy = torch.randn(4096, 4096, device="cuda")
+    for _ in range(30):
+        busy = busy @ busy
+        busy = busy / busy.abs().max()
+    cache.to_cpu()
+    assert all(layer.keys.device.type == "cpu" for layer in cache.layers)
+    assert all(bool((layer.keys == 3.0).all()) for layer in cache.layers)
+
+
+def test_resident_bytes_is_the_whole_preallocated_cache():
+    """The pool budgets what is really parked: every slot up to max_seq_len,
+    used or not -- nothing is compacted."""
+    cache = build(256)
+    assert cache.resident_bytes() == cache.nbytes() > 0
+    cache.advance(200)
+    assert cache.resident_bytes() == cache.nbytes()
+
+
+def test_the_real_cache_is_served_whole_by_the_real_prefix_store():
+    """The store's contract is pinned on a stand-in in
+    `tests/test_one_length_cache.py`; this is the real class through it."""
+    from vaayu.prefix_cache import PrefixCacheStore
+    store = PrefixCacheStore(budget_bytes=10 ** 12)
+    cache = _filled()
+    cache.advance(3)                       # 4 ids stored, 3 fed
+    store.store("sid", [1, 2, 3, 4], cache)
+    assert store._current_bytes == cache.nbytes()
+
+    refused, matched = store.lookup("sid", [1, 2, 9, 9, 9])
+    assert refused is None and matched == 0 and store.recurrent_partial_misses == 1
+
+    got, matched = store.lookup("sid", [1, 2, 3, 4, 5, 6])
+    assert got is cache and matched == 4
+    got.to_device(torch.device("cpu"))     # `_adopt_prefix_hit`, step by step
+    got.crop(min(matched, 6 - 1))          # a no-op: the guard kept it at the cache's length
+    assert got.get_seq_length() == 3
+
+
+def test_an_aborted_turn_drops_the_real_cache(capsys):
+    from vaayu.prefix_cache import PrefixCacheStore, restore_on_abort
+    store = PrefixCacheStore(budget_bytes=10 ** 12)
+    cache = build(256)
+    cache.advance(3)
+    assert restore_on_abort(store, "sid", [1, 2, 3, 4], cache, prefix_len=3) is False
+    assert len(store._pool) == 0
+    assert "servable at one length only" in capsys.readouterr().out

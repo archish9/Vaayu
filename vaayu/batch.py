@@ -492,7 +492,8 @@ def cache_supports_prefix_store(cache) -> bool:
 
     Recurrent state is no longer disqualifying: `to_cpu`/`to_device` carry it
     with the entry and the store serves it only at the length it describes
-    (42-B).
+    (42-B). The same holds for a cache that declares itself one-length
+    (`cache_is_one_length`, S34).
     """
     return all(callable(getattr(cache, m, None)) for m in _PREFIX_STORE_METHODS)
 
@@ -516,6 +517,24 @@ def cache_holds_recurrent_state(cache) -> bool:
         if hasattr(layer, "update_conv_state") or hasattr(layer, "conv_states"):
             return True
     return False
+
+
+def cache_is_one_length(cache) -> bool:
+    """True iff `cache` can be served only at the one length it has reached.
+
+    Two kinds qualify. A hybrid-attention cache holds recurrent state
+    (`cache_holds_recurrent_state`): a fixed-size summary with no per-token
+    history. And a cache may DECLARE it with `is_one_length = True`, because
+    its own layout overwrites what a shorter crop would need -- DeepSeek-V4's
+    preallocated sliding window plus compressed half does (S34).
+
+    The prefix store serves such an entry only to a prompt that contains all
+    of it and never lends it. Disk persistence and TurboQuant pooling, which
+    read a per-token K/V layout, refuse it. Detected off the object, never
+    from an architecture name (CLAUDE.md §5).
+    """
+    return (bool(getattr(cache, "is_one_length", False))
+            or cache_holds_recurrent_state(cache))
 
 
 def spec_recurrent_refusal(cache) -> str | None:
@@ -550,7 +569,9 @@ def prefix_cache_refusal_reason(cache, kv_cache_mode) -> str | None:
     to_cpu/to_device, and PrefixCacheStore.lookup serves such an entry only at
     the one length its state describes. What a hybrid still cannot do is LEND a
     prefix (copy_prefix raises) or use the KV-only side channels -- disk
-    persistence and TurboQuant pooling both refuse at load.
+    persistence and TurboQuant pooling both refuse at load. A cache that
+    DECLARES itself one-length (S34) is served under the same rule and refused
+    by the same side channels; see `cache_is_one_length`.
     """
     if not cache_supports_prefix_store(cache):
         return (f"kv_cache_mode={kv_cache_mode!r} yields {type(cache).__name__}, "

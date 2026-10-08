@@ -261,17 +261,19 @@ def test_prefix_caching_is_not_refused_at_construction(monkeypatch):
     assert seen["kwargs"]["enable_prefix_cache"] is True
 
 
-def test_this_cache_is_one_the_class_level_detection_catches():
-    """What makes the downgrade safe. If `DeepseekV4Cache` ever grew these
-    three methods, both the base's instance probe and this class's own
-    class-level `cache_supports_prefix_store` check (Task 6a) would silently
-    START storing prefixes out of a preallocated sliding window, which is the
-    wrong-history bug."""
-    from vaayu.batch import cache_supports_prefix_store
+def test_this_cache_can_be_pooled_only_because_it_declares_one_length():
+    """Since S34 `DeepseekV4Cache` carries the three prefix-store methods, so
+    the class-level detection ALLOWS the pool. What keeps that from being the
+    wrong-history bug -- a prefix served out of a preallocated sliding window
+    at a length it no longer describes -- is the declaration beside them: the
+    store serves a one-length cache only to a prompt that contains all of it.
+    Either half without the other is a defect."""
+    from vaayu.batch import cache_is_one_length, cache_supports_prefix_store
 
     cache = modeling.DeepseekV4Cache(shipped_config(), max_seq_len=256,
                                      device="cpu", dtype=torch.float32)
-    assert not cache_supports_prefix_store(cache)
+    assert cache_supports_prefix_store(cache)
+    assert cache_is_one_length(cache)
 
 
 def test_refuse_unsupported_prefix_cache_does_not_crash_with_no_max_seq_len(capsys):
@@ -282,15 +284,18 @@ def test_refuse_unsupported_prefix_cache_does_not_crash_with_no_max_seq_len(caps
     here exactly as it is on every real load. The base's own
     `_refuse_unsupported_prefix_cache` would construct a probe cache via
     `_create_kv_cache()` and crash inside `DeepseekV4Cache.__init__` on
-    `None // int`. This override must disable prefix caching, print the one
-    warning, and return -- never raise.
+    `None // int`. This override must answer from the classes and return --
+    never raise. Since S34 the answer is "allowed": the pool stays on, nothing
+    is printed, and the one-length flag is recorded for the side channels.
     """
     model = engine(enable_prefix_cache=True, max_seq_len=None,
                    kv_cache_mode="auto", running_device="cpu",
                    running_dtype=torch.bfloat16)
     model._refuse_unsupported_prefix_cache()
-    assert model.enable_prefix_cache is False
-    assert "DISABLED" in capsys.readouterr().out
+    assert model.enable_prefix_cache is True
+    assert model._cache_is_one_length is True
+    assert model._cache_holds_recurrent_state is False
+    assert "DISABLED" not in capsys.readouterr().out
 
 
 def test_cache_holds_recurrent_state_is_set_false_even_when_prefix_cache_is_off():
@@ -300,6 +305,7 @@ def test_cache_holds_recurrent_state_is_set_false_even_when_prefix_cache_is_off(
     model = engine(enable_prefix_cache=False)
     model._refuse_unsupported_prefix_cache()
     assert model._cache_holds_recurrent_state is False
+    assert model._cache_is_one_length is False
 
 
 def test_refuse_unsupported_prefix_cache_never_constructs_a_real_cache(monkeypatch):
@@ -315,31 +321,30 @@ def test_refuse_unsupported_prefix_cache_never_constructs_a_real_cache(monkeypat
 
     monkeypatch.setattr(model, "_create_kv_cache", boom)
     model._refuse_unsupported_prefix_cache()  # must not raise
-    assert model.enable_prefix_cache is False
+    assert model.enable_prefix_cache is True
 
 
-def test_refuse_unsupported_prefix_cache_is_detected_not_hardcoded(monkeypatch):
-    """If `DeepseekV4Cache` ever grows the prefix-store surface, the override
-    must start ALLOWING prefix caching -- proving the decision reads the
-    class's actual capabilities rather than a hardcoded refusal.
+@pytest.mark.parametrize("missing", ["to_cpu", "to_device", "resident_bytes"])
+def test_refuse_unsupported_prefix_cache_is_detected_not_hardcoded(monkeypatch, capsys,
+                                                                   missing):
+    """The decision reads the class's actual capabilities. Take any ONE of the
+    three prefix-store methods off `DeepseekV4Cache` -- what a checkpoint
+    shipping older modeling code would look like -- and the override must go
+    back to disabling the pool with its WARNING, rather than let `store()`
+    fail per turn and drain the pool.
 
-    Adds real `to_cpu` / `to_device` / `resident_bytes` methods directly to
-    the `DeepseekV4Cache` class (monkeypatch undoes this after the test) --
-    exactly the class the override's `cache_supports_prefix_store` check
-    reads. `batch.py`'s predicate itself is untouched: this exercises the
-    override's real detection path, not a stubbed-out answer.
+    `monkeypatch.delattr` removes the real method from exactly the class the
+    override's `cache_supports_prefix_store` check reads, and puts it back
+    after the test.
     """
-    monkeypatch.setattr(modeling.DeepseekV4Cache, "to_cpu",
-                        lambda self: None, raising=False)
-    monkeypatch.setattr(modeling.DeepseekV4Cache, "to_device",
-                        lambda self, device: None, raising=False)
-    monkeypatch.setattr(modeling.DeepseekV4Cache, "resident_bytes",
-                        lambda self: 0, raising=False)
+    monkeypatch.delattr(modeling.DeepseekV4Cache, missing)
     model = engine(enable_prefix_cache=True, max_seq_len=None,
                    kv_cache_mode="auto", running_device="cpu",
                    running_dtype=torch.bfloat16)
     model._refuse_unsupported_prefix_cache()
-    assert model.enable_prefix_cache is True
+    assert model.enable_prefix_cache is False
+    assert model._cache_is_one_length is False
+    assert "DISABLED" in capsys.readouterr().out
 
 
 def test_speculative_decoding_is_refused_by_name(monkeypatch):
@@ -355,8 +360,8 @@ def test_speculative_decoding_is_refused_by_name(monkeypatch):
 def test_generate_hands_a_real_deepseek_cache_to_the_ordinary_path(monkeypatch):
     """Task 6d's regression test.
 
-    `_refuse_unsupported_prefix_cache` above force-disables prefix caching
-    for this model, so `VaayuBaseModel.generate` always takes its
+    With the prefix pool OFF (the only state this model had before S34),
+    `VaayuBaseModel.generate` takes its
     `self._prefix_cache is None` branch and delegates straight to
     `transformers`' own `generate()` with no cache seeded. Left alone,
     `transformers` manufactures a stock `DynamicCache`
@@ -409,6 +414,30 @@ def test_generate_respects_a_caller_supplied_cache(monkeypatch):
     model.generate(torch.tensor([[1, 2, 3]]), max_new_tokens=1,
                    past_key_values=sentinel)
     assert seen["past_key_values"] is sentinel
+
+
+def test_generate_seeds_nothing_when_the_prefix_pool_is_on(monkeypatch):
+    """S34. With the pool on, `VaayuBaseModel.generate` either restores a
+    pooled entry or builds a fresh cache itself, and overwrites whatever was
+    passed in. Seeding one here would allocate and zero a whole preallocated
+    cache on the GPU for every request, only to drop it."""
+    seen = {}
+
+    def fake_base_generate(self, *args, **kwargs):
+        seen["past_key_values"] = kwargs.get("past_key_values")
+        return "generated"
+
+    monkeypatch.setattr(VaayuBaseModel, "generate", fake_base_generate)
+    model = engine(config=shipped_config(num_hidden_layers=2), max_seq_len=256,
+                   kv_cache_mode="auto", running_device="cpu",
+                   running_dtype=torch.bfloat16, _prefix_cache=object())
+
+    def boom():
+        raise AssertionError("must not build a cache the base will discard")
+
+    monkeypatch.setattr(model, "_create_kv_cache", boom)
+    assert model.generate(torch.tensor([[1, 2, 3]]), max_new_tokens=1) == "generated"
+    assert seen["past_key_values"] is None
 
 
 def test_generate_delegates_args_and_return_value_unchanged(monkeypatch):
