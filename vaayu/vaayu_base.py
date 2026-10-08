@@ -5974,9 +5974,11 @@ class VaayuBaseModel(GenerationMixin):
                             # (measured through the server, one injected OOM:
                             # Llama-3.2-1B 16 of 34 cache tensors wrong and the
                             # reply text changed; Qwen3-Next and DeepSeek-V4 too).
-                            # Raising hands the request to generate()'s abort rule,
-                            # which crops a plain K/V pool entry back to its matched
-                            # length and drops one it cannot crop.
+                            # Raising hands the request to the abort rule: generate()
+                            # puts a plain K/V pool entry back, cut to the reused prefix
+                            # every layer still holds, and drops a one-length one;
+                            # speculative_generate loses the entry; batched_generate's
+                            # store-back does not apply the rule yet (todo-backlog #38).
                             try:
                                 # Unreachable from __init__ (resolve_use_torch_compile refuses
                                 # it, row 48); kept as the landing spot for a step-boundary fix.

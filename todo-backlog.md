@@ -12,7 +12,7 @@ Status keys, as in `todo.md`: `[ ]` pending · `[~]` in progress · `[!]` blocke
 
 ---
 
-## Index — 37 items (19 moved 2026-09-26; 20–21 added 2026-09-28 by S10b; 22–23 added 2026-09-28 by S10c; 24–25 added 2026-09-29 by S12; #1 = row 36 CLOSED by S12; 26 added 2026-10-01 by S16 (ii); 27 added 2026-10-02 from the S17 row; 28–35 added 2026-10-03 in the todo.md cleanup; 36 added 2026-10-07 by S29; 37 added 2026-10-07 by S30)
+## Index — 38 items (19 moved 2026-09-26; 20–21 added 2026-09-28 by S10b; 22–23 added 2026-09-28 by S10c; 24–25 added 2026-09-29 by S12; #1 = row 36 CLOSED by S12; 26 added 2026-10-01 by S16 (ii); 27 added 2026-10-02 from the S17 row; 28–35 added 2026-10-03 in the todo.md cleanup; 36 added 2026-10-07 by S29; 37 added 2026-10-07 by S30; 38 added 2026-10-08 by I4's final review)
 
 | # | item | was in `todo.md` | why it is here | re-open when |
 |---|---|---|---|---|
@@ -51,6 +51,7 @@ Status keys, as in `todo.md`: `[ ]` pending · `[~]` in progress · `[!]` blocke
 | 35 | Row 47 A6 remainder — drop the Hub kernel dependency (`triton_kernels_hub` is fetched from the Hub on first run) | row 47 program table | A6's substance (move only the routed experts, 1.27 GB/token instead of 10.17 GB) was delivered by S8's routed delivery; only the network dependency at first load remains | an offline install is required, or the Hub dependency breaks a load |
 | 36 | S29 lead — the 40 % "cacheable" rule does not fit a cyclic per-token stream | S29 (added 2026-10-07) | seen only in configs no default load reaches today: with the dense layer cache OFF (`RAM_CACHE_BUDGET_GB=0`, non-default) Llama-3.3-70B goes buffered at "50 %" and the page cache served ~5.5 %; not measured against O_DIRECT there | a default load prints `Sufficient RAM` for a model that streams per token and does not fit the page cache whole, or a user runs a streamed dense model with `RAM_CACHE_BUDGET_GB=0` |
 | 37 | S30 — batching design: make N>1 reachable through the server | S30 row (PARKED by the USER 2026-10-07) | N>1 only: the server runs `MAX_BATCH_SIZE = 1`, and no client sends Vaayu concurrent requests (RudraAnvil has no Vaayu reference and runs its subagents one at a time) — worth 0 % to users today (CLAUDE.md §8) | a client that sends concurrent requests targets Vaayu (Rudra depends on Vaayu and fans out), or the USER asks |
+| 38 | I4-b — batched store-back stores a ragged entry after an error | I4 final review (added 2026-10-08) | N>1 only: `batched_generate` runs only with `MAX_BATCH_SIZE >= 2` + sdpa (not the default); worth 0 % to users today (CLAUDE.md §8) | `batched_generate` is wired into the server, i.e. with #37 |
 
 ---
 
@@ -674,9 +675,10 @@ layer decodes eagerly, bit-identical); the spec allows it. **Re-open when:** a l
 graph layers to OOM refusals (grep the log for `decode graphs refused for … OutOfMemoryError`).
 
 - `_guarded` (`vaayu/decode_graphs.py`) refuses the layer on ANY capture exception, including a transient
-  `torch.cuda.OutOfMemoryError`; the engine's own OOM retry (`vaayu_base.py`, `_MAX_OOM_RETRIES`) never sees it.
-  **Fix when re-opened:** on `OutOfMemoryError`, restore the snapshot and re-raise instead of refusing, so the engine's
-  retry path handles it and the next token recaptures.
+  `torch.cuda.OutOfMemoryError`. **Fix when re-opened:** on `OutOfMemoryError`, restore the snapshot and run
+  the stock layer once (as today) but do NOT add the layer to `_refused`, so the next token recaptures.
+  **Do not re-raise into the layer loop:** since I4 (2026-10-08) the loop has no OOM retry — it raises on
+  the first OOM — so re-raising would turn a bit-identical eager fallback into an HTTP 500.
 
 ## 26. S5-M-C — the expert CLONE path fragments glibc arenas
 
@@ -1015,7 +1017,7 @@ out?"). The S30 row as it stood is in the archive below.*
 coder → verify → tester → reviewer one at a time. The only concurrency it could produce is deepagents' `task` tool
 fanning out inside one turn.
 **Re-open when:** a client that sends concurrent requests targets Vaayu (Rudra depends on Vaayu and fans out), or the
-USER asks for it. Re-opening it re-opens #5, #6 and #33 too.
+USER asks for it. Re-opening it re-opens #5, #6, #33 and #38 too.
 
 - [ ] **Design server batching (S30's brief; inputs re-verified at `fc06d8b`, 2026-10-07; line anchors as of then).**
   - **The machinery exists, from P10.** `vaayu/server/scheduler.py:492` (a dispatcher) calls `run_batch`.
@@ -1039,7 +1041,33 @@ USER asks for it. Re-opening it re-opens #5, #6 and #33 too.
       runs a tool between turns comes back seconds later, and admitting a latecomer into a RUNNING batch is
       continuous batching, which Vaayu does not do.
   - **Backlog items that re-open with it:** #5 (the stager re-runs per batched chunk), #6 (`head_bytes`), #33 (the P10
-    batching minors and the sentinel-only cancel `[bug]`).
+    batching minors and the sentinel-only cancel `[bug]`), #38 (the batched store-back stores a ragged entry
+    after an error).
+## 38. I4-b — batched store-back stores a ragged entry after an error
+
+*Added 2026-10-08 by I4's final review (review of 9c3d847..58efcb1), ruled LEDGER by the controller.* **Why here:** N>1
+only. `batched_generate` runs only with `MAX_BATCH_SIZE >= 2` + sdpa (not the default); worth 0 % to users today
+(CLAUDE.md §8). **Re-open when:** `batched_generate` is wired into the server, i.e. with #37.
+
+- **Location:** `vaayu/vaayu_base.py:7185-7203`. `_have = past.get_seq_length()` reads only the FIRST KV layer, and `past`
+  is the object the failing forward mutated.
+- **Mechanism:** the same ragged-entry defect Task 1b fixed in `generate()`. After a raise inside layer k, layers 0..k hold
+  one more position than layers k+1.., and the store-back takes the first layer's length as the whole entry's.
+- **Replay** (real `FP8DynamicCache`, real `slice_cache_row_unpadded`, N=2, raise inside layer 1 of 4; re-run
+  2026-10-08, CPU):
+  - decode-step raise (`plans/probes/i4_batch_storeback_repro.py`): per-layer `_seq_len` after the raise `[9, 9, 8, 8]`;
+    padded row 0 stores 7 ids with `_seq_len=[7, 7, 7, 7]` and unwritten slots inside the used window on layers 2-3
+    (position 6; equal lengths, invisible to any length check); unpadded row 1 stores 9 ids with `_seq_len=[9, 9, 8, 8]`
+    (ragged).
+  - prefill-chunk raise after an adopted shared prefix (`plans/probes/i4_batch_storeback_prefill_hit.py`): `[12, 12, 10, 10]`;
+    padded row 0 stores 10 ids, unwritten slots 8 and 9 on layers 2-3; unpadded row 1 stores 12 ids with
+    `_seq_len=[12, 12, 10, 10]`, the WHOLE prompt as token ids, so a client's plain retry is served from them.
+- **Reach:** `MAX_BATCH_SIZE >= 2` + sdpa, plain K/V models only.
+- **Not a regression:** the old retry reached the same store-back with layer k appended 2-3 times.
+- **Candidate fix (reviewer, arithmetic checked for both cases, NOT built):**
+  `_have = min(past.kv_layer_lengths() or [past.get_seq_length()])` + a CPU test built from the two replay scripts.
+- **Re-open when:** with #37.
+
 ---
 
 # ARCHIVE — todo.md as of 2026-10-03 (`main` `8310e11`), verbatim
@@ -9363,7 +9391,11 @@ reach** — then this 0.83 GB becomes part of a real budget rather than a roundi
   Fix = parse the hit count and assert it rose across a turn that EXTENDS the previous one (system + user +
   assistant reply + new user), then see it fail with the pool off.
 
-- **[bug] [~] I4 — (row as it stood when it closed 2026-10-08; closing verdict in todo.md) IN PROGRESS since 2026-10-08 (fresh session started; systematic-debugging, Phase 1 = reproduce
+- [x] **I4 — ✅ CLOSED 2026-10-08: FIXED on branch `i4-remove-oom-retry` (`504fc19`, `3defef1`), awaiting the USER's merge to `main`.** The layer loop's OOM retry is removed: the first `torch.cuda.OutOfMemoryError` in a layer raises the lever-naming error, for every model (no layer's forward is idempotent, so a retry that succeeded answered from a cache the failed attempt had already written, and the pool kept it). Pre-fix, one injected OOM: Llama-3.2-1B 16/34 tensors wrong and the reply text changed (96-token replies: 34/34, text differs), Qwen3-Next 47-51/172, DeepSeek-V4 92/237. Post-fix on device (client retries the 500 once): 6 gated arms bitwise clean (B-vs-A 0 on every turn: 1B prefill t1, 1B t2 `LOOKUP=0`, 1B decode, Qwen L24, Qwen L23, DeepSeek L22 t1) and 3 reported arms whose retry is a full prefill, each equal bitwise to a COLD reference session (D-vs-B 0 on all turns: 1B default 0/34, Qwen L1 t2 0/172, DeepSeek L22 t2 0/237). Scope grew by ruling to Task 1b: two pre-existing `restore_on_abort` defects, found on device, fixed in `3defef1` (plain K/V entries stored RAGGED after a forward died inside a layer: 1B `LOOKUP=0` retry differed 15/34, `_seq_len` 121 x9 / 120 x7, now 0/34; hybrid entries restored with an advanced recurrent state at an unchanged KV length: Qwen L1 t2 95/172, now dropped and the retry equals a cold reference 0/172). Pool after an error: `generate()` crops a plain K/V entry and drops a hybrid / one-length entry; `speculative_generate` (the dense server default, prompt lookup ON) has no `restore_on_abort`, so the entry is LOST and the retry re-prefills (reuse lost, nothing corrupt; M2). Cost: a request the retry might have rescued now fails; no recovered retry is on record anywhere. Gates green (dense 1B + 70B, accumulator Qwen + MiniMax, server on 1B / Qwen / MiniMax / gpt-oss / DeepSeek, prefix 1B); dense gate ppl not captured this run (5/5 under the < 25 ceiling on both Llama); suite 3827 passed, 26 skipped. Batched turns (`MAX_BATCH_SIZE >= 2`) still store an inconsistent entry after an error: same defect, N>1-only, backlog #38. §8: no knob, n/a plumbing, reachable on every model at N=1 on the server default, SHIPPED on the branch. RESULTS `docs/2026-10-08-I4-oom-retry-RESULTS.md`; full row: `todo-backlog.md` "Closed after the 2026-10-03 cleanup".
+
+Row as it stood when it closed:
+
+- **[bug] I4 — opened 2026-10-08 (fresh session started; systematic-debugging, Phase 1 = reproduce
   on device before any fix) — NEXT, IN ITS OWN FRESH SESSION (USER 2026-10-08, at S34's merge: "merge and fix bug in fresh
   session"; S34 itself is merged, `e7c69ea`): a SUCCESSFUL OOM retry in the layer loop pools a
   silently wrong one-length cache.** `vaayu/vaayu_base.py:5965-6001`: on `torch.cuda.OutOfMemoryError` the layer loop
