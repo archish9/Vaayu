@@ -9122,3 +9122,189 @@ reach** — then this 0.83 GB becomes part of a real budget rather than a roundi
     0.550–0.567, E1–E6 incl. flagged E3/E4/E5 ≈ 2.11–2.76 (E5, the gc move, is 1.46–2.07 of it); unflagged bundle-b
     1.154–1.157 FAILS, flagged bundle-b 2.710–3.190 STRADDLES (pre-registered 3 processes: 3.072–3.699).
     **= S33-A0 (≤ 1 h CUPTI confirmation) / S33 (STAGED: E1–E6, then decide C8b; USER).**
+
+- [x] **S34 — DeepSeek-V4 cross-turn prefix cache — ✅ CLOSED 2026-10-08: BUILT, MEASURED, GATED and task-reviewed on branch `s34-deepseek-prefix-cache` (head `75c4278`, cut from `05f5bf9`); NOT merged — awaiting the USER's word to merge. 1k appending turns 10.26 s vs 51.08 s to first token pool ON vs OFF (ON/OFF 0.201), 4k 11.33 s vs 165.00 s (OFF is ONE turn; 0.069); decode -0.72 % at the own RAM budget (+0.4 % without one slow first OFF arm) and -0.10 % at BALLAST_GB=15, both inside the 5 % rule; a pool HIT is bitwise identical to handing the live cache over; suite 3815 passed, 26 skipped. Row as it stood at close:**
+**S34 — DeepSeek-V4 cross-turn prefix cache (set by the USER at S31, 2026-10-07).** Week-class: brainstorm →
+      spec → plan with the USER. **IN PROGRESS 2026-10-08.**
+      **STEP 0 DONE 2026-10-08 at `826e58b` (measure only; `plans/probes/s34_price.py`, raw in
+      `plans/probes/s34_out/`; RESULTS `docs/2026-10-08-S34-step0-prefix-hit-price-RESULTS.md`): a HIT is worth
+      34.9 s of TTFT at 1k and 137.0 s at 4k — 21.9 % and 51.7 % of the turn (18.4 % / 47.0 % against S15's
+      0.560 s/token). The stop rule (< ~5 %) does NOT fire → design.** The probe timed the REAL diff prefill, not a
+      proxy: it kept turn 1's `DeepseekV4Cache`, parked it in host RAM (`offload()`), restored it (`prefetch()`,
+      22 ms) and passed it as `past_key_values`, so the engine prefilled only the 225 new positions. `BALLAST_GB=15`,
+      29G, one session per process, three processes:
+      | turn-2 prompt | full prefill today | diff-only (HIT, emulated) | saving | share of turn |
+      |---|---|---|---|---|
+      | 1,280 (full → diff) | 46.09 s · 22,050 loads · 295.0 GB | 11.24 s · 5,387 loads · 72.1 GB | 34.83 s | 21.8 % of 159.6 s |
+      | 1,280 (diff → full) | 46.22 s · 22,093 loads · 295.6 GB | 11.27 s · 5,409 loads · 72.4 GB | 34.93 s | 21.9 % of 159.4 s |
+      | 4,352 (diff → full) | 148.24 s · 70,542 loads · 943.7 GB | 11.27 s · 5,395 loads · 72.2 GB | 136.95 s | 51.7 % of 265.1 s |
+      The diff's cost is flat in context; the full prefill grows ≈ 17 s per 512-token chunk, so the saving ≈ 17 s ×
+      (kept prefix / 512). Both arms are disk-bound (76–77 % stall).
+      **Design inputs STEP 0 settled:** (1) the engine already continues a multi-token chunk over a kept cache at an
+      unaligned `start_pos` — no forward change is needed; the cache class is Vaayu's own
+      (`vaayu/model_code/deepseek_v4/modeling_deepseek_v4.py:899`, registered in-process). (2) The agent-shaped
+      re-render contains the whole stored entry (lcp 1,056 / 1,056, 4,128 / 4,128) and the cache holds
+      `len(stored) − 1` in every layer, so the exact-length contract is reachable. (3) Hash-routed layers get the
+      diff's own ids (`input_ids_scope` wraps whatever `forward` is given). (4) **"Greedy ids identical to cold"
+      (this row's Measure line) CANNOT be the gate:** full vs diff flip at step 12 (1k) / 11 (4k) at margins of 0.25 /
+      0.00 logits, and two legitimate FULL prefills (chunk 512 vs 256) differ just as much (max|d| 4.63 vs 4.36) and
+      flip the same token; diff = chunk-256 full on 16 / 16 ids. Gate = HIT vs HIT bitwise + HIT vs cold against a
+      null floor (the A5.5 method). (5) 42-B's guard in `PrefixCacheStore.lookup` is keyed on
+      `cache_holds_recurrent_state`, which finds nothing on `DeepseekV4CacheLayer` → generalise it to "servable at
+      one length" (S35 needs the same). (6) **The expert-ceiling reserve mis-prices a DeepSeek prefix session:**
+      `derive_expert_ceiling` (`vaayu_base.py:377-396`) is fed the config formula's 88 KB/token
+      (`vaayu_base.py:3055`; the load log prints `reserving 0 prefix session(s) of 5.41 GB each`), so switching
+      the pool on as it stands would reserve 3 × 5.41 = 16.2 GB and pin the expert RAM cache at its 8.5 GiB floor.
+      The real cache is 6,880 B/token (`planned_kv_bytes_per_token`, S15) ≈ 0.42 GB per parked session, 1.27 GB for
+      three → the build must feed the reserve the measured figure, then measure decode with and without the pool at
+      the SERVER's own RAM budget (at `BALLAST_GB=15` the cache already sits on the floor, 9.13 GB, and hides it).
+      **USER 2026-10-08: approach A — park the whole cache in the existing pool + a one-length contract in the
+      store (B = compact snapshot and C = live GPU cache without the pool were offered and not picked). Design
+      approved by the USER the same day; spec
+      `docs/superpowers/specs/2026-10-08-S34-deepseek-prefix-cache-design.md` approved by the USER; PLAN WRITTEN
+      AND DRY-RUN: `docs/superpowers/plans/2026-10-08-S34-deepseek-prefix-cache.md` (5 tasks; verified assets in
+      `docs/superpowers/plans/2026-10-08-S34-assets/`; probes `plans/probes/s34_session.py`, `s34_cmp.py`) —
+      awaiting the USER's review and choice of execution method. NOTHING IS BUILT: `main` is unchanged.**
+      **The dry run (scratch worktree at `826e58b`, since removed), so the plan's numbers survive without `docs/`:**
+      unit suite with the change **3815 passed, 26 skipped** (+38); 14 of 14 mutants killed; the pool HIT is
+      **bitwise identical** to handing the live cache from turn to turn (80 forwards at 1k; and with a 937-token,
+      two-chunk diff); HIT TTFT **10.0–10.1 s** at a 1.3–1.5k context against 45.3 s cold, 30.2 s against 61.2 s
+      for the 937-token diff; DeepSeek server gate 10 / 10 with `HIT … match_len=34/45` and `reserving 3 prefix
+      session(s) of 0.42 GB each` (expert RAM cache 22.6–23.5 GB with the pool, 23.0–24.4 without); one OFF / ON
+      decode pair 384.1 vs 393.9 ms/token (+2.5 %, ONE pair — the plan's mirrored ABBA decides; stop rule 5 %);
+      host RAM trough 1.5–2.7 GB; the store costs 123 ms per turn after the stream.
+      **Three things the dry run changed or found:** (1) **`to_cpu` must be a BLOCKING copy.** The first cut used
+      the cache layer's `offload()`; a CUDA tensor's `.to("cpu", non_blocking=True)` returns before one byte
+      reaches pageable host memory (220,000,000 of 220,000,000 elements read wrong at once) and the run only
+      passed because the GPU was idle at the end of a turn. A CUDA test now pins it. `offload()` itself keeps the
+      hazard; nothing in Vaayu calls it. (2) **The server gate's old prefix test passed with 0 hits on
+      Qwen3-Next** (`hits 0 -> 1` once a turn that appends was added) — the `[bug]` below, fixed by the plan's
+      Task 3 and seen failing (`1 failed, 9 passed`) with `lookup` forced to miss. (3) **The pool's budget floats
+      between loads of the same tree: 0.70 / 0.89 / 0.93 / 1.34 / 1.36 GB = one to three DeepSeek sessions of
+      0.44 GB**, because it is what RAM is left after the load, not what the reserve set aside; one session
+      always fits. The design in five lines, so this row stands without the file: (a) `DeepseekV4Cache` gains
+      `to_cpu` / `to_device` / `resident_bytes` (the whole preallocated cache moves, pageable) and declares
+      `is_one_length = True`; (b) `batch.cache_is_one_length` = that marker OR recurrent state, and
+      `PrefixCacheStore.lookup` uses it for 42-B's guard (serve only when the prompt contains the WHOLE entry);
+      (c) an aborted turn ALWAYS drops a declared one-length entry — the attention forward writes its
+      Compressor / Indexer state before it advances `cumulative_length` (`modeling_deepseek_v4.py:1351-1363`), so
+      an unchanged length cannot vouch for the state; (d) KV persist, `prefix_compress` and the batched pool path
+      refuse a one-length cache, and the expert-ceiling reserve takes `planned_kv_bytes_per_token()`; (e)
+      `VaayuDeepseekV4.generate` stops seeding a throwaway cache when the pool is on. Gate = a real pool HIT
+      bitwise equal to the same session with the live cache handed straight to turn 2 (same computational path),
+      decode ON vs OFF at two RAM budgets (stop at > 5 %), host RAM trough (stop under 0.5 GB).
+      **Two corrections to this row's Measure line:** (i) "greedy ids identical to cold" cannot hold (design input
+      4); (ii) **`test_multiturn.py` cannot gate DeepSeek** — its round 2 keeps the system prompt and changes the
+      task, a divergence a one-length cache cannot serve by contract (0 HITs, as on Qwen3-Next), and it renders
+      with `apply_chat_template`, which this checkpoint does not ship; it runs on MiniMax as the shared-store
+      regression instead. **What the feature does NOT give:** reuse across prompts that share only a prefix (a
+      new task under the same system prompt, an edited context) — only turns that APPEND are served.
+      **Cost today:** the prefix cache is switched off at load, so every turn after the first is a full prefill. S17
+      (`docs/2026-10-01-S17-prefill-reads-vram-tier-RESULTS.md` §7; ONE rep per arm, `BALLAST_GB=15`): cold 1k prompt
+      **34.4 s**, turn 2 = a 1,280-token prefill **47.1 s**; **both turns disk-bound (26–36 s of stall each).** Decode
+      1.78 tok/s (S15), so a 256-token turn is ≈ 47 + 256 × 0.560 ≈ 190 s. Reach: every DeepSeek turn after the first,
+      N=1, server default (`ENABLE_PREFIX_CACHE = True`, `vaayu/server/config.py:100`).
+      **STEP 0 — PRICE IT BEFORE ANY DESIGN.** The saving is NOT 47.1 s: it is 47.1 s minus what the diff's own
+      prefill costs, and a disk-bound ~280-token diff may still read most routed experts (256 experts, top-6, 43
+      layers). Measure a cold prefill of a diff-sized prompt over a warm tier (`plans/probes/s17_ttft.py` as the base;
+      `MemoryMax=29G`, FOREGROUND), compute the saving per turn and its share of ≈ 190 s, and present that to the
+      USER before the spec. If it is under ~5 % of the turn, recommend closing.
+      **INPUTS PRE-GATHERED at `5118a65`. Re-verify at HEAD:**
+      - **Pointer spot-check 2026-10-08 at `5bdb816` (by S33-C8b's session; names only, no behaviour re-verified):**
+        S33 stage 1 (`6c9a31f`) changed `vaayu/vaayu_base.py` and `vaayu/vaayu_deepseek_v4.py` after the pre-gather.
+        Moved: the base's instance probe is now `vaayu_base.py:4299` (was :4247); `input_ids_scope` is now
+        `vaayu_deepseek_v4.py:770` / :800 (was :768 / :798). Unchanged: `vaayu_deepseek_v4.py:471` and :459,
+        `vaayu/batch.py:476` and :539, `vaayu/prefix_cache.py:74` and :194, `vaayu/server/config.py:100`.
+      - **The refusal:** `VaayuDeepseekV4._refuse_unsupported_prefix_cache` (`vaayu/vaayu_deepseek_v4.py:471`)
+        detects by CLASS, because the base's instance probe (`vaayu_base.py:4247`) would crash: `DeepseekV4Cache` is
+        preallocated from `max_seq_len`, still `None` at that point. It finds no prefix-store surface
+        (`_PREFIX_STORE_METHODS = ("to_cpu", "to_device", "resident_bytes")`, `vaayu/batch.py:476`;
+        `prefix_cache_refusal_reason` :539), warns and clears the flag; `kv_persist` then prints "ignored".
+      - **The cache:** transformers' `DeepseekV4Cache` / `DeepseekV4CacheLayer` (resolved through `_running_symbol`,
+        `vaayu_deepseek_v4.py:449-459`): a preallocated sliding window plus a compressed half. `crop()` is exact only
+        at `keep == L` (A5.5) — the same reason speculative decoding is refused on it.
+      - **Design lead, NOT verified:** 42-B already serves hybrid recurrent-state entries only "at the one length its
+        state describes" (`batch.py` `prefix_cache_refusal_reason` docstring; `PrefixCacheStore.lookup`). That
+        exact-length contract fits a cache that cannot crop, and an agent turn's prefix is usually the previous turn's
+        whole context. A diverging turn falls back to cold (or a shorter stored entry). `PrefixCacheStore.lookup`
+        (`vaayu/prefix_cache.py:74`), `store` :194. **S35 hits the same problem** (a window-length ring buffer cannot
+        crop back past its window) — design the contract once.
+      - **Check before designing:** DeepSeek's hash-routed layers read stashed input ids (A5.7b; `input_ids_scope`,
+        `vaayu_deepseek_v4.py:768` / :798) — a HIT that prefills only the diff must still hand those layers the right
+        ids.
+      - **Size:** real KV 6.7 KiB/token (S15, measured), so a 10k-token entry is ~67 MB of host RAM.
+      - **Files:** `vaayu/prefix_cache.py` (lookup / store / abort-path restore), `vaayu/batch.py`,
+        `vaayu/kv_persist.py` (keep refusing, or learn the format), the DeepSeek refusal above.
+      - **Traps:** memories `ttft_probe_ab_traps` (DeepSeek has no prefix cache today; snapshot the probe prompt),
+        `cold_request_and_causal_leak_traps` (named-session miss falls back to best prefix), `oracle_arm_and_lru_threshold`
+        (cold-vs-HIT logits differ; compare HIT with HIT). **Nothing may be written into DeepSeek's model dir.**
+      **Measure:** turn-2+ TTFT of an agent-shaped session, cold vs HIT, greedy ids identical to cold; prefix gate
+      (`test_multiturn.py` at the repo root) and server gate on DeepSeek; prefix gate on Qwen3-Next unchanged (shared infra).
+      **§8:** no new knob expected (`ENABLE_PREFIX_CACHE` exists, default True); reachable at N=1, server default.
+
+      **CLOSING SUMMARY (2026-10-08, Task 5; RESULTS `docs/2026-10-08-S34-deepseek-prefix-cache-RESULTS.md`, raw logs
+      `plans/probes/s34_out/`, every run `head=75c4278 dirty=False`).**
+      **Built (3 commits on the branch):** `86cf272` the one-length contract in the shared engine (`cache_is_one_length` in
+      `vaayu/batch.py`; `PrefixCacheStore.lookup` and `restore_on_abort` ask it; KV persist, `prefix_compress` and the batched
+      pool path refuse a one-length cache; the expert-ceiling reserve takes `planned_kv_bytes_per_token()`); `bd7fcb7`
+      DeepSeek-V4's cache joins the pool (`is_one_length = True`, a BLOCKING `to_cpu`, `to_device`, `resident_bytes`;
+      `generate` stops seeding a throwaway cache); `75c4278` the server gate's prefix check can fail and sends a turn that
+      appends. Suite on the branch `3815 passed, 26 skipped, 538 warnings in 242.38s` (+38 over 3777). Mutation: 14 of 14
+      killed; the fixed server gate fails on a pool that never serves (`1 failed, 9 passed`, `the appending turn was not
+      served from the pool: hits 0 -> 0`).
+      **Numbers (`s34_cmp.py`):** TTFT of appending turns, ON vs OFF: 1k (prompts 1,280 / 1,540 / 1,800) mean 10.26 s vs
+      51.08 s, ON/OFF 0.201, hits [1, 1, 1]; 4k (4,352 / 4,612 / 4,872) mean 11.33 s vs 165.00 s, ON/OFF 0.069, hits
+      [1, 1, 1] — the 4k OFF arm is ONE appending turn (three full 4k prefills do not fit a foreground run). Turn 1
+      unchanged (32.68 vs 32.76 s; 146.34 vs 147.99 s). The HIT prefills 225–229 positions (the diff).
+      Decode, mirrored ABBA, n=4 per arm: own RAM budget ON 481.76 vs OFF 485.27 ms/token (-0.72 %, OFF spread 4.67 % = one
+      slow first arm 501.46; without it ON is about +0.4 % against 479.87) and BALLAST_GB=15 ON 560.95 vs OFF 561.49
+      (-0.10 %): no measurable decode cost either way (5 % rule). Equality: `live-vs-pool` ALL_BITWISE=True (M2: 32 / 32 /
+      16 forwards; R1: 32 / 16); `pool-vs-cold` relL2@0 6.807e-02 (M2) / 1.067e-01 (R1), below the null floor
+      `cold-vs-ctl` 7.284e-02 / 1.138e-01. R2: `prefix_compress` and `enable_kv_persist` are refused with a line at load
+      (`kv_writer` false, `pool_compress_bits` null); the in-RAM pool still HITs.
+      **Cost:** the store's tail 115–148 ms per turn after the stream; the expert RAM cache gives up about 1.2 GB for the
+      pool (22.5 vs 23.7 GB at 1k, 22.47 vs 23.72 GB at 4k), and other models are unchanged (MiniMax per-session reserve
+      2.08 GB on branch and `main`). **Stop rules 1-4: none fired.**
+      **Host RAM (what is and is not shown):** own-budget troughs, in GB: pool ON 0.86 (M2, four arms in one process, the
+      lowest) / 1.58 / 1.72 / 1.76 / 2.05-2.59 / 2.19 / 2.22; pool OFF 1.19-1.67 — never under the 0.5 GB stop line. The
+      `BALLAST_GB=15` M4 run (trough 15.16 GB) does NOT show host RAM under pressure: the probe frees its ballast right
+      after the load (`plans/probes/s34_session.py:94`) and samples after, so it shows only that the engine sized itself
+      for a 15 GB machine, the pool budget came out 0.00 GB, and all five appending turns were still served. OPEN lead (c).
+      **Pool capacity:** the pool's budget is the RAM left after the load, 0.00 (x5, ballast) / 0.54-1.08 GB on Task 4's
+      loads (dry run: up to 1.36 GB) against 0.44 GB per DeepSeek session, so `PREFIX_SESSIONS=3` holds zero, one or two
+      sessions in practice. OPEN lead (a).
+      **Gates (all green on the branch):** DeepSeek server `10 passed in 93.31s` (`HIT … match_len=34/45`, prefix reuse
+      `hits 0 -> 1`); Qwen3-Next server 10 passed, Llama-3.2-1B server 10 passed; accumulator Qwen3-Next 8 passed and
+      MiniMax 8 passed; dense Llama-3.2-1B 5 passed and Llama-3.3-70B 5 passed; `test_multiturn.py` branch = `main`
+      (`2hit/0miss/0evict hit_rate=100% saved=3940/3980`).
+      **Reach, §8:** no new knob (`ENABLE_PREFIX_CACHE`, `PREFIX_SESSIONS` exist; `vaayu/server/app.py:417` and `:431` pass
+      them to `from_pretrained(...)`); reachable at N=1 on the server default (the DeepSeek server gate's own appending
+      turn was served from the pool); nothing is banked, but nothing reaches `main` users until the merge. Documented in
+      `vaayu/server/README.md` and `documentation/server.md` (§6, §6.2, the three knob rows).
+      **Does not do:** reuse a prompt that shares only a prefix (a new task under the same system prompt, an edited
+      history) — those prefill in full; an aborted turn drops the entry; disk persistence and TurboQuant pooling stay
+      refused. NEXT: S35, in its own fresh session (after the USER merges S34).
+
+- [x] **= S34 — DeepSeek-V4 has NO cross-turn prefix cache — ✅ CLOSED 2026-10-08 by S34 (branch `s34-deepseek-prefix-cache`, awaiting the merge). Row as it stood at close:**
+**= S34. DeepSeek-V4 has NO cross-turn prefix cache — every turn is a full prefill** (added 2026-10-03 in the
+      cleanup; the facts are scattered through the archive's A5.5/A5.7b/S17 records). The engine disables the prefix
+      cache at load for this model: `DeepseekV4Cache` / `DeepseekV4CacheLayer` implement none of the prefix store's
+      methods (`_PREFIX_STORE_METHODS = ("to_cpu", "to_device", "resident_bytes")`), and its compressed / windowed
+      layers make cropping exact only at `keep == L` (A5.5's "crop() REFUSES" property) — so
+      `batch.cache_holds_recurrent_state`, `prefix_cache.py`'s lookup / abort-path restore and `kv_persist` must
+      learn this cache before it can be stored. Cost today (S17 T6, one rep, 1k-token prompt): turn 2 is a full
+      1,280-token prefill, **47.1 s** TTFT, where a prefix HIT would prefill only the diff. Reach: every DeepSeek
+      turn after the first, N=1, server default. Unpriced build (a cache-format design, both prefix paths, the
+      prefix and server gates on DeepSeek). Re-rank at S26 with the DeepSeek levers above.
+
+- [x] **[bug] The server gate's prefix-reuse check cannot fail — ✅ FIXED 2026-10-08 by S34 Task 3 (`75c4278`, branch `s34-deepseek-prefix-cache`, awaiting the merge): the check parses the hit count and asserts it rose across a turn that appends; seen failing (`1 failed, 9 passed`, `hits 0 -> 0`) on a pool that never serves, green on DeepSeek-V4 (`hits 0 -> 1`). Row as it stood at close:**
+**[bug] The server gate's prefix-reuse check cannot fail** (found 2026-10-08 by S34's design reading; S34's
+  plan fixes it — if S34 closes without building, this stays open). `tests/test_server_smoke.py::test_prefix_reuse`
+  asserts `"hits=0" not in stats`, but `/health` returns `PrefixCacheStore.stats()`, whose format is
+  `0hit/1miss/0evict hit_rate=0% …` — the substring `hits=0` never occurs, so the assertion passes with zero hits
+  (reproduced: `PrefixCacheStore(0)` after one miss → `'0hit/1miss/0evict hit_rate=0% saved=0/3 tok (0%)'`). The
+  gates table's "prefix reuse firing" is therefore unproven on every model. Second half: the gate's two turns are
+  IDENTICAL, and an entry that is servable at one length (Qwen3-Next's hybrid cache today, DeepSeek-V4 after S34)
+  cannot serve a replay — the stored entry is prompt + generated tokens, which the same prompt does not contain.
+  Fix = parse the hit count and assert it rose across a turn that EXTENDS the previous one (system + user +
+  assistant reply + new user), then see it fail with the pool off.
