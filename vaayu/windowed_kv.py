@@ -97,3 +97,141 @@ class WindowedKVCache(FP8DynamicCache):
             logs[name].append(buf[..., :move, :].to("cpu", copy=True))
             buf[..., :held - move, :] = buf[..., move:held, :].clone()
         self._ring_start[layer_idx] = start + move
+
+    def _host_range(self, layer_idx, name, a, b):
+        """Logical positions [a, b) of one buffer list, gathered from the host log."""
+        pieces, pos = [], 0
+        for blk in self._host[layer_idx][name]:
+            n = blk.shape[-2]
+            lo, hi = max(a, pos), min(b, pos + n)
+            if lo < hi:
+                pieces.append(blk[..., lo - pos:hi - pos, :])
+            pos += n
+        return pieces[0] if len(pieces) == 1 else torch.cat(pieces, dim=-2)
+
+    def _host_truncate(self, layer_idx, a):
+        """Keep only logical positions [0, a) of the host log."""
+        logs = self._host.get(layer_idx, {})
+        for name, blocks in logs.items():
+            kept, pos = [], 0
+            for blk in blocks:
+                if pos >= a:
+                    break
+                n = blk.shape[-2]
+                kept.append(blk if pos + n <= a else blk[..., :a - pos, :])
+                pos += n
+            logs[name] = kept
+        if a == 0:
+            self._host.pop(layer_idx, None)
+
+    def _reload(self, layer_idx, need, length):
+        """Rebuild a windowed layer's ring at logical [need, length): the part
+        below ring_start from the host log (<= W-1 positions, H2D), the rest from
+        the ring itself; then cut the log at `need`."""
+        start = self._ring_start[layer_idx]
+        h_end = min(length, start)
+        in_ring = max(0, length - start)
+        n_host = h_end - need
+        for name in self._BUFFER_LISTS:
+            ring = getattr(self, name)[layer_idx]
+            tail = ring[..., :in_ring, :].clone()
+            if n_host > 0:
+                ring[..., :n_host, :] = self._host_range(
+                    layer_idx, name, need, h_end).to(ring.device)
+            ring[..., n_host:n_host + in_ring, :] = tail
+        self._host_truncate(layer_idx, need)
+        self._ring_start[layer_idx] = need
+
+    def crop(self, max_length: int) -> None:
+        """Length-only where the window the new length needs is still in VRAM;
+        otherwise the ring is rebuilt from the host log first. Pooled form: the
+        parent's length-only crop."""
+        for i, window in self.windows.items():
+            if i >= len(self._seq_len):
+                continue
+            length = min(self._seq_len[i], max_length)
+            need = max(0, length - (window - 1))
+            if need < self._ring_start.get(i, 0):
+                self._reload(i, need, length)
+        super().crop(max_length)
+
+    def crop_front(self, keep_len: int) -> None:
+        raise NotImplementedError(
+            "WindowedKVCache cannot drop its oldest positions: its windowed "
+            "layers keep them in a host log addressed by logical position. The "
+            "only engine caller (_trim_kv_cache_front) is dead code.")
+
+    def to_cpu(self) -> None:
+        """Pooled form: each windowed layer becomes ONE full-length compact
+        tensor (host log + ring), byte-identical to FP8DynamicCache's, so every
+        prefix-store rule applies unchanged. Blocks are freed as they are
+        copied, so the history is never held twice. The parent then compacts
+        the rest (its `pin_memory()` returns an already-pinned tensor as is)."""
+        pin = torch.cuda.is_available()
+        for i in self.windows:
+            if i >= len(self._seq_len) or i >= len(self.key_cache):
+                continue
+            start = self._ring_start.get(i, 0)
+            if (start == 0 and i not in self._host
+                    and self.key_cache[i].device.type == "cpu"):
+                continue                     # already pooled
+            held = self._seq_len[i] - start
+            logs = self._host.pop(i, {})
+            for name in self._BUFFER_LISTS:
+                lst = getattr(self, name)
+                ring = lst[i]
+                out = torch.empty((*ring.shape[:-2], self._seq_len[i], ring.shape[-1]),
+                                  dtype=ring.dtype, device="cpu", pin_memory=pin)
+                pos, blocks = 0, logs.get(name, [])
+                while blocks:
+                    blk = blocks.pop(0)
+                    out[..., pos:pos + blk.shape[-2], :] = blk
+                    pos += blk.shape[-2]
+                    del blk
+                out[..., pos:, :] = ring[..., :held, :]
+                lst[i] = out
+            self._ring_start[i] = 0
+        super().to_cpu()
+
+    def to_device(self, device) -> None:
+        """Device form: a windowed layer uploads only its last min(seq_len, W-1)
+        positions into a fresh ring; the pooled CPU tensor stays behind as its
+        host log (a view, no copy). Called on pooled entries only."""
+        for i, window in self.windows.items():
+            if i >= len(self._seq_len) or i >= len(self.key_cache):
+                continue
+            seq = self._seq_len[i]
+            if seq == 0 or self._ring_start.get(i, 0) or i in self._host:
+                continue                     # empty, or already in device form
+            keep = min(seq, window - 1)
+            start = seq - keep
+            cap = ring_tokens(window, self.chunk)
+            logs = {}
+            for name in self._BUFFER_LISTS:
+                lst = getattr(self, name)
+                full = lst[i]
+                ring = torch.zeros((*full.shape[:-2], max(cap, keep), full.shape[-1]),
+                                   dtype=full.dtype, device=device)
+                ring[..., :keep, :] = full[..., start:seq, :]
+                logs[name] = [full[..., :start, :]]
+                lst[i] = ring
+            self._ring_start[i] = start
+            if start:
+                self._host[i] = logs
+        super().to_device(device)
+
+    def copy_prefix(self, length: int) -> "WindowedKVCache":
+        """Lend from a POOLED entry only (the prefix store's entries are pooled)."""
+        if self._host or any(self._ring_start.values()):
+            raise RuntimeError(
+                "WindowedKVCache.copy_prefix lends from a pooled entry only; this "
+                "one is in device form (ring + host log). Call to_cpu() first.")
+        out = super().copy_prefix(length)
+        out.windows, out.chunk = dict(self.windows), self.chunk
+        return out
+
+    def resident_bytes(self) -> int:
+        """VRAM buffers plus the host log (empty in pooled form)."""
+        return super().resident_bytes() + sum(
+            blk.nbytes for logs in self._host.values()
+            for blocks in logs.values() for blk in blocks)

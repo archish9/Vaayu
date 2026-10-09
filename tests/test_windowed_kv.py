@@ -164,3 +164,118 @@ def test_spill_is_right_under_queued_gpu_work():
     torch.cuda.synchronize()
     del big, win
     torch.cuda.empty_cache()   # test_decode_graphs measures memory_reserved() deltas
+
+# ── forms: pooled / device, crop, lending, abort (Task 2) ───────────────────
+
+def _continue(win, ref, geo, seed, steps=(2, 1, 1)):
+    g = GEOMETRIES[geo]
+    gen = torch.Generator().manual_seed(seed)
+    dev = next(t.device for t in ref.key_cache if t.shape[-2] > 0)
+    for n in steps:
+        for i, w in g["layers"].items():
+            k, v = _kv(gen, g["heads"], n, g["head_dim"], dev)
+            _check_step(win, ref, k, v, i, w)
+
+
+def _assert_pooled_equal(win, ref):
+    win.to_cpu()
+    ref.to_cpu()
+    assert not win._host and not any(win._ring_start.values())
+    for name in ref._BUFFER_LISTS:
+        for i in range(len(ref._seq_len)):
+            assert torch.equal(getattr(win, name)[i], getattr(ref, name)[i]), (name, i)
+    assert win._seq_len == ref._seq_len
+    assert win.resident_bytes() == ref.resident_bytes()
+
+
+@GEO
+@QUANT
+def test_pooled_form_is_byte_identical_to_the_full_length_cache(geo, quantize):
+    win, ref = _feed(geo, quantize)
+    _assert_pooled_equal(win, ref)
+
+
+@GEO
+@pytest.mark.parametrize("where", ["N", "N-1", "inside-ring", "below-ring", "tiny", "zero"])
+def test_crop_then_continue_matches(geo, where):
+    win, ref = _feed(geo, False)
+    i = min(win.windows)
+    n = ref._seq_len[i]
+    target = {"N": n, "N-1": n - 1, "inside-ring": n - 2,
+              "below-ring": win._ring_start[i] - 3, "tiny": 1, "zero": 0}[where]
+    if where == "below-ring":
+        assert target + (win.windows[i] - 1) < win._ring_start[i] + win.windows[i], target
+    win.crop(target)
+    ref.crop(target)
+    _continue(win, ref, geo, seed=10)
+    _assert_pooled_equal(win, ref)
+
+
+@GEO
+def test_store_hit_crop_below_the_ring_and_store_again(geo):
+    """The harmony reasoning turn: pooled entry -> to_device -> crop well below
+    the ring -> continue -> pool again, twice over."""
+    win, ref = _feed(geo, False)
+    for cycle in range(2):
+        win.to_cpu()
+        ref.to_cpu()
+        win.to_device("cpu")
+        ref.to_device("cpu")
+        i = min(win.windows)
+        assert win.key_cache[i].shape[-2] == ring_tokens(win.windows[i], win.chunk)
+        target = ref._seq_len[i] - (win.windows[i] + 5)
+        win.crop(target)
+        ref.crop(target)
+        _continue(win, ref, geo, seed=20 + cycle, steps=(3, 1, 1, 1))
+    _assert_pooled_equal(win, ref)
+
+
+@GEO
+def test_copy_prefix_lends_a_windowed_copy(geo):
+    win, ref = _feed(geo, False)
+    win.to_cpu()
+    ref.to_cpu()
+    owner = copy.deepcopy(win)
+    length = ref._seq_len[min(win.windows)] - 7
+    lent, lent_ref = win.copy_prefix(length), ref.copy_prefix(length)
+    assert type(lent) is WindowedKVCache
+    assert lent.windows == win.windows and lent.chunk == win.chunk
+    lent.to_device("cpu")
+    lent_ref.to_device("cpu")
+    _continue(lent, lent_ref, geo, seed=30)
+    _assert_pooled_equal(lent, lent_ref)
+    _assert_pooled_equal(win, owner)          # the owner's entry is untouched
+
+
+def test_copy_prefix_refuses_the_device_form():
+    win, _ref = _feed("small-mixed", False)
+    assert any(win._ring_start.values())
+    with pytest.raises(RuntimeError, match="pooled"):
+        win.copy_prefix(3)
+
+
+def test_crop_front_is_refused():
+    win = WindowedKVCache(quantize=False, windows={0: 8}, chunk=4)
+    with pytest.raises(NotImplementedError):
+        win.crop_front(3)
+
+
+def test_restore_on_abort_pools_a_consistent_windowed_entry():
+    """A forward that died after layer 1 and before layer 2 (ragged), on a
+    device-form cache with spilled positions."""
+    from vaayu.prefix_cache import PrefixCacheStore, restore_on_abort
+    geo = "small-mixed"
+    g = GEOMETRIES[geo]
+    win, ref = _feed(geo, False)
+    gen = torch.Generator().manual_seed(40)
+    for i in (0, 1):                         # layers 0 and 1 got the new chunk, 2 did not
+        k, v = _kv(gen, g["heads"], 4, g["head_dim"])
+        win.update(k, v, i)
+        ref.update(k, v, i)
+    prefix_len = min(ref._seq_len)
+    store = PrefixCacheStore(10 ** 9)
+    token_ids = list(range(prefix_len + 10))
+    assert restore_on_abort(store, "s", token_ids, win, prefix_len) is True
+    ref.crop(prefix_len)
+    pooled = store._pool["s"].cache
+    _assert_pooled_equal(pooled, ref)
