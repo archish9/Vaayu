@@ -106,3 +106,28 @@ def test_batch_admission_counts_the_same_layers_as_the_reserve():
     stub = _stub(layers, kvh, hd, hidden, heads, windows)
     n_layers, n_kv_heads, head_dim, _elem = geo_from_model(stub)
     assert (n_layers, n_kv_heads, head_dim) == (12, 8, 64)
+
+
+def _deepseek_shaped_stub():
+    """DeepSeek-V4 keeps its attention at `.attn` with `window_size`, and overrides
+    the per-token figure with a measured one. No `self_attn.sliding_window`, so
+    the real lookup must find no windows and nothing may be discounted twice."""
+    cfg = types.SimpleNamespace(num_hidden_layers=4, num_attention_heads=64,
+                                num_key_value_heads=1, head_dim=512, hidden_size=4096)
+    layers = [types.SimpleNamespace(attn=types.SimpleNamespace(window_size=128, layer_idx=i))
+              for i in range(4)]
+    return types.SimpleNamespace(
+        config=cfg, model=types.SimpleNamespace(layers=layers),
+        layer_names_dict={"layer_prefix": "layers"}, kv_cache_mode="auto",
+        loader_strategy=object(), prefill_chunk_size=512,
+        _kv_cache_is_bucketed=lambda: True,
+        planned_kv_bytes_per_token=lambda: (6880, False, "measured"))
+
+
+def test_a_deepseek_shaped_tree_maps_no_windows():
+    from vaayu.windowed_kv import kv_windows_of
+    stub = _deepseek_shaped_stub()
+    assert kv_windows_of(stub) == {}
+    assert per_token_window_discount(stub) == 0
+    assert VaayuBaseModel.planned_kv_constant_bytes(stub) == 0
+    assert VaayuBaseModel.pooled_kv_bytes_per_token(stub) == 6880
