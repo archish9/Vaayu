@@ -365,8 +365,11 @@ borrowing behave as on any other model. The VRAM plan charges these layers as a
 constant ring instead of per token (the `[Vaayu-VRAM] KV cost:` load line names it);
 the host-RAM reservation for pooled sessions still charges them per token.
 
-Not available on such a load, each with a WARNING at load: `PREFIX_COMPRESS`,
-`ENABLE_KV_PERSIST`, decode CUDA graphs, and the prefix cache inside `batched_generate`.
+Not available on such a load: `PREFIX_COMPRESS`, `ENABLE_KV_PERSIST` and decode CUDA
+graphs (each with a WARNING at load), and the prefix cache inside `batched_generate`
+(a WARNING per batch).
 `KV_CACHE_MODE="turboquant"` and `PREFILL_CHUNK_SIZE=0` keep every position and the full
-per-token charge. `KV_CACHE_MODE="fp16"` on gpt-oss is fixed by the same change: it
-crashed past 128 tokens before S35.
+per-token charge. Under `KV_CACHE_MODE="fp16"` the cache is transformers' own, which stores windowed layers
+at window length itself; Vaayu hands those layers the same per-layer mask. This needs
+chunked prefill: with `PREFILL_CHUNK_SIZE = 0` a model with windowed layers fails under
+`fp16` once the context passes the window.

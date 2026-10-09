@@ -9,7 +9,7 @@ from vaayu.batch import geo_from_model, kv_bearing_layer_count
 from vaayu.vaayu_base import VaayuBaseModel
 from vaayu.vram_plan import (DEFAULT_ALLOC_FACTOR, VramShape, _kv_term_bytes, kv_bytes_per_token,
                              plan_vram, predict_peak_vram, reserve_floor_bytes)
-from vaayu.windowed_kv import per_layer_kv_bytes, per_token_window_discount
+from vaayu.windowed_kv import per_layer_kv_bytes, per_token_window_discount, ring_tokens
 
 GiB = 1024 ** 3
 
@@ -71,29 +71,33 @@ def _stub(layers, kv_heads, head_dim, hidden, heads, windows, mode="bf16", chunk
 
 
 GEOS = {
-    #                layers kvh hd  hidden heads windows
-    "gptoss-like":   (24, 8, 64, 2880, 64, {i: 128 for i in range(0, 24, 2)}),
-    "qwen3next-like": (48, 2, 256, 2048, 16, {}),
-    "minimax-like":  (62, 8, 128, 3072, 48, {}),
-    "all-windowed":  (4, 8, 64, 512, 8, {0: 32, 1: 32, 2: 32, 3: 32}),
+    #                layers kvh hd  hidden heads windows              mode   chunk
+    "gptoss-like":   (24, 8, 64, 2880, 64, {i: 128 for i in range(0, 24, 2)}, "bf16", 512),
+    "small-windowed": (6, 2, 16, 64, 4, {1: 8, 4: 3}, "fp8", 4),
+    "qwen3next-like": (48, 2, 256, 2048, 16, {}, "bf16", 512),
+    "minimax-like":  (62, 8, 128, 3072, 48, {}, "bf16", 512),
+    "all-windowed":  (4, 8, 64, 512, 8, {0: 32, 1: 32, 2: 32, 3: 32}, "bf16", 512),
 }
 
 
 @pytest.mark.parametrize("geo", sorted(GEOS))
 def test_planned_figures_on_stub_geometries(geo):
-    layers, kvh, hd, hidden, heads, windows = GEOS[geo]
-    stub = _stub(layers, kvh, hd, hidden, heads, windows)
+    layers, kvh, hd, hidden, heads, windows, mode, chunk = GEOS[geo]
+    stub = _stub(layers, kvh, hd, hidden, heads, windows, mode=mode, chunk=chunk)
     full = kv_bytes_per_token(num_hidden_layers=kv_bearing_layer_count(stub),
-                              num_key_value_heads=kvh, head_dim=hd, kv_cache_mode="bf16")
+                              num_key_value_heads=kvh, head_dim=hd, kv_cache_mode=mode)
     per_layer = per_layer_kv_bytes(stub)
     planned = VaayuBaseModel.planned_kv_bytes_per_token(stub)[0]
     const = VaayuBaseModel.planned_kv_constant_bytes(stub)
     pooled = VaayuBaseModel.pooled_kv_bytes_per_token(stub)
-    if geo == "gptoss-like":
-        assert per_token_window_discount(stub) == 12
-        assert planned == full - 12 * per_layer == 24576
-        assert const == 12 * (127 + 2 * 512) * per_layer == 28_286_976
-        assert pooled == full == 49152
+    if geo in ("gptoss-like", "small-windowed"):
+        n = len(windows)
+        assert per_token_window_discount(stub) == n
+        assert planned == full - n * per_layer
+        assert const == per_layer * sum(ring_tokens(w, chunk) for w in windows.values())
+        assert pooled == planned + n * per_layer == full
+        if geo == "gptoss-like":
+            assert planned == 24576 and const == 28_286_976 and pooled == 49152
     else:
         # No window, or every layer windowed (nothing left to grow with context):
         # today's charge exactly, no constant, pooled == planned.
@@ -102,8 +106,8 @@ def test_planned_figures_on_stub_geometries(geo):
 
 
 def test_batch_admission_counts_the_same_layers_as_the_reserve():
-    layers, kvh, hd, hidden, heads, windows = GEOS["gptoss-like"]
-    stub = _stub(layers, kvh, hd, hidden, heads, windows)
+    layers, kvh, hd, hidden, heads, windows, mode, chunk = GEOS["gptoss-like"]
+    stub = _stub(layers, kvh, hd, hidden, heads, windows, mode=mode, chunk=chunk)
     n_layers, n_kv_heads, head_dim, _elem = geo_from_model(stub)
     assert (n_layers, n_kv_heads, head_dim) == (12, 8, 64)
 

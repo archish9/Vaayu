@@ -204,7 +204,7 @@ def test_crop_then_continue_matches(geo, where):
     target = {"N": n, "N-1": n - 1, "inside-ring": n - 2,
               "below-ring": win._ring_start[i] - 3, "tiny": 1, "zero": 0}[where]
     if where == "below-ring":
-        assert target + (win.windows[i] - 1) < win._ring_start[i] + win.windows[i], target
+        assert max(0, target - (win.windows[i] - 1)) < win._ring_start[i], target
     win.crop(target)
     ref.crop(target)
     _continue(win, ref, geo, seed=10)

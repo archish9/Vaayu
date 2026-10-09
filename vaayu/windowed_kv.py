@@ -42,8 +42,11 @@ def kv_windows_of(model) -> dict:
     {} under TurboQuant (its own update never windows; it is charged in full) and
     when `prefill_chunk_size <= 0` (an unchunked prefill puts the whole prompt in
     one update, which the plan's constant ring term cannot bound). fp16 mode
-    keeps its windows: transformers' own DynamicSlidingWindowLayer stores those
-    layers at window length, and the mask hook must slice for them too.
+    keeps its windows only while `prefill_chunk_size > 0`: transformers' own
+    DynamicSlidingWindowLayer stores those layers at window length, and the mask
+    hook must slice for them too. The same `chunk <= 0` rule applies to every
+    mode, so fp16 with `prefill_chunk_size <= 0` gets the full-width mask and
+    fails past the window (pre-existing on main, ledgered in todo.md).
 
     Cached on the model once a layer tree is found -- the answer cannot change
     after load. Not cached while there is no tree yet.
