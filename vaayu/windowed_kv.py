@@ -66,6 +66,33 @@ def kv_windows_of(model) -> dict:
     return windows
 
 
+def per_token_window_discount(model) -> int:
+    """How many KV-bearing layers the VRAM plan stops charging per token because
+    the cache stores them at window length. 0 when there are none -- and 0 when
+    EVERY KV layer is windowed: nothing would then grow with context, so the plan
+    keeps charging them per token (over-reserving, but the context search stays
+    bounded)."""
+    windows = kv_windows_of(model)
+    if not windows:
+        return 0
+    from .batch import kv_bearing_layer_count
+    return len(windows) if len(windows) < kv_bearing_layer_count(model) else 0
+
+
+def per_layer_kv_bytes(model) -> int:
+    """KV bytes ONE layer stores per position under this load's mode."""
+    from .vram_plan import kv_bytes_per_token
+    cfg = model.config
+    n_heads = cfg.num_attention_heads
+    head_dim = getattr(cfg, "head_dim", None)
+    if not isinstance(head_dim, int):
+        head_dim = cfg.hidden_size // n_heads
+    return kv_bytes_per_token(num_hidden_layers=1,
+                              num_key_value_heads=getattr(cfg, "num_key_value_heads", n_heads),
+                              head_dim=head_dim,
+                              kv_cache_mode=getattr(model, "kv_cache_mode", "auto"))
+
+
 def window_stored_keys(model, layer, window, len_p, len_s):
     """Keys the KV cache hands this layer's attention when it stores the layer
     at window length -- min(past, W-1) + new, transformers' own rule -- or None

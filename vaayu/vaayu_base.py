@@ -2723,10 +2723,16 @@ class VaayuBaseModel(GenerationMixin):
             # KV, RC4 (c)), or a model's own measurement of its cache (S15 L-b:
             # DeepSeek-V4's preallocated compressed cache).
             _kv_per_token, _kv_bucketed, _kv_source = self.planned_kv_bytes_per_token()
+            _kv_constant = self.planned_kv_constant_bytes()
+            # Byte-identical to the pre-S35 line on every model without windowed layers.
             print(f"[Vaayu-VRAM] KV cost: {_kv_per_token / 1024:.1f} KiB/token "
-                  f"({'bucketed' if _kv_bucketed else 'exact'}; {_kv_source})")
+                  f"({'bucketed' if _kv_bucketed else 'exact'}; {_kv_source})"
+                  + (f" + {_kv_constant / 1024 ** 2:.1f} MiB for "
+                     f"{len(getattr(self, '_kv_windows', None) or {})} windowed layer(s) "
+                     f"stored at window length" if _kv_constant else ""))
             _shape = VramShape(
                 kv_per_token=_kv_per_token,
+                kv_constant_bytes=_kv_constant,
                 N=1, chunk=max(1, self.prefill_chunk_size),
                 hidden=self.config.hidden_size, n_heads=_n_heads,
                 vocab=self.config.vocab_size,
@@ -3058,7 +3064,9 @@ class VaayuBaseModel(GenerationMixin):
                 # before S34: a model whose cache is not a per-layer K/V stack
                 # overrides it, and the formula priced one such prefix session at
                 # 13x its real size. Unchanged for every model that does not.
-                _kv_tok = int(self.planned_kv_bytes_per_token()[0])
+                # S35: POOLED entries are full length even where the live cache
+                # stores a layer at window length, so this asks the pooled figure.
+                _kv_tok = int(self.pooled_kv_bytes_per_token())
             except Exception:
                 _kv_tok = 0        # D3: a sizing helper must not become the crash
             _prefix_on = bool(getattr(self, "enable_prefix_cache", False))
@@ -4242,18 +4250,43 @@ class VaayuBaseModel(GenerationMixin):
         used -- KV-bearing layers x KV heads x head_dim x the mode's bytes, against
         a capacity that doubles when the cache is one of Vaayu's ring buffers
         (_kv_cache_is_bucketed). A model whose cache is neither (DeepSeek-V4's
-        preallocated compressed cache) overrides this."""
+        preallocated compressed cache) overrides this. S35: a layer the cache stores
+        at window length is not charged per token -- its ring is
+        planned_kv_constant_bytes()."""
         from .batch import kv_bearing_layer_count
         from .vram_plan import kv_bytes_per_token
+        from .windowed_kv import per_token_window_discount
         n_heads = self.config.num_attention_heads
         head_dim = getattr(self.config, "head_dim", None)
         if not isinstance(head_dim, int):
             head_dim = self.config.hidden_size // n_heads
         return (kv_bytes_per_token(
-                    num_hidden_layers=kv_bearing_layer_count(self),
+                    num_hidden_layers=(kv_bearing_layer_count(self)
+                                       - per_token_window_discount(self)),
                     num_key_value_heads=getattr(self.config, "num_key_value_heads", n_heads),
                     head_dim=head_dim, kv_cache_mode=self.kv_cache_mode),
                 self._kv_cache_is_bucketed(), "config")
+
+    def planned_kv_constant_bytes(self) -> int:
+        """Bytes the windowed layers' rings hold whatever the context (S35): each
+        layer a WindowedKVCache stores at window length keeps ring_tokens(W,
+        chunk) positions in VRAM. 0 wherever the window discount does not apply."""
+        from .windowed_kv import (kv_windows_of, per_layer_kv_bytes,
+                                  per_token_window_discount, ring_tokens)
+        if not per_token_window_discount(self):
+            return 0
+        chunk = max(1, int(self.prefill_chunk_size))
+        return per_layer_kv_bytes(self) * sum(
+            ring_tokens(w, chunk) for w in kv_windows_of(self).values())
+
+    def pooled_kv_bytes_per_token(self) -> int:
+        """Host bytes ONE pooled token costs (S35). A pooled entry is full length
+        even where the live cache stores a layer at window length, so the layers
+        the VRAM figure leaves out are charged here. Equal to
+        planned_kv_bytes_per_token()[0] on every model without windowed layers."""
+        from .windowed_kv import per_layer_kv_bytes, per_token_window_discount
+        return (int(self.planned_kv_bytes_per_token()[0])
+                + per_token_window_discount(self) * per_layer_kv_bytes(self))
 
     def _kv_cache_is_bucketed(self) -> bool:
         """Whether _create_kv_cache (below) would return a geometric-doubling

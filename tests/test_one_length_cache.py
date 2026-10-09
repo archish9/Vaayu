@@ -262,9 +262,12 @@ def test_an_ordinary_models_session_is_priced_as_before(layers, kv_heads, head_d
 
 
 def test_the_expert_ceiling_is_fed_the_models_own_kv_cost_by_source():
+    """S35: the reserve prices POOLED sessions, which are full length even where
+    the live cache stores a layer at window length -- so it asks the pooled
+    figure (equal to the planned one on every model without windowed layers)."""
     src = BASE_SRC.read_text()
-    fed = src.find("_kv_tok = int(self.planned_kv_bytes_per_token()[0])")
+    fed = src.find("_kv_tok = int(self.pooled_kv_bytes_per_token())")
     ceiling = src.find("_ceiling = derive_expert_ceiling(")
-    assert fed != -1, "the reserve does not ask the model for its KV cost"
+    assert fed != -1, "the reserve does not ask the model for its pooled KV cost"
     assert fed < ceiling
     assert "kv_bytes_per_token as _kv_per_tok" not in src, "the inlined formula is back"

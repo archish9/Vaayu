@@ -275,6 +275,11 @@ class VramShape:
     # attention_score_cost() hook, never a literal; 0.0 for flash/sdpa and for
     # every shape built before it, so none of their predictions move.
     score_bytes_per_key: float = 0.0
+    # Bytes the KV cache holds WHATEVER the context (S35): the rings of the
+    # layers a WindowedKVCache stores at window length, each `ring_tokens(W,
+    # chunk)` positions. Charged once per stream beside the per-token term. 0 for
+    # every model without windowed layers, so none of their predictions move.
+    kv_constant_bytes: int = 0
 
 
 def _prefill_chunks(shape: VramShape, S: int) -> list[tuple[int, int, int]]:
@@ -333,7 +338,7 @@ def _kv_term_bytes(shape: VramShape, S: int) -> int:
     allocator."""
     cap = kv_capacity_tokens(int(S), chunk=shape.chunk, growth=shape.kv_growth_factor,
                              buckets=shape.kv_capacity_buckets)
-    return shape.kv_per_token * cap * shape.N
+    return shape.kv_per_token * cap * shape.N + shape.kv_constant_bytes * shape.N
 
 
 def _peak_intercept_bytes(shape: VramShape, S: int) -> float:
@@ -435,11 +440,13 @@ def predict_peak_vram(shape: VramShape, S: int) -> int:
         tokens_last, _, cap_final = chunks[-1]
         raw = (_peak_transient_bytes(shape, tokens_last)
                + max(_score_term_bytes(shape, q, k) for q, k, _ in chunks)
-               + shape.kv_per_token * cap_final * shape.N)
+               + shape.kv_per_token * cap_final * shape.N
+               + shape.kv_constant_bytes * shape.N)
     else:
         raw = max(_peak_transient_bytes(shape, tokens)
                   + _score_term_bytes(shape, tokens, needed)
                   + shape.kv_per_token * cap * shape.N
+                  + shape.kv_constant_bytes * shape.N
                   for tokens, needed, cap in chunks)
     return int(round(raw * shape.alloc_factor))
 
