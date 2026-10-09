@@ -229,8 +229,10 @@ attention implementation:
 - **Score-materializing loads (sdpa, and eager: gpt-oss and DeepSeek-V4 on the server
   default; dense included):** the floor is the reserve that gives flash-parity context. A
   requested `max_seq_len` below flash parity caps that parity, so the floor falls and the
-  difference goes back to pinning and the expert cache (since S15 L-b, 2026-10-01). Above
-  flash parity it changes nothing. The floor is also never allowed to take the pin budget
+  difference goes back to pinning and the expert cache (since S15 L-b, 2026-10-01). On a
+  load without windowed layers, a request above flash parity changes nothing; on one with
+  windowed layers (gpt-oss-20b) a longer request is planned and costs the expert tier (the
+  two measured figures below). The floor is also never allowed to take the pin budget
   an MoE load's non-expert weights need (`protected pin demand` in the load log).
   gpt-oss is the eager example: its floor is the parity floor priced at the full-length KV
   cost of its cache (8.77 GiB at the derived 33,213 tokens; protection does not bind, 3.35
