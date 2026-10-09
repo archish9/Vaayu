@@ -340,8 +340,9 @@ the clean 0.45–0.56 ms/token before any build.
           71.57 / 71.30 s (110.26); tier hit 0.584 / 0.526 (0.42 / 0.404). VmHWM 30.7k 16.196 / 16.202 vs 16.182 GiB (+15.3 / +21.7
           MB: 2.7–9.1 MB past the 12.6 MB one-block allowance, ruled PASS in substance against the pre-fix ~700 MB; 6–8 MB below main at
           8k). Gates after the rule all green (server ×5 10 passed each, dense ×2 5 passed, accumulator ×2 8 passed); the other
-          four models' `KV cost:` lines md5-identical and none prints the new load line. Branch suite 3913 passed, 26 skipped
-          (`becdf31`). §8: no new knob; more context = the existing `MAX_SEQ_LEN` (measured price: 40,442 tokens → tier 3
+          four models' `KV cost:` lines md5-identical and none prints the new load line. Branch suite 3918 passed, 26 skipped
+          (`2199298`, the final code head, 253.89 s; 3913 at `becdf31`); gpt-oss server gate re-run on it: 10 passed, plan unchanged
+          (33,213 / 8.77 GiB, no layer pruned, HIT 83/146). §8: no new knob; more context = the existing `MAX_SEQ_LEN` (measured price: 40,442 tokens → tier 3
           experts, 8k decode 85.6 ms), documented in `vaayu/server/README.md`, `documentation/server.md`, `documentation/TUNING.md`
           §3c; reachable at N=1 on the server default. **STATE: ready to merge on the USER's word; then the row closes and its
           full text moves to `todo-backlog.md` (CLAUDE.md §6). NEXT after the merge: the elastic tier (spec §8b), its own spec.**
