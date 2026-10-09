@@ -302,7 +302,7 @@ the clean 0.45–0.56 ms/token before any build.
       - **BUILT AND MEASURED 2026-10-09 (branch `s35-windowed-kv`, head `15d95a8`; NOT merged).** Commits `b487c80`, `8346f06`
         (ring + spill), `67b9c02` (pooled/device forms, crop reload, lending, abort), `e4d92a8` (wiring, per-layer mask slice, sdpa gap),
         `b38a82c` + `f71006d` (planner constant + pooled host figure), `5e3513a` (refusals), `15d95a8` (RSS fix). **Branch suite on the
-        final head: 3904 passed, 26 skipped, 538 warnings (246.71 s)**; `main`'s floor stays 3827 until a merge. RESULTS
+        final head: 3905 passed, 26 skipped, 538 warnings (277.71 s, `12aa5e7`, after the final-review fix wave; 3904 at `15d95a8`)**; `main`'s floor stays 3827 until a merge. RESULTS
         `docs/2026-10-09-S35-windowed-kv-RESULTS.md` (logs `plans/probes/s35_out/`).
         - **Stock equivalence (spec §6.1) PASSES:** branch vs stock transformers' DEFAULT cache bitwise 64/64, G ids == stock; main
           control is bitwise vs the FULL-length cache instead (64/64; vs default 5/64, max|d| 1.781; ids differ at 50 = S13's tie).
