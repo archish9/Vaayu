@@ -279,3 +279,45 @@ def test_restore_on_abort_pools_a_consistent_windowed_entry():
     ref.crop(prefix_len)
     pooled = store._pool["s"].cache
     _assert_pooled_equal(pooled, ref)
+
+
+def _count_releases(monkeypatch, win=None, seen=None):
+    calls = []
+
+    def fake():
+        calls.append(None)
+        if seen is not None:
+            seen.append([id(t) for t in win.key_cache])
+    monkeypatch.setattr("vaayu.windowed_kv.release_freed_host_pages", fake)
+    return calls
+
+
+def test_to_cpu_releases_the_freed_spill_pages_once(monkeypatch):
+    win, _ = _feed("small-mixed", False)
+    calls = _count_releases(monkeypatch)
+    win.to_cpu()
+    assert len(calls) == 1
+    win.to_cpu()
+    assert len(calls) == 1
+
+    short = WindowedKVCache(quantize=False, windows={1: 8}, chunk=4)
+    gen = torch.Generator().manual_seed(1)
+    for _ in range(3):
+        k, v = _kv(gen, 2, 1, 16)
+        short.update(k, v, 0)
+        short.update(k, v, 1)
+    assert not short._host.get(1)
+    short.to_cpu()
+    assert len(calls) == 1
+
+
+def test_the_release_runs_before_the_parent_compacts(monkeypatch):
+    win, _ = _feed("small-mixed", False)
+    before = [id(t) for t in win.key_cache]
+    seen = []
+    _count_releases(monkeypatch, win, seen)
+    win.to_cpu()
+    full = 0                               # layer 0 is the full-attention layer
+    assert seen[0][full] == before[full], "the parent compacted before the release"
+    assert [id(t) for t in win.key_cache][full] != before[full], \
+        "premise: the parent replaces the full layer's buffer"

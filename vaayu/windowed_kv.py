@@ -12,6 +12,8 @@ Attention is handed exactly what transformers' own DynamicSlidingWindowLayer
 hands it: the last min(past, W-1) positions plus the new ones. Windows are read
 off the attention modules, never from an architecture name (CLAUDE.md §5).
 """
+import ctypes
+
 import torch
 
 from .vaayu_base import FP8DynamicCache
@@ -120,6 +122,21 @@ def ring_tokens(window: int, chunk: int) -> int:
     needs, one spill block and one chunk of new positions (block = chunk, so a
     spill happens at most once per `chunk` positions of growth)."""
     return (int(window) - 1) + 2 * max(1, int(chunk))
+
+
+def release_freed_host_pages() -> None:
+    """Hand freed host pages back to the OS (glibc `malloc_trim(0)`).
+
+    WindowedKVCache.to_cpu frees every spill block it copies, but glibc keeps
+    those pages resident: its dynamic mmap threshold moves past the block size
+    after the first free, so later blocks come from the heap and stay in RSS.
+    Measured on gpt-oss-20b's geometry at 30,720 tokens (S35): RSS after the
+    pool store 3.17 GiB against FP8DynamicCache's 2.49, and 2.44 for both after
+    one trim. A no-op where libc has no malloc_trim."""
+    try:
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except (OSError, AttributeError):
+        pass
 
 
 class WindowedKVCache(FP8DynamicCache):
@@ -266,6 +283,7 @@ class WindowedKVCache(FP8DynamicCache):
         copied, so the history is never held twice. The parent then compacts
         the rest (its `pin_memory()` returns an already-pinned tensor as is)."""
         pin = torch.cuda.is_available()
+        freed = 0
         for i in self.windows:
             if i >= len(self._seq_len) or i >= len(self.key_cache):
                 continue
@@ -283,12 +301,15 @@ class WindowedKVCache(FP8DynamicCache):
                 pos, blocks = 0, logs.get(name, [])
                 while blocks:
                     blk = blocks.pop(0)
+                    freed += 1
                     out[..., pos:pos + blk.shape[-2], :] = blk
                     pos += blk.shape[-2]
                     del blk
                 out[..., pos:, :] = ring[..., :held, :]
                 lst[i] = out
             self._ring_start[i] = 0
+        if freed:
+            release_freed_host_pages()   # before the parent pins the rest
         super().to_cpu()
 
     def to_device(self, device) -> None:
