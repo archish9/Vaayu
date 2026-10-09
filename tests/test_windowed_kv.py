@@ -134,19 +134,33 @@ def test_no_window_means_the_parent_exactly():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 def test_spill_is_right_under_queued_gpu_work():
-    """The spill's D2H must be blocking: queue a long GPU job right before every
-    update so a non_blocking copy would land before the bytes do."""
+    """The spill's D2H must be blocking. Queue GPU work ahead of every update and
+    read the newest host block right after the update returns, before any sync:
+    a non_blocking copy has not landed yet, so the read would be wrong. Nothing in
+    the loop syncs (the K/V are moved to the device before the loop, and the
+    reference is the CPU copies), so the read is the first sync-free look."""
     gen = torch.Generator().manual_seed(3)
+    heads, head_dim = 2, 16
+    plan = [4, 4, 4] + [1] * 40
+    cpu_kv = [_kv(gen, heads, n, head_dim) for n in plan]
+    gpu_kv = [(k.to("cuda"), v.to("cuda")) for k, v in cpu_kv]
+    torch.cuda.synchronize()
     win = WindowedKVCache(quantize=False, windows={0: 8}, chunk=4)
-    ref = FP8DynamicCache(quantize=False)
-    big = torch.randn(2048, 2048, device="cuda")
-    for n in [4, 4, 4] + [1] * 40:
-        k, v = _kv(gen, 2, n, 16, device="cuda")
-        _ = big @ big                       # queued work ahead of the copy
-        _check_step(win, ref, k, v, 0, 8)
-    start = win._ring_start[0]
-    host = torch.cat(win._host[0]["key_cache"], dim=-2)
-    assert host.device.type == "cpu"
-    assert torch.equal(host, ref.key_cache[0][..., :start, :].cpu())
-    del big, win, ref
+    big = torch.randn(4096, 4096, device="cuda")
+    cpu_keys, spills = [], 0
+    for (k_cpu, _), (k, v) in zip(cpu_kv, gpu_kv):
+        cpu_keys.append(k_cpu)
+        old = win._ring_start.get(0, 0)
+        for _ in range(3):
+            _ = big @ big                   # queued work ahead of any copy
+        win.update(k, v, 0)
+        new = win._ring_start.get(0, 0)
+        if new > old:
+            spills += 1
+            want = torch.cat(cpu_keys, dim=-2)[..., old:new, :]
+            got = win._host[0]["key_cache"][-1].clone()   # no sync before this read
+            assert torch.equal(got, want)
+    assert spills > 0, "the plan must cross at least one spill"
+    torch.cuda.synchronize()
+    del big, win
     torch.cuda.empty_cache()   # test_decode_graphs measures memory_reserved() deltas
