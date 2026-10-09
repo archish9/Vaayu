@@ -194,7 +194,7 @@ you got:
 On gpt-oss-20b routed delivery routes top_k × layers = 96 experts (1.27 GB) per token instead of
 10.17 GB, and after warm-up all of its experts sit in the RAM cache, so decode no longer waits on
 the disk. The routed experts that are already in the VRAM expert cache are not uploaded again:
-about 40 % of them on this model, whose cache holds 111-133 of its 768 experts beside the
+about 58 % of them at 8k context (53 % at 30.7k) on this model, whose cache holds about 184 of its 768 experts beside the
 context reserve. The output is bit-identical to stock transformers. There is no setting for it.
 
 Two log lines belong to this path. `Expert VRAM cache budget A -> B GB (~N experts): the routed

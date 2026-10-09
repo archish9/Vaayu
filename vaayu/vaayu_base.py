@@ -2723,10 +2723,16 @@ class VaayuBaseModel(GenerationMixin):
             # KV, RC4 (c)), or a model's own measurement of its cache (S15 L-b:
             # DeepSeek-V4's preallocated compressed cache).
             _kv_per_token, _kv_bucketed, _kv_source = self.planned_kv_bytes_per_token()
+            _kv_constant = self.planned_kv_constant_bytes()
+            # Byte-identical to the pre-S35 line on every model without windowed layers.
             print(f"[Vaayu-VRAM] KV cost: {_kv_per_token / 1024:.1f} KiB/token "
-                  f"({'bucketed' if _kv_bucketed else 'exact'}; {_kv_source})")
+                  f"({'bucketed' if _kv_bucketed else 'exact'}; {_kv_source})"
+                  + (f" + {_kv_constant / 1024 ** 2:.1f} MiB for "
+                     f"{len(getattr(self, '_kv_windows', None) or {})} windowed layer(s) "
+                     f"stored at window length" if _kv_constant else ""))
             _shape = VramShape(
                 kv_per_token=_kv_per_token,
+                kv_constant_bytes=_kv_constant,
                 N=1, chunk=max(1, self.prefill_chunk_size),
                 hidden=self.config.hidden_size, n_heads=_n_heads,
                 vocab=self.config.vocab_size,
@@ -2778,11 +2784,63 @@ class VaayuBaseModel(GenerationMixin):
             if _protected:
                 print(f"[Vaayu-VRAM] protected pin demand: {_protected / 1024 ** 3:.2f} GiB "
                       f"(MoE non-expert weights the reserve floor may not take)")
+            # S35: a windowed layer's ring holds ring_tokens(W, chunk) positions
+            # whatever the context, so it saves VRAM only when the context is longer
+            # than the ring. Plan the FULL-LENGTH layout first; a layer whose ring is
+            # not shorter than the context that layout affords keeps full-length
+            # storage, as before S35 (windows_that_pay has the measured case).
+            if _kv_constant:
+                from dataclasses import replace as _dc_replace
+                from .vram_plan import VramPlanError
+                from .windowed_kv import windows_that_pay
+                _full_shape = _dc_replace(_shape, kv_per_token=self.pooled_kv_bytes_per_token(),
+                                          kv_constant_bytes=0)
+                try:
+                    _full_ctx = plan_vram(
+                        free_vram=_free_vram, shape=_full_shape, min_resident=_min_resident,
+                        requested_max_seq_len=max_seq_len,
+                        position_limit=getattr(self.config, "max_position_embeddings",
+                                               2 ** 31 - 1),
+                        layer_slack=_layer_slack,
+                        reserve_floor=reserve_floor_bytes(
+                            shape=_full_shape, base_floor=_VRAM_RESERVE_FLOOR_BYTES,
+                            free_vram=_free_vram, min_resident=_min_resident,
+                            layer_slack=_layer_slack, protected_bytes=_protected,
+                            requested_max_seq_len=max_seq_len)).max_seq_len
+                except VramPlanError:
+                    _full_ctx = None     # the full-length layout cannot plan this request: keep the rings
+                _paying = (windows_that_pay(self._kv_windows, self.prefill_chunk_size, _full_ctx)
+                           if _full_ctx is not None else self._kv_windows)
+                if len(_paying) != len(self._kv_windows):
+                    print(f"[Vaayu-VRAM] {len(self._kv_windows) - len(_paying)} windowed attention "
+                          f"layer(s) keep full-length KV: their ring would hold more positions "
+                          f"than the {_full_ctx}-token context this load can afford, so "
+                          f"window-length storage would cost VRAM instead of saving it")
+                    self._kv_windows = _paying
+                    if not _paying:
+                        self._cache_is_windowed = False
+                    _kv_per_token = self.planned_kv_bytes_per_token()[0]
+                    _kv_constant = self.planned_kv_constant_bytes()
+                    _shape = _dc_replace(_shape, kv_per_token=_kv_per_token,
+                                         kv_constant_bytes=_kv_constant)
+            # S35 (USER decision 2026-10-09): a load whose cache stores windowed
+            # layers at window length keeps its context target -- flash parity is
+            # priced at the pooled, full-length KV cost -- so the saving lowers the
+            # reserve (expert tier / pinning) instead of raising the target. None on
+            # every other load: the old path, byte for byte. The rule applies under a
+            # score-materializing kernel (eager / sdpa); on flash the reserve is the
+            # base floor and the saving goes to context.
+            _parity_kv = self.pooled_kv_bytes_per_token() if _kv_constant else None
+            if _parity_kv is not None and _score_per_elem > 0:
+                print(f"[Vaayu-VRAM] context target priced at the full-length KV cost "
+                      f"({_parity_kv / 1024:.1f} KiB/token); "
+                      f"set max_seq_len for more context")
             _reserve_floor = reserve_floor_bytes(
                 shape=_shape, base_floor=_VRAM_RESERVE_FLOOR_BYTES,
                 free_vram=_free_vram, min_resident=_min_resident,
                 layer_slack=_layer_slack, protected_bytes=_protected,
-                requested_max_seq_len=max_seq_len)
+                requested_max_seq_len=max_seq_len,
+                parity_kv_per_token=_parity_kv)
             self._vram_plan = plan_vram(
                 free_vram=_free_vram, shape=_shape,
                 min_resident=_min_resident,
@@ -3058,7 +3116,9 @@ class VaayuBaseModel(GenerationMixin):
                 # before S34: a model whose cache is not a per-layer K/V stack
                 # overrides it, and the formula priced one such prefix session at
                 # 13x its real size. Unchanged for every model that does not.
-                _kv_tok = int(self.planned_kv_bytes_per_token()[0])
+                # S35: POOLED entries are full length even where the live cache
+                # stores a layer at window length, so this asks the pooled figure.
+                _kv_tok = int(self.pooled_kv_bytes_per_token())
             except Exception:
                 _kv_tok = 0        # D3: a sizing helper must not become the crash
             _prefix_on = bool(getattr(self, "enable_prefix_cache", False))
@@ -3533,6 +3593,12 @@ class VaayuBaseModel(GenerationMixin):
             print("[KV] enable_kv_persist=True ignored: this model's KV cache is "
                   "servable at one length only and is not the per-token K/V layout "
                   "an on-disk record holds. The in-RAM prefix cache still works.")
+        elif (getattr(self, "enable_kv_persist", False)
+                and getattr(self, "_cache_is_windowed", False)):
+            print("[KV] enable_kv_persist=True ignored: this model's KV cache stores its "
+                  "windowed attention layers at window length (S35), and the on-disk "
+                  "writer reads every position off the live cache. The in-RAM prefix "
+                  "cache still works.")
         elif getattr(self, "enable_kv_persist", False):
             import shutil
             from .kv_persist import DiskWriter, KvDiskLoader
@@ -4242,18 +4308,43 @@ class VaayuBaseModel(GenerationMixin):
         used -- KV-bearing layers x KV heads x head_dim x the mode's bytes, against
         a capacity that doubles when the cache is one of Vaayu's ring buffers
         (_kv_cache_is_bucketed). A model whose cache is neither (DeepSeek-V4's
-        preallocated compressed cache) overrides this."""
+        preallocated compressed cache) overrides this. S35: a layer the cache stores
+        at window length is not charged per token -- its ring is
+        planned_kv_constant_bytes()."""
         from .batch import kv_bearing_layer_count
         from .vram_plan import kv_bytes_per_token
+        from .windowed_kv import per_token_window_discount
         n_heads = self.config.num_attention_heads
         head_dim = getattr(self.config, "head_dim", None)
         if not isinstance(head_dim, int):
             head_dim = self.config.hidden_size // n_heads
         return (kv_bytes_per_token(
-                    num_hidden_layers=kv_bearing_layer_count(self),
+                    num_hidden_layers=(kv_bearing_layer_count(self)
+                                       - per_token_window_discount(self)),
                     num_key_value_heads=getattr(self.config, "num_key_value_heads", n_heads),
                     head_dim=head_dim, kv_cache_mode=self.kv_cache_mode),
                 self._kv_cache_is_bucketed(), "config")
+
+    def planned_kv_constant_bytes(self) -> int:
+        """Bytes the windowed layers' rings hold whatever the context (S35): each
+        layer a WindowedKVCache stores at window length keeps ring_tokens(W,
+        chunk) positions in VRAM. 0 wherever the window discount does not apply."""
+        from .windowed_kv import (kv_windows_of, per_layer_kv_bytes,
+                                  per_token_window_discount, ring_tokens)
+        if not per_token_window_discount(self):
+            return 0
+        chunk = max(1, int(self.prefill_chunk_size))
+        return per_layer_kv_bytes(self) * sum(
+            ring_tokens(w, chunk) for w in kv_windows_of(self).values())
+
+    def pooled_kv_bytes_per_token(self) -> int:
+        """Host bytes ONE pooled token costs (S35). A pooled entry is full length
+        even where the live cache stores a layer at window length, so the layers
+        the VRAM figure leaves out are charged here. Equal to
+        planned_kv_bytes_per_token()[0] on every model without windowed layers."""
+        from .windowed_kv import per_layer_kv_bytes, per_token_window_discount
+        return (int(self.planned_kv_bytes_per_token()[0])
+                + per_token_window_discount(self) * per_layer_kv_bytes(self))
 
     def _kv_cache_is_bucketed(self) -> bool:
         """Whether _create_kv_cache (below) would return a geometric-doubling
@@ -4293,6 +4384,7 @@ class VaayuBaseModel(GenerationMixin):
         # be False -- not absent -- when the prefix cache is off entirely.
         self._cache_holds_recurrent_state = False
         self._cache_is_one_length = False
+        self._cache_is_windowed = False
         if not getattr(self, "enable_prefix_cache", False):
             return
         from .batch import (cache_holds_recurrent_state, cache_is_one_length,
@@ -4300,6 +4392,10 @@ class VaayuBaseModel(GenerationMixin):
         _probe = self._create_kv_cache()
         self._cache_holds_recurrent_state = cache_holds_recurrent_state(_probe)
         self._cache_is_one_length = cache_is_one_length(_probe)
+        # S35: the live cache keeps windowed layers in a ring + host log, which the
+        # side channels that read per-position K/V off it cannot follow.
+        from .windowed_kv import WindowedKVCache
+        self._cache_is_windowed = isinstance(_probe, WindowedKVCache)
         _refusal = prefix_cache_refusal_reason(_probe, self.kv_cache_mode)
         if _refusal is not None:
             print(f"[Vaayu-Prefix] WARNING: cross-turn prefix cache DISABLED — "
@@ -4322,6 +4418,13 @@ class VaayuBaseModel(GenerationMixin):
         # which need per-layer cache classes. getattr, because partial stand-ins
         # construct caches too.
         cfg = cache_config_if_non_uniform(getattr(self, "config", None))
+        # S35 (47-m4): a layer that attends only its last W positions is stored
+        # at window length where the cache can do it (bf16 / fp8). The map is read
+        # off the attention modules once per load; {} for every model with no
+        # windowed layer, which keeps exactly the cache it had before.
+        from .windowed_kv import WindowedKVCache, kv_windows_of
+        windows = kv_windows_of(self)
+        chunk = int(getattr(self, "prefill_chunk_size", 0) or 0)
 
         if mode == "fp16":
             if self.kv_cache_mode == "fp8":
@@ -4333,6 +4436,9 @@ class VaayuBaseModel(GenerationMixin):
             # 2.0 bytes/element vs 3.016 for fp8 mode, and lossless.
             print("[Vaayu] KV Cache: bf16 ring buffer (no quantization, ~33% "
                   "less VRAM than fp8 mode)")
+            if windows:
+                return WindowedKVCache(quantize=False, config=cfg, windows=windows,
+                                       chunk=chunk)
             return FP8DynamicCache(quantize=False, config=cfg)
 
         if mode == "turboquant" or mode.startswith("turboquant:"):
@@ -4349,6 +4455,9 @@ class VaayuBaseModel(GenerationMixin):
             # The float8-unavailable fallback is resolved above, not here, so
             # env.json reports the fp16 that actually ran (resolve_kv_cache_mode).
             print("[Vaayu] KV Cache: FP8 quantized (~50% VRAM savings)")
+            if windows:
+                return WindowedKVCache(quantize=True, config=cfg, windows=windows,
+                                       chunk=chunk)
             return FP8DynamicCache(config=cfg)
 
         # H1: fp8 used to be the FALL-THROUGH, so any unrecognised mode string
@@ -5321,15 +5430,26 @@ class VaayuBaseModel(GenerationMixin):
         return out
 
     def get_attention_mask_args(self, full_attention_mask, len_p, len_s, layer=None):
+        from .windowed_kv import sdpa_window_mask, window_stored_keys
+        window = self.layer_attention_window(layer) if layer is not None else None
+        stored = window_stored_keys(self, layer, window, len_p, len_s)
         if full_attention_mask is None:
             # No explicit mask: flash gets the window through the attention
-            # module's own `sliding_window` argument, and sdpa's implicit causal
-            # mask has none -- see row 47's G4 follow-up.
-            return {}
-        window = self.layer_attention_window(layer) if layer is not None else None
+            # module's own `sliding_window` argument. sdpa's implicit causal mask
+            # has none, so a windowed layer running more than one query gets an
+            # explicit one here (row 47's G4 follow-up, closed by S35).
+            if (window is None or len_s <= 1
+                    or getattr(self, "_active_attn_impl", None) != "sdpa"):
+                return {}
+            keys = stored if stored is not None else len_p + len_s
+            return {'attention_mask': sdpa_window_mask(
+                window, len_s, keys, torch.device(getattr(self, "running_device", "cpu")))}
         if window is not None:
             full_attention_mask = self._windowed_mask(full_attention_mask, window)
-        return {'attention_mask': full_attention_mask[:, :, -len_s:, -len_p - len_s:]}
+        # A layer the cache stores at window length is handed only its last keys
+        # (S35); every other layer the whole bottom-right block, as before.
+        keys = stored if stored is not None else len_p + len_s
+        return {'attention_mask': full_attention_mask[:, :, -len_s:, -keys:]}
 
     def get_position_ids_args(self, full_position_ids, len_p, len_s):
 
@@ -6373,6 +6493,12 @@ class VaayuBaseModel(GenerationMixin):
                   "per-token K/V layout the packed container carries. Pooling "
                   "uncompressed.")
             bits = None
+        elif bits is not None and getattr(self, "_cache_is_windowed", False):
+            print("[Vaayu-Prefix] WARNING: prefix_compress ignored on this model — "
+                  "its KV cache stores the windowed attention layers at window length "
+                  "(S35), and the packed container is built from the live cache's "
+                  "per-position K/V. Pooling uncompressed.")
+            bits = None
         if bits is not None and bits < 9:
             print(f"[Vaayu-Prefix] WARNING: prefix_compress={bits} is below the 9 "
                   f"bits/channel that passes the quality gate on both on-device "
@@ -6949,6 +7075,14 @@ class VaayuBaseModel(GenerationMixin):
                 print("[Vaayu-Prefix] WARNING: batched_generate does not support "
                       "the cross-turn prefix cache on a KV cache that is servable "
                       "at one length only -- skipping both the lookup and the "
+                      "store-back for this batch; every stream prefills in full.")
+                pc = None
+            elif pc is not None and getattr(self, "_cache_is_windowed", False):
+                # S35: a hit hands back a ring plus a host log, and
+                # broadcast_cache_rows widens only the ring.
+                print("[Vaayu-Prefix] WARNING: batched_generate does not support "
+                      "the cross-turn prefix cache on a KV cache that stores windowed "
+                      "layers at window length -- skipping both the lookup and the "
                       "store-back for this batch; every stream prefills in full.")
                 pc = None
             common_ids = batch_common_prefix(requests) if pc is not None else []

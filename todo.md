@@ -180,7 +180,7 @@ the clean 0.45–0.56 ms/token before any build.
 | **S33** ✅ (stage 1) | ~~Build E1–E6~~ — **STAGE 1 CLOSED 2026-10-07: KEEP, merged `6c9a31f`.** Built E1–E7 (E7 = the per-request `vaayu_telemetry.json` dump, found in this row's re-verification and added by the USER). KEEP set (off, all, all, off): **S = 4.727 ms/token** of mean HIT decode (bar 3.133; OFF spread 1.039; budget band 3.82–5.63), HIT turn 16.84 → 15.65 s (−7.1 %), ids identical, TTFT unchanged. Attribution: E7 +2.005 and E5 +1.896 RESOLVED; E1+E2+E6 +0.426 and E3+E4 +0.313 inside the spread, kept on reach, tests and price (E1–E6 = 2.635; S32 priced 2.11–2.76). Bitwise on four MoE models; gpt-oss vs stock 64/64; suite 3777. Full row: the S33 row in the backlog archive; `docs/2026-10-07-S33-host-edits-e1-e7-RESULTS.md` | — | done |
 | **S33-C8b** ✅ | ~~Decide stage 2: C8b, whole-forward graph replay (the USER's word)~~ — **CLOSED 2026-10-08 by the USER: NOT BUILT, closed with S32's price.** Re-verified at `5bdb816` (no engine change since `6c9a31f`): increment over the built E-edits ≤ 0.45 (p1) / 0.56 (p3) ms/token, ≈ 0.35–0.45 after the profiled-r0 bias = 0.6–0.9 % of the 15.65 s HIT turn, about 1/6 of the 5 % bar (3.133); hard ceiling 1.10 / 1.21 (all the boundary-window GPU idle S32 found), GPU-bound by S28's C5 kernels; inside the ≈ 1.0 ms/token OFF spread; week-class on the shared loop. Re-open only if the layer boundary stops being GPU-bound. Full row: the S33-C8b row in the backlog archive | — | done |
 | **S34** ✅ | ~~DeepSeek-V4 cross-turn prefix cache~~ — **CLOSED 2026-10-08: BUILT, MEASURED, GATED; branch `s34-deepseek-prefix-cache` (engine code at `75c4278`; the final-review fix wave on top changes no engine file), MERGED `e7c69ea` 2026-10-08 on the USER's word. Final whole-branch review 2026-10-08: no Critical issue; `[bug]` I4 is fixed NEXT, in its own fresh session (USER, at the merge).** 1k appending turns 10.26 s vs 51.08 s to first token pool ON vs OFF (ON/OFF 0.201), 4k 11.33 s vs 165.00 s (OFF is ONE turn; 0.069); decode -0.72 % at the own RAM budget (+0.4 % without one slow first OFF arm) and -0.10 % at BALLAST_GB=15, both inside the 5 % rule; a pool HIT is bitwise identical to handing the live cache over; suite 3815 passed, 26 skipped. Reach: N=1 on the server default, at `ENABLE_THINKING=False` (the default); none with thinking on. A turn that ends in an ERROR drops the entry; a cancelled / disconnected turn is stored at its partial reply, which a retry of the same request cannot use. Full row: the S34 row in the backlog archive; `docs/2026-10-08-S34-deepseek-prefix-cache-RESULTS.md` | — | done |
-| **S35** `[~]` | **gpt-oss: 47-m4 (sliding-window KV at window length), then the elastic tier** | *(b)* 0.81 GB of VRAM + 2× `max_seq_len`; the freed VRAM can feed the expert tier | days–week |
+| **S35** `[~]` | **gpt-oss: 47-m4 (sliding-window KV at window length), then the elastic tier** — **BUILT AND MEASURED 2026-10-09 on branch `s35-windowed-kv` (head `becdf31`); the USER picked C ("C now, elastic next"), the §8a parity rule is built and measured (default 33,213 ctx, tier 184 experts, 8k decode 60.1 ms vs main 79.1); ready to merge on the USER's word** | *(b)* 0.81 GB of VRAM + 2× `max_seq_len`; the freed VRAM can feed the expert tier | days–week |
 | **S36** | **Cheap sweep + 47-m6 (fp32 rotary quality check)** | *(c)* hours each | a day or two |
 
 ## Durable rows (the briefs)
@@ -301,7 +301,56 @@ the clean 0.45–0.56 ms/token before any build.
         RESULTS + ledger, then STOP for the USER's B/C pick. **Dry-run by the author:** Tasks 1–5's code applied
         verbatim → suite 3901 passed, 26 skipped; 7 mutants killed; the three probes ran on `main` at small sizes
         (stock control: TF vs full-length 64/64, vs default cache 25/64). Branch `s35-windowed-kv` (not created yet).
-      - **NEXT:** execute the plan (USER picks the execution method).
+      - **BUILT AND MEASURED 2026-10-09 (branch `s35-windowed-kv`, head `15d95a8`; NOT merged).** Commits `b487c80`, `8346f06`
+        (ring + spill), `67b9c02` (pooled/device forms, crop reload, lending, abort), `e4d92a8` (wiring, per-layer mask slice, sdpa gap),
+        `b38a82c` + `f71006d` (planner constant + pooled host figure), `5e3513a` (refusals), `15d95a8` (RSS fix). **Branch suite on the
+        final head: 3905 passed, 26 skipped, 538 warnings (277.71 s, `12aa5e7`, after the final-review fix wave; 3904 at `15d95a8`)**; `main`'s floor stays 3827 until a merge. RESULTS
+        `docs/2026-10-09-S35-windowed-kv-RESULTS.md` (logs `plans/probes/s35_out/`).
+        - **Stock equivalence (spec §6.1) PASSES:** branch vs stock transformers' DEFAULT cache bitwise 64/64, G ids == stock; main
+          control is bitwise vs the FULL-length cache instead (64/64; vs default 5/64, max|d| 1.781; ids differ at 50 = S13's tie).
+        - **Quality (§6.2) PASSES:** 8k main 32.8456 (sd 0.2456) vs branch 32.8287 (sd 0.0657), Δ −0.0169 vs pooled sd 0.1798; 30.7k
+          main 29.2463 (sd 0.1661) vs branch 29.3699 (sd 0.1794), Δ +0.1237 vs pooled sd 0.1729 (0.72 sd). Side reading: a 30.7k
+          teacher-forced prefill draw 127 s main vs 93 s branch (−27 %).
+        - **Arms (pair means; A = main, B = planner as-is, C = `MAX_SEQ_LEN=33155`):** `max_seq_len` A 33,155 / B 40,442 / C 33,155;
+          reserve 9.494 / 10.961 / 8.770 GiB; tier experts 122 / **3** / **181** (replay predicted ~6 / ~186). Decode 8k 78.36 / 85.64 /
+          59.93 ms (B +9.3 %, C −23.5 %); 30.7k 128.32 / 110.60 / 85.92 ms (B −13.8 %, C −33.0 %). TTFT 8k 15.24 / 13.68 / 12.42 s;
+          30.7k 109.68 / 76.26 / 71.88 s. Greedy ids == A everywhere; VRAM peaks under each reserve (30.7k 6.54 / 7.32 / 5.93 GiB).
+        - **Host RSS stop rule FIRED, was root-caused and fixed (`15d95a8`):** VmHWM at 30.7k A 16.18 vs B 16.81–16.84 / C 16.88 GiB
+          (+0.66–0.70 GiB vs a 12.6 MB allowance). Cause: `to_cpu` freed the spill blocks but glibc retained the pages (model-free: RSS
+          3.17 vs 2.49 GiB; 2.44 after `malloc_trim(0)`). Fix: `release_freed_host_pages()` (one `malloc_trim(0)`, ~24 ms once per
+          store) in `WindowedKVCache.to_cpu` before the parent pins the full layers. Re-run A3/B3/C3 VmHWM 30.7k 16.181 / 16.180 /
+          16.182 GiB → PASS (decode / TTFT replicate).
+        - **Gates, all 9 green on `15d95a8`:** server gpt-oss / 1B / Qwen3-Next / MiniMax / DeepSeek 10 passed each; dense 1B + 70B
+          5 each; accumulator Qwen3-Next + MiniMax 8 each. gpt-oss: `KV cost: 24.0 KiB/token + 27.0 MiB for 12 windowed layer(s)`,
+          prefix HITs 81/82 and 83/146 (= S34's), decode graphs not installed (windowed, WARNING). Load lines of 1B / Qwen / MiniMax /
+          DeepSeek: KV cost md5-identical to S34, `max_seq_len` and reserve identical; pinning budget 0.02–0.06 GiB lower = free-VRAM drift.
+        - **Found and fixed: `KV_CACHE_MODE="fp16"` on gpt-oss CRASHES on `main` past 128 tokens** (`eager_attention_forward`: size of
+          tensor a (128) must match b (199) at dim 3; server-reachable knob, spec §2.7 predicted it); on the branch fp16 is bit-identical
+          to stock (64/64), via the per-layer mask slice.
+        - **§8 answers:** knob — none (sizes derived; `MAX_SEQ_LEN=33155` gives C today); plumbed — `_create_kv_cache` + the plan;
+          reachable — N=1, server default (`auto` → bf16); refused at load with a WARNING — `PREFIX_COMPRESS`, `ENABLE_KV_PERSIST`,
+          decode graphs, the batched pool (backlog #39).
+        - **Rulings:** 30.7k quality split in halves (tool limit; no cost); persist / batched-pool guards source-order tests only
+          (ledgered below); fp16 + `PREFILL_CHUNK_SIZE<=0` keeps main's mask (ledgered below); fix the RSS root cause rather than charge
+          the spill (cost if wrong: the trim lands in the post-stream tail — measured ~24 ms).
+        - **USER PICKED C 2026-10-09 ("C now, elastic next").** The §8a rule: `reserve_floor_bytes` prices the flash-parity
+          search at the pooled (full-length) KV cost on a load with a ring constant (`parity_kv_per_token`; None elsewhere = the
+          old path), so the window saving lowers the reserve instead of raising the context target; replay pins default 33,213 /
+          9,415,222,559 B, `MAX_SEQ_LEN=40442` → 11,764,103,012 B. Built `cd026d3` + `becdf31`. On device, DEFAULT config (no
+          knob), arms D1 / D2 with same-run main A4: `max_seq_len` 33,213, reserve 8.77 GiB, tier 184 experts; decode 8k
+          59.88 / 60.35 ms (main 79.12), 30.7k 85.64 / 86.03 ms (main 128.96); cold TTFT 8k 12.88 / 12.80 s (15.65), 30.7k
+          71.57 / 71.30 s (110.26); tier hit 0.584 / 0.526 (0.42 / 0.404). VmHWM 30.7k 16.196 / 16.202 vs 16.182 GiB (+15.3 / +21.7
+          MB: 2.7–9.1 MB past the 12.6 MB one-block allowance, ruled PASS in substance against the pre-fix ~700 MB; 6–8 MB below main at
+          8k). Gates after the rule all green (server ×5 10 passed each, dense ×2 5 passed, accumulator ×2 8 passed); the other
+          four models' `KV cost:` lines md5-identical and none prints the new load line. Branch suite 3918 passed, 26 skipped
+          (`2199298`, the final code head, 253.89 s; 3913 at `becdf31`); gpt-oss server gate re-run on it: 10 passed, plan unchanged
+          (33,213 / 8.77 GiB, no layer pruned, HIT 83/146). §8: no new knob; more context = the existing `MAX_SEQ_LEN` (measured price: 40,442 tokens → tier 3
+          experts, 8k decode 85.6 ms), documented in `vaayu/server/README.md`, `documentation/server.md`, `documentation/TUNING.md`
+          §3c; reachable at N=1 on the server default. **STATE: ready to merge on the USER's word; then the row closes and its
+          full text moves to `todo-backlog.md` (CLAUDE.md §6). NEXT after the merge: the elastic tier (spec §8b), its own spec.**
+        - **Addendum final review (opus) 2026-10-09:** no Critical. Fixes: default figures (184 experts / 60.1 ms, not 181 / 59.9, which was the `MAX_SEQ_LEN=33155` arm), TUNING §3c, CLAUDE.md reference clause (stock's DEFAULT cache since S35). Two planner hardenings built in the same wave: `windows_that_pay` (a layer is windowed only if its ring is shorter than the context the full-length layout affords; Gemma-2-27b-like replay: main 2,048 tokens, rings 358, now 2,048) and the parity floor covering the last chunk boundary (layer-major MoE+sdpa replay: 15,859 → ≥ main's 16,389). gpt-oss plans byte-identical (pins unchanged).
+        - **Final whole-branch review (opus) 2026-10-09:** no Critical, no code defect on the server path (832 fuzzed op sequences on CPU + CUDA bitwise vs the full-length cache); fixes I1/I2 applied in the final fix wave.
+        - M1 (final review) on device 2026-10-09: prefix HITs on long entries are EXACT — pool path vs a no-pool replay bitwise 64/64 on a same-session partial HIT (crop below the ring, reload from the host log, 1,400-position prefill spilling onto the view) and on the appending HIT that follows (entry consolidated from view + spill blocks); main control 64/64. Greedy ids part from main's on HIT turns only at exact bf16 ties (main's margin 0.0000). HIT TTFT main → branch: 2.829 → 2.403 s (partial, 1,400 new), 2.448 → 2.297 s (append, 1,200 new); store tail not slower (110.4 → 108.9 ms, 47.5 → 37.4 ms). Probes `plans/probes/s35_hit.py`, `s35_hit_exact.py`.
       **47-m4's numbers:** 12 of gpt-oss-20b's 24 layers are windowed at 128, so 24,576 of 49,152 B/token is stored
       and reserved but unreadable. At the derived `max_seq_len` 33,206 that is 1.632 GB held against 0.819 GB needed:
       **0.813 GB (49.8 %) wasted**, and the derived `max_seq_len` is halved. Correctness is not affected.
@@ -434,7 +483,30 @@ at HEAD before acting.
 - [ ] **= S35 (after 47-m4). Elastic tier (the USER's "later, separately measured" row).** Step 1's curve: 243 experts 65.1 %,
       324 → 79.0 %, 405 → 88.1 %, 486 → 93.7 %, all 768 → 100 %; budget above the real one costs context
       (+1 GiB → 28,152, +2 GiB → 23,033 by the planner's inverse) unless the tier borrows idle reserve and
-      gives it back under prefill headroom (safety unproven). Today's tier is 111–133 experts.
+      gives it back under prefill headroom (safety unproven). Today's tier is about 184 experts (default config, S35).
+      **Spec §8b (2026-10-09):** the idea is to advertise the larger context and size the reserve to the request that is
+      running, so the tier uses what a short request leaves idle. The planner's per-request prediction on gpt-oss's windowed
+      shape (`plans/probes/s35_elastic_sim.py`): 2k 1.94 GiB, 8k 3.31, 16k 5.13, 33k 8.77, 40k 10.96 → a tier of ~734 / ~623 /
+      ~476 / ~181 / ~3 experts of 768. Four pieces are missing, each an OOM risk: a tier budget above the static reserve line;
+      give-back as the context grows during decode; regrow after a long request; proof at the prefill→decode boundary.
+      Admission already evicts tier entries before refusing (S18). An 8k figure near 42–45 ms/token is a linear extrapolation
+      from arms B and C, NOT a measurement. Own spec, own safety measurements; the "borrow idle reserve" half stays unbuilt
+      until its safety is shown.
+- [ ] **(S35) the branch's VmHWM at 30.7k is 14–20 MB above main in the default config, unexplained.** After the 9b trim:
+      D1 16.196, D2 16.202 vs A4 16.182 GiB (B3 / C3 were 16.180 / 16.182 vs 16.181). The model-free diag
+      (`plans/probes/s35_rss_diag.py`) shows the windowed cache BELOW the full one (2.47 vs 2.49 GiB), so the cause is not the
+      cache itself. Ruled PASS in substance (cost if wrong: ≤ 20 MB of host RAM at the longest contexts).
+- [ ] **(S35) fp16 + `PREFILL_CHUNK_SIZE<=0` keeps main's misaligned windowed mask** — `kv_windows_of` (`vaayu/windowed_kv.py`, used at `vaayu_base.py` mask hook) returns `{}` there; on transformers 5.5.4 the request FAILS with a size error ("The size of tensor a (W) must match the size of tensor b (…)") past the window — it is not silent wrong attention — as on main. Small fix (final review 2026-10-09): apply the `chunk <= 0` rule in `kv_windows_of` only when the mode is not fp16, and make `per_token_window_discount` return 0 when `chunk <= 0`. Unverified: fp16 + `USE_PROMPT_LOOKUP=True`, and a multi-chunk fp16 prefill. Docstring says so since the final fix wave.
+- [ ] **(S35) the batched-pool and persist refusal guards are source-order tests only** (`tests/test_one_length_cache.py` / windowed-refusal tests; both paths need a loaded model; N>1 unreachable). Replace with behavioural tests when `batched_generate` is wired (backlog #37). Batched-prefill ring (final review M6): `batched_generate` chunks its own prefill; with `prefill_chunk_size` temporarily 0 the cache's chunk clamps to 1, the ring doubles, and can pass the plan's ring bound when chunk < W. N>1 only.
+- [ ] **(S35) N>1 admission does not charge the windowed rings' constant per stream** (`vaayu/batch.py` `geo_from_model`); N>1 only.
+- [ ] **(S35) crop-reload / store-hit / lending tests run bf16 only** (`tests/test_windowed_kv.py`); the fp8 scale + mirror lists on the reload path are unpinned.
+- [ ] **(S35) `WindowedKVCache.to_cpu` pops the host log before `out` is fully built** (`vaayu/windowed_kv.py`); a failed pinned alloc mid-way loses that layer's history (error path only).
+- [ ] **(S35, M2) a model whose EVERY KV layer is windowed gets a `WindowedKVCache` but no plan discount** (`per_token_window_discount` → 0): the rings are allocated at the first update while the plan charges per token — e.g. 48 layers, 4 KV heads × 128, W 4096, chunk 512: 480 MiB of rings from the first token against a 48 MiB charge at 512 tokens (short 432 MiB; covered from 8,192 tokens). No such model on disk. Fix when one appears: either do not window when every layer is windowed, or charge max(per-token, constant).
+- [ ] **(S35, M4) `WindowedKVCache.to_cpu` trims after every store that follows a HIT** (the `to_device` view counts as a freed block), ~24 ms worst case, unmeasured in the server heap; and one trim after all windowed layers equals main's host peak only because gpt-oss windows exactly half its layers (at a windowed share f the transient is pool + 2f entries against main's pool + 1).
+- [ ] **(S35, M1) under `KV_CACHE_MODE="fp16"` or with <= ~12 GiB free the floor's clamp binds**, so the window saving goes to context and the tier stays small (plan ≈ the 40,442 arm). Replay only (addendum review M1).
+- [ ] **(S35, M4) `MAX_SEQ_LEN=40442` under the parity rule was never loaded on device** (replay reserve 10.956 GiB, 3–7 experts by arithmetic); the 3 experts / 85.6 ms figure is the pre-rule derived plan.
+- [ ] **(S35, M6) the load-line identity check covers 4 of the 5 other models** — Llama-3.3-70B's gate log has no load line (the dense gate runs without `-s`); identity there is by construction.
+- [ ] **(S35, M7) a caller-supplied `FP8DynamicCache()` / `DynamicCache()` on a windowed load fails with a size error where main ran** (library / probes only; use `model._create_kv_cache()`).
 - [ ] **= S36 item 3. Known gap (S18 step 2): `ENABLE_EXPERT_USAGE=True` (server default False) records no routes on
       gpt-oss** — the routed forward never calls `_maybe_record_usage` while its tier evictions are now
       attributed, so the usage report is not meaningful on this model.
@@ -517,8 +589,8 @@ server are under "Engine-wide — reliability and minors".*
   `vaayu/vaayu_base.py:2935`) only knows recurrent state. The first partially rejected draft reaches
   `_trim_kv_cache` (`vaayu_base.py:6766`) and `crop` raises → a 500 / SSE error. Predates S34; what S34 adds is that
   the checked-out pool entry is lost too (the speculative loop has no `restore_on_abort`). Measured 2026-10-08 (I4, Task 2): on the dense default, prompt lookup ON, an error also LOSES the checked-out entry — the 1B `TURN=2` arm's client retry was a full prefill equal bitwise to a cold reference (D-vs-B 0/34). Not the default knob
-  (`"auto"` resolves OFF on MoE). Fix: refuse a declared one-length cache in `spec_recurrent_refusal` (covers S35's
-  window cache too), with a test; it touches speculative decoding, which S34's plan listed as do-not-touch.
+  (`"auto"` resolves OFF on MoE). Fix: refuse a declared one-length cache in `spec_recurrent_refusal` (S35 note, 2026-10-09: a
+  windowed cache stays croppable, so it does NOT need this refusal), with a test; it touches speculative decoding, which S34's plan listed as do-not-touch.
 
 - [ ] **Lead I3 (S34 final review, 2026-10-08; encoder-only evidence, not on device; UNPRICED): DeepSeek-V4 with
       thinking ON gets no prefix reuse and still pays the pool's cost.** Trigger: a request with

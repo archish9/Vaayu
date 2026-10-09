@@ -350,7 +350,11 @@ def kv_bearing_layer_count(model) -> int:
 
 def geo_from_model(model) -> tuple:
     cfg = model.config
-    n_layers = kv_bearing_layer_count(model)
+    from .windowed_kv import per_token_window_discount
+    # Same layer count as the reserve (S35): admission and the plan quote ONE
+    # expression. The windowed rings' constant is not charged per stream here
+    # (N>1 is unreachable through the server; todo.md S35 row).
+    n_layers = kv_bearing_layer_count(model) - per_token_window_discount(model)
     n_kv_heads = getattr(cfg, "num_key_value_heads", cfg.num_attention_heads)
     head_dim = getattr(cfg, "head_dim", None)
     if not isinstance(head_dim, int):

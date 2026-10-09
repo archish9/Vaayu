@@ -230,10 +230,17 @@ attention implementation:
   default; dense included):** the floor is the reserve that gives flash-parity context. A
   requested `max_seq_len` below flash parity caps that parity, so the floor falls and the
   difference goes back to pinning and the expert cache (since S15 L-b, 2026-10-01). Above
-  flash parity it changes nothing. The floor is also never allowed to take the pin budget
+  flash parity the floor does not move; a longer request (up to `S_max`) is still planned
+  and its larger reserve comes out of pinning and the expert cache. On gpt-oss-20b: `None`
+  → 33,213 tokens, 184 experts in the VRAM tier, 8k decode 60.1 ms/token; a 40,442-token
+  plan → 3 experts, 85.6 ms/token. The floor is also never allowed to take the pin budget
   an MoE load's non-expert weights need (`protected pin demand` in the load log).
-  gpt-oss is the eager example: its floor really is the 9.49 GiB parity floor (protection
-  does not bind, 3.35 vs 4.78 GiB), so a shorter request returns VRAM. A MoE load whose
+  gpt-oss is the eager example: its floor is the parity floor priced at the full-length KV
+  cost of its cache (8.77 GiB at the derived 33,213 tokens; the pinning budget is 5.59 GiB,
+  so the 3.35 GiB protected demand does not bind), so a shorter request returns VRAM, and a
+  LONGER one (up to `S_max`) is allowed and costs the expert tier: `None` gives 184 experts
+  in the VRAM tier (8k decode 60.1 ms/token); a 40,442-token plan gives 3 (85.6 ms/token,
+  measured at a derived 40,442-token plan). A MoE load whose
   floor is already held at the 3.50 GiB base by that protection gets **nothing** back from
   a shorter context: DeepSeek-V4 today (its 8.24 GiB protected demand exceeds the 7.82 GiB
   above the base floor; requests of None / 32,768 / 16,384 / 4,096 all plan floor 3.50,

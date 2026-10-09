@@ -351,3 +351,25 @@ therefore replays each resident decoder layer's static work as CUDA graphs
   GB.`) only if the pool had already been charged to the expert VRAM tier; a model with no
   expert VRAM tier — dense, or disabled before any tier charge succeeded — has nothing to
   refund, and the WARNING ends without that sentence.
+
+## 8. Windowed attention layers' KV (S35)
+
+A layer that attends only its last W positions (gpt-oss-20b: 12 of 24 layers, W = 128)
+needs only the last W−1 of them for the next token. When the load's KV cache mode is
+`bf16` (the default) or `fp8`, Vaayu stores such layers in `WindowedKVCache`
+(`vaayu/windowed_kv.py`): a VRAM ring of `(W−1) + 2 × prefill_chunk_size` positions, with
+older positions copied to host RAM in blocks. Attention is handed exactly what
+transformers' own `DynamicSlidingWindowLayer` hands it. A cross-turn prefix-cache entry
+is still stored at full length, so appending turns, partial matches and cross-session
+borrowing behave as on any other model. The VRAM plan charges these layers as a
+constant ring instead of per token (the `[Vaayu-VRAM] KV cost:` load line names it);
+the host-RAM reservation for pooled sessions still charges them per token.
+
+Not available on such a load: `PREFIX_COMPRESS`, `ENABLE_KV_PERSIST` and decode CUDA
+graphs (each with a WARNING at load), and the prefix cache inside `batched_generate`
+(a WARNING per batch).
+`KV_CACHE_MODE="turboquant"` and `PREFILL_CHUNK_SIZE=0` keep every position and the full
+per-token charge. Under `KV_CACHE_MODE="fp16"` the cache is transformers' own, which stores windowed layers
+at window length itself; Vaayu hands those layers the same per-layer mask. This needs
+chunked prefill: with `PREFILL_CHUNK_SIZE = 0` a model with windowed layers fails under
+`fp16` once the context passes the window.

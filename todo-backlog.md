@@ -12,7 +12,7 @@ Status keys, as in `todo.md`: `[ ]` pending · `[~]` in progress · `[!]` blocke
 
 ---
 
-## Index — 38 items (19 moved 2026-09-26; 20–21 added 2026-09-28 by S10b; 22–23 added 2026-09-28 by S10c; 24–25 added 2026-09-29 by S12; #1 = row 36 CLOSED by S12; 26 added 2026-10-01 by S16 (ii); 27 added 2026-10-02 from the S17 row; 28–35 added 2026-10-03 in the todo.md cleanup; 36 added 2026-10-07 by S29; 37 added 2026-10-07 by S30; 38 added 2026-10-08 by I4's final review)
+## Index — 39 items (19 moved 2026-09-26; 20–21 added 2026-09-28 by S10b; 22–23 added 2026-09-28 by S10c; 24–25 added 2026-09-29 by S12; #1 = row 36 CLOSED by S12; 26 added 2026-10-01 by S16 (ii); 27 added 2026-10-02 from the S17 row; 28–35 added 2026-10-03 in the todo.md cleanup; 36 added 2026-10-07 by S29; 37 added 2026-10-07 by S30; 38 added 2026-10-08 by I4's final review; 39 added 2026-10-09 by S35)
 
 | # | item | was in `todo.md` | why it is here | re-open when |
 |---|---|---|---|---|
@@ -52,6 +52,7 @@ Status keys, as in `todo.md`: `[ ]` pending · `[~]` in progress · `[!]` blocke
 | 36 | S29 lead — the 40 % "cacheable" rule does not fit a cyclic per-token stream | S29 (added 2026-10-07) | seen only in configs no default load reaches today: with the dense layer cache OFF (`RAM_CACHE_BUDGET_GB=0`, non-default) Llama-3.3-70B goes buffered at "50 %" and the page cache served ~5.5 %; not measured against O_DIRECT there | a default load prints `Sufficient RAM` for a model that streams per token and does not fit the page cache whole, or a user runs a streamed dense model with `RAM_CACHE_BUDGET_GB=0` |
 | 37 | S30 — batching design: make N>1 reachable through the server | S30 row (PARKED by the USER 2026-10-07) | N>1 only: the server runs `MAX_BATCH_SIZE = 1`, and no client sends Vaayu concurrent requests (RudraAnvil has no Vaayu reference and runs its subagents one at a time) — worth 0 % to users today (CLAUDE.md §8) | a client that sends concurrent requests targets Vaayu (Rudra depends on Vaayu and fans out), or the USER asks |
 | 38 | I4-b — batched store-back stores a ragged entry after an error | I4 final review (added 2026-10-08) | N>1 only: `batched_generate` runs only with `MAX_BATCH_SIZE >= 2` + sdpa (not the default); worth 0 % to users today (CLAUDE.md §8) | `batched_generate` is wired into the server, i.e. with #37 |
+| 39 | S35 — `PREFIX_COMPRESS` and `ENABLE_KV_PERSIST` are refused on a windowed cache | S35 row (added 2026-10-09) | both are off by default and read the live GPU cache's per-position K/V, which a window ring does not hold; refused at load with a WARNING | someone wants either on a model with windowed layers (gpt-oss today) |
 
 ---
 
@@ -9462,3 +9463,14 @@ Row as it stood when it closed:
     model. (Offered against: keep the retry for plain K/V with a per-layer rollback; and (b) skip-the-store. The
     row's (a) as written, one-length caches only, would leave plain K/V models broken; (b) would still return a
     reply computed from the corrupt cache.) Plan: `docs/superpowers/plans/2026-10-08-i4-remove-oom-retry.md`.
+
+## 39. S35 — `PREFIX_COMPRESS` and `ENABLE_KV_PERSIST` are refused on a windowed cache
+
+*Added 2026-10-09 by S35 (branch `s35-windowed-kv`).* **Why here:** both knobs default off (`PREFIX_COMPRESS=None`,
+`ENABLE_KV_PERSIST=False`); no user path on gpt-oss needs them today. **Re-open when:** someone wants either on a model with windowed layers
+(gpt-oss today).
+
+- **What S35 does:** on a load whose KV cache is `WindowedKVCache`, each knob is refused at load with one WARNING (spec §9.4).
+- **Why:** both read the live GPU cache's per-position K/V, and a windowed layer's ring holds only its last W−1 positions plus the
+  prefill-chunk slack; the older positions live in a host spill log.
+- **Fix when re-opened:** read through `WindowedKVCache.to_cpu()`'s pooled (full-length) form instead of the live GPU layers.
