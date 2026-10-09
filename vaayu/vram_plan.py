@@ -630,8 +630,8 @@ def reserve_floor_bytes(*, shape: VramShape, base_floor: int, free_vram: int,
     times the KV it saved. Measured on gpt-oss-20b: left alone the floor rose
     9.49 -> 10.96 GiB for +22 % context and the expert VRAM tier fell 122 -> 3
     experts (8k decode 78.4 -> 85.6 ms/token); with parity held at the
-    full-length cost the reserve is 8.77 GiB, the tier 181 experts and 8k decode
-    59.9 ms/token. More context stays one knob away (`max_seq_len`). None --
+    full-length cost the reserve is 8.77 GiB, the tier 184 experts and 8k decode
+    60.1 ms/token (default config). More context stays one knob away (`max_seq_len`). None --
     every load without windowed layers -- searches at the shape's own cost:
     the result is exactly what it was.
 
