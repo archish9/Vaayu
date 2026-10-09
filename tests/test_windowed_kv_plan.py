@@ -207,3 +207,25 @@ def test_the_load_prices_parity_at_the_pooled_cost_only_with_a_ring_by_source():
     src = (Path(__file__).resolve().parents[1] / "vaayu" / "vaayu_base.py").read_text()
     assert "_parity_kv = self.pooled_kv_bytes_per_token() if _kv_constant else None" in src
     assert "parity_kv_per_token=_parity_kv" in src
+
+
+def test_the_parity_search_drops_the_ring_constant():
+    """The full-length parity search carries no ring constant (a mutant that kept it
+    shortens the parity context). The constant is 1 GiB so the two contexts differ."""
+    from vaayu.vram_plan import _largest_s_within_budget
+    shape = _shape(kv_per_token=65_536, kv_constant_bytes=int(1.0 * GiB), hidden=4096,
+                   n_heads=32, vocab=100_000, head_bytes=819_200_000,
+                   score_elem_bytes=10.9, score_bytes_per_key=0.0)
+    flash = dict(kv_per_token=131_072, score_elem_bytes=0.0, score_bytes_per_key=0.0)
+    parity = _largest_s_within_budget(
+        dataclasses.replace(shape, kv_constant_bytes=0, **flash), int(3.5 * GiB))
+    kept = _largest_s_within_budget(
+        dataclasses.replace(shape, kv_constant_bytes=int(1.0 * GiB), **flash),
+        int(3.5 * GiB))
+    assert kept != parity                                   # the premise: not vacuous
+    ceiling = int(14.5 * GiB) - int(0.5 * GiB)
+    expected = max(int(3.5 * GiB), min(predict_peak_vram(shape, parity), ceiling))
+    assert reserve_floor_bytes(
+        shape=shape, base_floor=int(3.5 * GiB), free_vram=int(14.5 * GiB), min_resident=0,
+        layer_slack=int(0.5 * GiB), protected_bytes=0, requested_max_seq_len=None,
+        parity_kv_per_token=131_072) == expected
