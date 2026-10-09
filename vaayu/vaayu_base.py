@@ -4322,6 +4322,13 @@ class VaayuBaseModel(GenerationMixin):
         # which need per-layer cache classes. getattr, because partial stand-ins
         # construct caches too.
         cfg = cache_config_if_non_uniform(getattr(self, "config", None))
+        # S35 (47-m4): a layer that attends only its last W positions is stored
+        # at window length where the cache can do it (bf16 / fp8). The map is read
+        # off the attention modules once per load; {} for every model with no
+        # windowed layer, which keeps exactly the cache it had before.
+        from .windowed_kv import WindowedKVCache, kv_windows_of
+        windows = kv_windows_of(self)
+        chunk = int(getattr(self, "prefill_chunk_size", 0) or 0)
 
         if mode == "fp16":
             if self.kv_cache_mode == "fp8":
@@ -4333,6 +4340,9 @@ class VaayuBaseModel(GenerationMixin):
             # 2.0 bytes/element vs 3.016 for fp8 mode, and lossless.
             print("[Vaayu] KV Cache: bf16 ring buffer (no quantization, ~33% "
                   "less VRAM than fp8 mode)")
+            if windows:
+                return WindowedKVCache(quantize=False, config=cfg, windows=windows,
+                                       chunk=chunk)
             return FP8DynamicCache(quantize=False, config=cfg)
 
         if mode == "turboquant" or mode.startswith("turboquant:"):
@@ -4349,6 +4359,9 @@ class VaayuBaseModel(GenerationMixin):
             # The float8-unavailable fallback is resolved above, not here, so
             # env.json reports the fp16 that actually ran (resolve_kv_cache_mode).
             print("[Vaayu] KV Cache: FP8 quantized (~50% VRAM savings)")
+            if windows:
+                return WindowedKVCache(quantize=True, config=cfg, windows=windows,
+                                       chunk=chunk)
             return FP8DynamicCache(config=cfg)
 
         # H1: fp8 used to be the FALL-THROUGH, so any unrecognised mode string
@@ -5321,15 +5334,26 @@ class VaayuBaseModel(GenerationMixin):
         return out
 
     def get_attention_mask_args(self, full_attention_mask, len_p, len_s, layer=None):
+        from .windowed_kv import sdpa_window_mask, window_stored_keys
+        window = self.layer_attention_window(layer) if layer is not None else None
+        stored = window_stored_keys(self, layer, window, len_p, len_s)
         if full_attention_mask is None:
             # No explicit mask: flash gets the window through the attention
-            # module's own `sliding_window` argument, and sdpa's implicit causal
-            # mask has none -- see row 47's G4 follow-up.
-            return {}
-        window = self.layer_attention_window(layer) if layer is not None else None
+            # module's own `sliding_window` argument. sdpa's implicit causal mask
+            # has none, so a windowed layer running more than one query gets an
+            # explicit one here (row 47's G4 follow-up, closed by S35).
+            if (window is None or len_s <= 1
+                    or getattr(self, "_active_attn_impl", None) != "sdpa"):
+                return {}
+            keys = stored if stored is not None else len_p + len_s
+            return {'attention_mask': sdpa_window_mask(
+                window, len_s, keys, torch.device(getattr(self, "running_device", "cpu")))}
         if window is not None:
             full_attention_mask = self._windowed_mask(full_attention_mask, window)
-        return {'attention_mask': full_attention_mask[:, :, -len_s:, -len_p - len_s:]}
+        # A layer the cache stores at window length is handed only its last keys
+        # (S35); every other layer the whole bottom-right block, as before.
+        keys = stored if stored is not None else len_p + len_s
+        return {'attention_mask': full_attention_mask[:, :, -len_s:, -keys:]}
 
     def get_position_ids_args(self, full_position_ids, len_p, len_s):
 

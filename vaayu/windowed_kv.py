@@ -17,6 +17,77 @@ import torch
 from .vaayu_base import FP8DynamicCache
 
 
+def _decoder_layers(model):
+    """The decoder layer list, walked by the load's own `layer_prefix`, or None
+    before the module tree exists (and on stand-ins that have none)."""
+    tree = getattr(model, "model", None)
+    prefix = (getattr(model, "layer_names_dict", None) or {}).get("layer_prefix")
+    if tree is None or not prefix:
+        return None
+    for name in prefix.split("."):
+        tree = getattr(tree, name, None)
+        if tree is None:
+            return None
+    return tree
+
+
+def kv_windows_of(model) -> dict:
+    """{layer_idx: window} for the layers THIS load's KV cache stores at window
+    length, or {}. The one definition both the cache factory and the VRAM plan
+    ask (S35), so the two cannot disagree. Read off the attention modules
+    (`layer_attention_window`), never from an architecture name.
+
+    {} under TurboQuant (its own update never windows; it is charged in full) and
+    when `prefill_chunk_size <= 0` (an unchunked prefill puts the whole prompt in
+    one update, which the plan's constant ring term cannot bound). fp16 mode
+    keeps its windows: transformers' own DynamicSlidingWindowLayer stores those
+    layers at window length, and the mask hook must slice for them too.
+
+    Cached on the model once a layer tree is found -- the answer cannot change
+    after load. Not cached while there is no tree yet.
+    """
+    cached = getattr(model, "_kv_windows", None)
+    if cached is not None:
+        return cached
+    layers = _decoder_layers(model)
+    if layers is None:
+        return {}
+    from .vaayu_base import VaayuBaseModel, resolve_kv_cache_mode
+    windows = {}
+    chunk = getattr(model, "prefill_chunk_size", None)
+    mode = str(resolve_kv_cache_mode(getattr(model, "kv_cache_mode", "auto"),
+                                     getattr(model, "loader_strategy", None)))
+    if not (isinstance(chunk, int) and chunk <= 0) and not mode.startswith("turboquant"):
+        for i, layer in enumerate(layers):
+            window = VaayuBaseModel.layer_attention_window(layer)
+            if window is not None:
+                windows[i] = window
+    model._kv_windows = windows
+    return windows
+
+
+def window_stored_keys(model, layer, window, len_p, len_s):
+    """Keys the KV cache hands this layer's attention when it stores the layer
+    at window length -- min(past, W-1) + new, transformers' own rule -- or None
+    when it keeps every position (no window, TurboQuant, a layer outside the
+    load's map). The mask must have exactly that many columns: eager attention
+    keeps the FIRST `key_len` columns it is handed."""
+    if window is None:
+        return None
+    idx = getattr(getattr(layer, "self_attn", None), "layer_idx", None)
+    if idx not in kv_windows_of(model):
+        return None
+    return min(int(len_p), int(window) - 1) + int(len_s)
+
+
+def sdpa_window_mask(window, len_s, keys, device):
+    """Bool [1, 1, len_s, keys] mask, True == attend: causal and inside the
+    window, bottom-right aligned (row r is query position keys - len_s + r)."""
+    q = torch.arange(keys - len_s, keys, device=device)[:, None]
+    k = torch.arange(keys, device=device)[None, :]
+    return ((k <= q) & (k > q - int(window)))[None, None]
+
+
 def ring_tokens(window: int, chunk: int) -> int:
     """VRAM positions one windowed layer's ring holds: the W-1 the next token
     needs, one spill block and one chunk of new positions (block = chunk, so a
