@@ -562,7 +562,8 @@ def _largest_s_within_budget(shape: VramShape, budget: int) -> int:
 def reserve_floor_bytes(*, shape: VramShape, base_floor: int, free_vram: int,
                         min_resident: int, layer_slack: int,
                         protected_bytes: int = 0,
-                        requested_max_seq_len: int | None = None) -> int:
+                        requested_max_seq_len: int | None = None,
+                        parity_kv_per_token: int | None = None) -> int:
     """The reserve floor for THIS load, raised when the kernel materializes
     attention scores (todo row 8, decided 2026-08-15).
 
@@ -621,15 +622,31 @@ def reserve_floor_bytes(*, shape: VramShape, base_floor: int, free_vram: int,
     context the caller has capped away (before S15 a 16,766 request still got the
     11.32 GiB floor).
 
+    The parity context is searched at the cache's FULL-LENGTH KV cost when the
+    caller supplies one (`parity_kv_per_token`; S35, USER decision 2026-10-09). A
+    cache that stores windowed layers at window length has a cheaper per-token KV,
+    which would double flash parity -- and under a score-materializing kernel
+    every extra context token also costs the reserve its score term, about ten
+    times the KV it saved. Measured on gpt-oss-20b: left alone the floor rose
+    9.49 -> 10.96 GiB for +22 % context and the expert VRAM tier fell 122 -> 3
+    experts (8k decode 78.4 -> 85.6 ms/token); with parity held at the
+    full-length cost the reserve is 8.77 GiB, the tier 181 experts and 8k decode
+    59.9 ms/token. More context stays one knob away (`max_seq_len`). None --
+    every load without windowed layers -- searches at the shape's own cost:
+    the result is exactly what it was.
+
     Never returns less than `base_floor`, which is itself measured (2026-07-24:
     2 GB covered prefill but not the prefill->decode boundary; 3.5 GB fixed it
     4/4).
     """
     if shape.score_elem_bytes <= 0:
         return int(base_floor)
-    flash_parity = _largest_s_within_budget(
-        replace(shape, score_elem_bytes=0.0, score_bytes_per_key=0.0),
-        int(base_floor))
+    parity_shape = replace(shape, score_elem_bytes=0.0, score_bytes_per_key=0.0)
+    if parity_kv_per_token is not None:
+        # Full-length layout: every KV layer per token, no ring constant.
+        parity_shape = replace(parity_shape, kv_per_token=int(parity_kv_per_token),
+                               kv_constant_bytes=0)
+    flash_parity = _largest_s_within_budget(parity_shape, int(base_floor))
     if requested_max_seq_len is not None:
         flash_parity = min(flash_parity, int(requested_max_seq_len))
     if flash_parity <= 0:

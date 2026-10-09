@@ -2784,11 +2784,22 @@ class VaayuBaseModel(GenerationMixin):
             if _protected:
                 print(f"[Vaayu-VRAM] protected pin demand: {_protected / 1024 ** 3:.2f} GiB "
                       f"(MoE non-expert weights the reserve floor may not take)")
+            # S35 (USER decision 2026-10-09): a load whose cache stores windowed
+            # layers at window length keeps its context target -- flash parity is
+            # priced at the pooled, full-length KV cost -- so the saving lowers the
+            # reserve (expert tier / pinning) instead of raising the target. None on
+            # every other load: the old path, byte for byte.
+            _parity_kv = self.pooled_kv_bytes_per_token() if _kv_constant else None
+            if _parity_kv is not None:
+                print(f"[Vaayu-VRAM] context target priced at the full-length KV cost "
+                      f"({_parity_kv / 1024:.1f} KiB/token): window-length storage lowers "
+                      f"the reserve, not the target (set max_seq_len for more context)")
             _reserve_floor = reserve_floor_bytes(
                 shape=_shape, base_floor=_VRAM_RESERVE_FLOOR_BYTES,
                 free_vram=_free_vram, min_resident=_min_resident,
                 layer_slack=_layer_slack, protected_bytes=_protected,
-                requested_max_seq_len=max_seq_len)
+                requested_max_seq_len=max_seq_len,
+                parity_kv_per_token=_parity_kv)
             self._vram_plan = plan_vram(
                 free_vram=_free_vram, shape=_shape,
                 min_resident=_min_resident,

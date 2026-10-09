@@ -135,3 +135,75 @@ def test_a_deepseek_shaped_tree_maps_no_windows():
     assert per_token_window_discount(stub) == 0
     assert VaayuBaseModel.planned_kv_constant_bytes(stub) == 0
     assert VaayuBaseModel.pooled_kv_bytes_per_token(stub) == 6880
+
+
+# ── spec §8a: flash parity is priced at the full-length KV cost (arm C) ─────
+
+def _gptoss_floor_and_plan(requested, parity_kv):
+    shape = _shape(kv_per_token=24576, kv_constant_bytes=28_286_976)
+    slack, free = 476_865_632, int((9.49 + 4.85) * GiB) + 476_865_632
+    floor = reserve_floor_bytes(shape=shape, base_floor=int(3.5 * GiB), free_vram=free,
+                                min_resident=int(13.24e6), layer_slack=slack,
+                                protected_bytes=int(3.35 * GiB),
+                                requested_max_seq_len=requested,
+                                parity_kv_per_token=parity_kv)
+    plan = plan_vram(free_vram=free, shape=shape, min_resident=int(13.24e6),
+                     requested_max_seq_len=requested, position_limit=131072,
+                     layer_slack=slack, reserve_floor=floor)
+    return floor, plan
+
+
+def test_parity_at_the_full_length_cost_keeps_the_context_and_lowers_the_reserve():
+    """gpt-oss replay (spec §8a): the default lands on arm C's reserve, not arm B's."""
+    floor, plan = _gptoss_floor_and_plan(None, 49152)
+    assert floor == 9_415_222_559
+    assert (plan.max_seq_len, plan.reserve_bytes) == (33213, 9_415_222_559)
+    _floor_b, plan_b = _gptoss_floor_and_plan(None, None)          # today's rule = arm B
+    assert (plan_b.max_seq_len, plan_b.reserve_bytes) == (40443, 11_787_182_646)
+
+
+def test_more_context_stays_one_knob_away():
+    _floor, plan = _gptoss_floor_and_plan(40442, 49152)
+    assert (plan.max_seq_len, plan.reserve_bytes) == (40442, 11_764_103_012)
+    floor, _plan = _gptoss_floor_and_plan(16384, 49152)
+    assert floor == 5_506_802_319
+
+
+@pytest.mark.parametrize("kv,hidden,heads,vocab,head_bytes,score", [
+    (327_680, 8192, 64, 128256, 2_101_346_304, 10.9),      # Llama-3.3-70B-like, sdpa
+    (253_952, 3072, 48, 200064, 1_229_193_216, 10.9),      # MiniMax-like, sdpa
+    (24_576, 2048, 16, 151936, 622_329_856, 0.0),          # Qwen3-Next-like, flash
+], ids=["llama70b-like", "minimax-like", "qwen3next-like"])
+def test_a_parity_cost_equal_to_the_shapes_own_changes_nothing(kv, hidden, heads, vocab,
+                                                              head_bytes, score):
+    """A load without windowed layers: pooled == planned, so passing it (or None)
+    must give today's floor exactly."""
+    shape = _shape(kv_per_token=kv, hidden=hidden, n_heads=heads, vocab=vocab,
+                   head_bytes=head_bytes, score_elem_bytes=score,
+                   score_bytes_per_key=0.0)
+    kw = dict(shape=shape, base_floor=int(3.5 * GiB), free_vram=int(14.5 * GiB),
+              min_resident=0, layer_slack=int(0.5 * GiB), protected_bytes=0,
+              requested_max_seq_len=None)
+    assert reserve_floor_bytes(**kw, parity_kv_per_token=kv) == reserve_floor_bytes(**kw)
+    assert reserve_floor_bytes(**kw, parity_kv_per_token=None) == reserve_floor_bytes(**kw)
+
+
+def test_the_parity_cost_only_ever_lowers_the_floor_on_a_second_windowed_geometry():
+    """Contrasting windowed shape (CLAUDE.md §5): half the KV per token in rings.
+    The full-length parity cost can only shorten the parity context, so the floor
+    it buys is never higher than today's."""
+    shape = _shape(kv_per_token=65_536, kv_constant_bytes=40_000_000, hidden=4096, n_heads=32,
+                   vocab=100_000, head_bytes=819_200_000, score_elem_bytes=10.9,
+                   score_bytes_per_key=0.0)
+    kw = dict(shape=shape, base_floor=int(3.5 * GiB), free_vram=int(14.5 * GiB),
+              min_resident=0, layer_slack=int(0.5 * GiB), protected_bytes=0,
+              requested_max_seq_len=None)
+    held = reserve_floor_bytes(**kw, parity_kv_per_token=131_072)
+    assert int(3.5 * GiB) <= held < reserve_floor_bytes(**kw)
+
+
+def test_the_load_prices_parity_at_the_pooled_cost_only_with_a_ring_by_source():
+    from pathlib import Path
+    src = (Path(__file__).resolve().parents[1] / "vaayu" / "vaayu_base.py").read_text()
+    assert "_parity_kv = self.pooled_kv_bytes_per_token() if _kv_constant else None" in src
+    assert "parity_kv_per_token=_parity_kv" in src
