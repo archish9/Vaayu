@@ -2784,16 +2784,57 @@ class VaayuBaseModel(GenerationMixin):
             if _protected:
                 print(f"[Vaayu-VRAM] protected pin demand: {_protected / 1024 ** 3:.2f} GiB "
                       f"(MoE non-expert weights the reserve floor may not take)")
+            # S35: a windowed layer's ring holds ring_tokens(W, chunk) positions
+            # whatever the context, so it saves VRAM only when the context is longer
+            # than the ring. Plan the FULL-LENGTH layout first; a layer whose ring is
+            # not shorter than the context that layout affords keeps full-length
+            # storage, as before S35 (windows_that_pay has the measured case).
+            if _kv_constant:
+                from dataclasses import replace as _dc_replace
+                from .vram_plan import VramPlanError
+                from .windowed_kv import windows_that_pay
+                _full_shape = _dc_replace(_shape, kv_per_token=self.pooled_kv_bytes_per_token(),
+                                          kv_constant_bytes=0)
+                try:
+                    _full_ctx = plan_vram(
+                        free_vram=_free_vram, shape=_full_shape, min_resident=_min_resident,
+                        requested_max_seq_len=max_seq_len,
+                        position_limit=getattr(self.config, "max_position_embeddings",
+                                               2 ** 31 - 1),
+                        layer_slack=_layer_slack,
+                        reserve_floor=reserve_floor_bytes(
+                            shape=_full_shape, base_floor=_VRAM_RESERVE_FLOOR_BYTES,
+                            free_vram=_free_vram, min_resident=_min_resident,
+                            layer_slack=_layer_slack, protected_bytes=_protected,
+                            requested_max_seq_len=max_seq_len)).max_seq_len
+                except VramPlanError:
+                    _full_ctx = None     # the full-length layout cannot plan this request: keep the rings
+                _paying = (windows_that_pay(self._kv_windows, self.prefill_chunk_size, _full_ctx)
+                           if _full_ctx is not None else self._kv_windows)
+                if len(_paying) != len(self._kv_windows):
+                    print(f"[Vaayu-VRAM] {len(self._kv_windows) - len(_paying)} windowed attention "
+                          f"layer(s) keep full-length KV: their ring would hold more positions "
+                          f"than the {_full_ctx}-token context this load can afford, so "
+                          f"window-length storage would cost VRAM instead of saving it")
+                    self._kv_windows = _paying
+                    if not _paying:
+                        self._cache_is_windowed = False
+                    _kv_per_token = self.planned_kv_bytes_per_token()[0]
+                    _kv_constant = self.planned_kv_constant_bytes()
+                    _shape = _dc_replace(_shape, kv_per_token=_kv_per_token,
+                                         kv_constant_bytes=_kv_constant)
             # S35 (USER decision 2026-10-09): a load whose cache stores windowed
             # layers at window length keeps its context target -- flash parity is
             # priced at the pooled, full-length KV cost -- so the saving lowers the
             # reserve (expert tier / pinning) instead of raising the target. None on
-            # every other load: the old path, byte for byte.
+            # every other load: the old path, byte for byte. The rule applies under a
+            # score-materializing kernel (eager / sdpa); on flash the reserve is the
+            # base floor and the saving goes to context.
             _parity_kv = self.pooled_kv_bytes_per_token() if _kv_constant else None
-            if _parity_kv is not None:
+            if _parity_kv is not None and _score_per_elem > 0:
                 print(f"[Vaayu-VRAM] context target priced at the full-length KV cost "
-                      f"({_parity_kv / 1024:.1f} KiB/token): window-length storage lowers "
-                      f"the reserve, not the target (set max_seq_len for more context)")
+                      f"({_parity_kv / 1024:.1f} KiB/token); "
+                      f"set max_seq_len for more context")
             _reserve_floor = reserve_floor_bytes(
                 shape=_shape, base_floor=_VRAM_RESERVE_FLOOR_BYTES,
                 free_vram=_free_vram, min_resident=_min_resident,

@@ -185,7 +185,6 @@ def test_a_parity_cost_equal_to_the_shapes_own_changes_nothing(kv, hidden, heads
               min_resident=0, layer_slack=int(0.5 * GiB), protected_bytes=0,
               requested_max_seq_len=None)
     assert reserve_floor_bytes(**kw, parity_kv_per_token=kv) == reserve_floor_bytes(**kw)
-    assert reserve_floor_bytes(**kw, parity_kv_per_token=None) == reserve_floor_bytes(**kw)
 
 
 def test_the_parity_cost_only_ever_lowers_the_floor_on_a_second_windowed_geometry():
@@ -229,3 +228,83 @@ def test_the_parity_search_drops_the_ring_constant():
         shape=shape, base_floor=int(3.5 * GiB), free_vram=int(14.5 * GiB), min_resident=0,
         layer_slack=int(0.5 * GiB), protected_bytes=0, requested_max_seq_len=None,
         parity_kv_per_token=131_072) == expected
+
+
+# ── a ring must be shorter than the context to pay (addendum review I4) ─────
+
+def _full_layout_context(full_shape, *, free, slack, min_res=0, protected=0):
+    floor = reserve_floor_bytes(shape=full_shape, base_floor=int(3.5 * GiB), free_vram=free,
+                                min_resident=min_res, layer_slack=slack,
+                                protected_bytes=protected, requested_max_seq_len=None)
+    return plan_vram(free_vram=free, shape=full_shape, min_resident=min_res,
+                     requested_max_seq_len=None, position_limit=2 ** 31 - 1,
+                     layer_slack=slack, reserve_floor=floor).max_seq_len
+
+
+def test_windows_that_pay_keeps_only_rings_shorter_than_the_context():
+    from vaayu.windowed_kv import ring_tokens, windows_that_pay
+    w = {0: 128, 3: 4096}
+    assert ring_tokens(128, 512) == 1151 and ring_tokens(4096, 512) == 5119
+    assert windows_that_pay(w, 512, 33155) == {0: 128, 3: 4096}
+    assert windows_that_pay(w, 512, 5119) == {0: 128}       # ring == context: no saving
+    assert windows_that_pay(w, 512, 1152) == {0: 128}
+    assert windows_that_pay(w, 512, 1151) == {}
+
+
+def test_a_window_longer_than_the_affordable_context_is_not_windowed():
+    """Gemma-2-27b-like dense geometry on flash, 14.78 GiB free: the full-length
+    layout affords 2,048 tokens, the 5,119-position rings would leave 358."""
+    from vaayu.windowed_kv import ring_tokens, windows_that_pay
+    per_layer = 2 * 16 * 128 * 2
+    full = _shape(kv_per_token=46 * per_layer, hidden=4608, n_heads=32, vocab=256000,
+                  head_bytes=256000 * 4608 * 2, score_elem_bytes=0.0, score_bytes_per_key=0.0)
+    ctx = _full_layout_context(full, free=int(14.78 * GiB), slack=int(0.45 * GiB))
+    assert ctx == 2048 < ring_tokens(4096, 512)
+    assert windows_that_pay({i: 4096 for i in range(0, 46, 2)}, 512, ctx) == {}
+
+
+def test_gptoss_rings_pay_and_stay():
+    from vaayu.windowed_kv import windows_that_pay
+    full = _shape(kv_per_token=49152)                       # gpt-oss, full-length layout
+    slack, free = 476_865_632, int((9.49 + 4.85) * GiB) + 476_865_632
+    ctx = _full_layout_context(full, free=free, slack=slack, min_res=int(13.24e6),
+                               protected=int(3.35 * GiB))
+    assert ctx > 30000
+    windows = {i: 128 for i in range(0, 24, 2)}
+    assert windows_that_pay(windows, 512, ctx) == windows
+    assert windows_that_pay(windows, 8192, 3046) == {}      # a 16,511-position ring at a 3k context
+
+
+def test_the_load_prunes_windows_before_it_plans_by_source():
+    from pathlib import Path
+    src = (Path(__file__).resolve().parents[1] / "vaayu" / "vaayu_base.py").read_text()
+    prune = src.find("windows_that_pay(self._kv_windows, self.prefill_chunk_size, _full_ctx)")
+    parity = src.find("_parity_kv = self.pooled_kv_bytes_per_token() if _kv_constant else None")
+    assert prune != -1, "the load never checks that its rings pay"
+    assert prune < parity, "the prune must run before the parity price is taken"
+
+
+def test_the_parity_floor_covers_the_last_chunk_boundary_on_a_layer_major_load():
+    from vaayu.windowed_kv import ring_tokens
+    vocab = 201088
+    head = int(3.5 * GiB) - 24 * 2048 * 32768 - 5 * vocab * 4
+    common = dict(N=1, chunk=512, hidden=2880, n_heads=64, vocab=vocab, elem_bytes=2,
+                  score_elem_bytes=10.9, score_bytes_per_key=0.0, head_bytes=head,
+                  alloc_factor=DEFAULT_ALLOC_FACTOR, kv_growth_factor=2,
+                  kv_capacity_buckets=True, layer_major_prefill=True)
+    full = VramShape(kv_per_token=24 * 2048, kv_constant_bytes=0, **common)
+    win = VramShape(kv_per_token=2 * 2048,
+                    kv_constant_bytes=2048 * 22 * ring_tokens(128, 512), **common)
+    env = dict(free_vram=int(23.0 * GiB), min_resident=int(13.24e6),
+               layer_slack=int(0.45 * GiB), protected_bytes=int(3.35 * GiB),
+               requested_max_seq_len=None)
+
+    def planned(shape, parity):
+        floor = reserve_floor_bytes(shape=shape, base_floor=int(3.5 * GiB),
+                                    parity_kv_per_token=parity, **env)
+        return plan_vram(free_vram=env["free_vram"], shape=shape,
+                         min_resident=env["min_resident"], requested_max_seq_len=None,
+                         position_limit=2 ** 31 - 1, layer_slack=env["layer_slack"],
+                         reserve_floor=floor).max_seq_len
+
+    assert planned(win, full.kv_per_token) >= planned(full, None)

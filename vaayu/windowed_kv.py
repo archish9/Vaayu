@@ -127,6 +127,18 @@ def ring_tokens(window: int, chunk: int) -> int:
     return (int(window) - 1) + 2 * max(1, int(chunk))
 
 
+def windows_that_pay(windows: dict, chunk: int, context: int) -> dict:
+    """The windowed layers worth storing at window length at this context.
+
+    A ring holds `ring_tokens(W, chunk)` positions whatever the context, so it
+    saves memory only when the context is LONGER than the ring. Where it is not
+    -- a 4,096-position window on a load that can afford ~2k tokens -- the ring
+    is pure cost: in replay on a Gemma-2-27b-like geometry 0.90 GiB of rings cut
+    the derived context from 2,048 to 358 tokens. Such a layer keeps full-length
+    storage, as before S35."""
+    return {i: w for i, w in windows.items() if ring_tokens(w, chunk) < int(context)}
+
+
 def release_freed_host_pages() -> None:
     """Hand freed host pages back to the OS (glibc `malloc_trim(0)`).
 

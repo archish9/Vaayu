@@ -652,9 +652,17 @@ def reserve_floor_bytes(*, shape: VramShape, base_floor: int, free_vram: int,
     if flash_parity <= 0:
         return int(base_floor)
     ceiling = int(free_vram) - int(min_resident) - int(layer_slack)
+    need = predict_peak_vram(shape, flash_parity)
+    if parity_kv_per_token is not None:
+        # Parity was searched on another shape, so this shape's peak need not be
+        # monotone up to it (the layer-major forward drops its logits term past a
+        # chunk boundary): also cover the last chunk boundary at or below parity.
+        chunk = max(1, int(shape.chunk))
+        boundary = (flash_parity // chunk) * chunk
+        if boundary > 0:
+            need = max(need, predict_peak_vram(shape, boundary))
     return max(int(base_floor),
-               min(predict_peak_vram(shape, flash_parity), ceiling,
-                   ceiling - max(0, int(protected_bytes))))
+               min(need, ceiling, ceiling - max(0, int(protected_bytes))))
 
 
 def _too_big_message(*, requested: int, s_max: int, free_vram: int,
