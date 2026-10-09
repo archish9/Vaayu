@@ -6,6 +6,8 @@ list — moved **verbatim** to `todo-backlog.md`, section **"ARCHIVE — todo.md
 user value today (each with a re-open condition) are the numbered list at the top of `todo-backlog.md`. Older full
 history: `git log -p -- todo.md`.
 
+**▶ S35 STATE (2026-10-09): BUILT, MEASURED AND REVIEWED on branch `s35-windowed-kv` (worktree `.claude/worktrees/s35-windowed-kv`, head `50501ad`) — NOT merged: it waits for the USER's pick between arm B (context) and arm C (tier). The branch's `todo.md` carries the full S35 row with every number; do NOT re-run the plan from the row below. RESULTS `docs/2026-10-09-S35-windowed-kv-RESULTS.md`. (Remove this line at the merge.)**
+
 Status keys: `[ ]` pending · `[~]` in progress · `[!]` blocked · `[bug]` open bug/regression.
 Protocol: `CLAUDE.md` §6 (this ledger), §7 (all plans / RESULTS go in `docs/`, which is gitignored — so every row here
 carries its own numbers), §8 (every change must reach the server; say if it is banked).
