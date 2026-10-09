@@ -273,9 +273,9 @@ the clean 0.45–0.56 ms/token before any build.
         only prompt+1 (gate `match_len=83/146`); one-length would miss every reasoning turn (cold 8k TTFT 13.85 s) and
         lose cross-session borrowing.
       - **Planner replay (CPU, `plans/probes/s35_plan_sim.py`, reproduces today's 33,155 / 9.49 / pin 4.85 exactly):**
-        47-m4 with the planner as-is → `max_seq_len` 40,445 (+22 %, NOT 2×: eager's score term), reserve 10.98 GiB,
+        47-m4 with the planner as-is (incl. the 28.3 MB ring constant) → `max_seq_len` 40,443 (+22 %, NOT 2×: eager's score term), reserve 10.98 GiB,
         tier ~0.08 GB ≈ 6 experts (today ~1.65 GB ≈ 124) → 8k decode heads back toward S18's OFF arm (93.9 vs 79.1
-        ms). With `MAX_SEQ_LEN=33155`: reserve 8.74 GiB, tier ~2.49 GB ≈ 188 experts. Tier figures are arithmetic.
+        ms). With `MAX_SEQ_LEN=33155`: reserve 8.77 GiB, tier ~2.46 GB ≈ 186 experts. Tier figures are arithmetic.
         **USER pick: measure both arms on device, then pick the default; the branch (default = as-is) does NOT merge
         before that pick.** If "context held": a planner rule protecting the tier from the parity raise is specced as
         an addendum and built before merge (the elastic-tier half starts there).
@@ -292,7 +292,14 @@ the clean 0.45–0.56 ms/token before any build.
       - Refused at load on a windowed cache (one WARNING each): decode graphs (gpt-oss already refused), the batched
         N>1 prefix pool, `PREFIX_COMPRESS`, `ENABLE_KV_PERSIST` (both off by default; backlog item at close). The sdpa
         `mask=None` window gap is closed in the mask hook.
-      - **NEXT:** implementation plan (writing-plans), then build on a branch.
+      - **PLAN WRITTEN 2026-10-09:** `docs/superpowers/plans/2026-10-09-S35-windowed-kv.md` (gitignored), 11 tasks:
+        1–2 `WindowedKVCache` (ring, spill, forms, crop reload, lending, abort), 3 engine wiring (`kv_windows_of`,
+        cache factory, per-layer mask slice, sdpa gap), 4 planner (`VramShape.kv_constant_bytes`, pooled host figure),
+        5 refusals, 6 suite, 7–10 on device (stock equivalence + fp16 check, ppl 8k/30.7k, arms A/B/C, gates), 11
+        RESULTS + ledger, then STOP for the USER's B/C pick. **Dry-run by the author:** Tasks 1–5's code applied
+        verbatim → suite 3901 passed, 26 skipped; 7 mutants killed; the three probes ran on `main` at small sizes
+        (stock control: TF vs full-length 64/64, vs default cache 25/64). Branch `s35-windowed-kv` (not created yet).
+      - **NEXT:** execute the plan (USER picks the execution method).
       **47-m4's numbers:** 12 of gpt-oss-20b's 24 layers are windowed at 128, so 24,576 of 49,152 B/token is stored
       and reserved but unreadable. At the derived `max_seq_len` 33,206 that is 1.632 GB held against 0.819 GB needed:
       **0.813 GB (49.8 %) wasted**, and the derived `max_seq_len` is halved. Correctness is not affected.
