@@ -70,6 +70,15 @@ def install_decode_graphs(model):
         print(f"[Vaayu] WARNING: decode graphs not installed: model device {device} is not "
               f"the current CUDA device ({torch.cuda.current_device()}); decode runs eagerly")
         return None
+    from .windowed_kv import kv_windows_of
+    _windows = kv_windows_of(model)
+    if _windows:
+        # S35: a capture saves and restores the cache's lengths only, and a spill
+        # inside the capture token would move a windowed layer's ring under it.
+        print(f"[Vaayu] WARNING: decode graphs not installed: this model's KV cache "
+              f"stores {len(_windows)} windowed attention layer(s) at window length; "
+              f"decode runs eagerly")
+        return None
     _install_seams(model)
     try:
         return DecodeGraphRunner(model)

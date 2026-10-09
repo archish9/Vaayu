@@ -3541,6 +3541,12 @@ class VaayuBaseModel(GenerationMixin):
             print("[KV] enable_kv_persist=True ignored: this model's KV cache is "
                   "servable at one length only and is not the per-token K/V layout "
                   "an on-disk record holds. The in-RAM prefix cache still works.")
+        elif (getattr(self, "enable_kv_persist", False)
+                and getattr(self, "_cache_is_windowed", False)):
+            print("[KV] enable_kv_persist=True ignored: this model's KV cache stores its "
+                  "windowed attention layers at window length (S35), and the on-disk "
+                  "writer reads every position off the live cache. The in-RAM prefix "
+                  "cache still works.")
         elif getattr(self, "enable_kv_persist", False):
             import shutil
             from .kv_persist import DiskWriter, KvDiskLoader
@@ -4326,6 +4332,7 @@ class VaayuBaseModel(GenerationMixin):
         # be False -- not absent -- when the prefix cache is off entirely.
         self._cache_holds_recurrent_state = False
         self._cache_is_one_length = False
+        self._cache_is_windowed = False
         if not getattr(self, "enable_prefix_cache", False):
             return
         from .batch import (cache_holds_recurrent_state, cache_is_one_length,
@@ -4333,6 +4340,10 @@ class VaayuBaseModel(GenerationMixin):
         _probe = self._create_kv_cache()
         self._cache_holds_recurrent_state = cache_holds_recurrent_state(_probe)
         self._cache_is_one_length = cache_is_one_length(_probe)
+        # S35: the live cache keeps windowed layers in a ring + host log, which the
+        # side channels that read per-position K/V off it cannot follow.
+        from .windowed_kv import WindowedKVCache
+        self._cache_is_windowed = isinstance(_probe, WindowedKVCache)
         _refusal = prefix_cache_refusal_reason(_probe, self.kv_cache_mode)
         if _refusal is not None:
             print(f"[Vaayu-Prefix] WARNING: cross-turn prefix cache DISABLED — "
@@ -6430,6 +6441,12 @@ class VaayuBaseModel(GenerationMixin):
                   "per-token K/V layout the packed container carries. Pooling "
                   "uncompressed.")
             bits = None
+        elif bits is not None and getattr(self, "_cache_is_windowed", False):
+            print("[Vaayu-Prefix] WARNING: prefix_compress ignored on this model — "
+                  "its KV cache stores the windowed attention layers at window length "
+                  "(S35), and the packed container is built from the live cache's "
+                  "per-position K/V. Pooling uncompressed.")
+            bits = None
         if bits is not None and bits < 9:
             print(f"[Vaayu-Prefix] WARNING: prefix_compress={bits} is below the 9 "
                   f"bits/channel that passes the quality gate on both on-device "
@@ -7006,6 +7023,14 @@ class VaayuBaseModel(GenerationMixin):
                 print("[Vaayu-Prefix] WARNING: batched_generate does not support "
                       "the cross-turn prefix cache on a KV cache that is servable "
                       "at one length only -- skipping both the lookup and the "
+                      "store-back for this batch; every stream prefills in full.")
+                pc = None
+            elif pc is not None and getattr(self, "_cache_is_windowed", False):
+                # S35: a hit hands back a ring plus a host log, and
+                # broadcast_cache_rows widens only the ring.
+                print("[Vaayu-Prefix] WARNING: batched_generate does not support "
+                      "the cross-turn prefix cache on a KV cache that stores windowed "
+                      "layers at window length -- skipping both the lookup and the "
                       "store-back for this batch; every stream prefills in full.")
                 pc = None
             common_ids = batch_common_prefix(requests) if pc is not None else []
