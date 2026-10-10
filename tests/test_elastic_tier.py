@@ -701,3 +701,13 @@ def test_a_load_whose_reserve_is_the_floor_gets_none_and_prints_nothing(name, ca
 def test_decode_graphs_keep_the_tier_static_and_say_so(name, capsys):
     assert _build(name, decode_graphs=True) is None
     assert "elastic expert tier OFF: decode graphs" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("name", ALL)
+def test_a_speculator_keeps_the_tier_static_and_says_so(name, capsys):
+    """speculative_generate sizes the tier's layer range for its verify width and
+    restores it afterwards; a budget that moves with the request would overwrite it."""
+    assert _build(name, speculator=True) is None
+    out = capsys.readouterr().out
+    assert out.count("elastic expert tier OFF: a speculator is loaded") == 1
+    assert "elastic expert tier ON" not in out

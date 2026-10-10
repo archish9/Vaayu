@@ -2,11 +2,10 @@
 
 Stand-in models and a recording stand-in for ElasticTier -- the decisions themselves
 are tested in tests/test_elastic_tier.py against a simulated card. What is pinned
-here: the admission branch (single stream only), the two generate entry points, the
-batch path's suspend, the prefill net, the forward hook, the layer range and the
-load-time build.
+here: the admission branch (single stream only), generate's prompt length, the batch
+path's suspend, the prefill net, the forward hook (behaviourally, on the real forward),
+the layer range and the load-time build.
 """
-import inspect
 import types
 from unittest.mock import MagicMock
 
@@ -14,6 +13,7 @@ import pytest
 import torch
 
 import vaayu.moe_patch as mp
+from tests.test_s33_host_edits import _Cache, make
 from vaayu.elastic_tier import GRANT_CHUNKS, ElasticTier
 from vaayu.persist.expert_cache import ExpertVRAMCache
 from vaayu.vaayu_base import (VaayuBaseModel, _VRAM_RESERVE_FLOOR_BYTES,
@@ -145,15 +145,6 @@ def test_generate_tells_admission_how_long_the_prompt_is():
     assert seen == [(18, {"prompt_tokens": 11})]
 
 
-def test_speculative_generate_asks_for_the_whole_request_at_once():
-    """Its loop narrows the tier's layer range for its own duration and restores it
-    afterwards, so a grant extended mid-request would be overwritten: it passes no
-    prompt length, and the elastic tier then grants the whole request."""
-    src = inspect.getsource(VaayuBaseModel.speculative_generate)
-    assert "self._assert_context_fits(input_ids.shape[-1] + max_new_tokens)" in src
-    assert "prompt_tokens" not in src
-
-
 def test_batched_generate_takes_the_lend_back_before_its_own_admission():
     elastic = RecordingElastic()
     stub = types.SimpleNamespace(
@@ -167,16 +158,34 @@ def test_batched_generate_takes_the_lend_back_before_its_own_admission():
 # ── the forward hook (stage 2) ───────────────────────────────────────────────────
 
 
-def test_forward_covers_the_context_before_the_layer_loop():
-    """Source order (forward needs a loaded model to run): the cover call sits after
-    the past length and this pass's token count are known and before inference_mode,
-    where the layers run. The on-device crossing runs count the extensions."""
-    src = inspect.getsource(VaayuBaseModel.forward)
-    past = src.index("_past_len_for_pos = (self.get_past_key_values_cache_seq_len(")
-    cover = src.index("_elastic.cover(_past_len_for_pos + int(_seq_total))")
-    layers = src.index("with torch.inference_mode():")
-    assert past < cover < layers
-    assert src.index("_seq_total = (sum(_chunk_lens)") < cover
+class _RecordingCover:
+    """What forward's hook sees: the argument, and how many layers had run by then."""
+    covering = True
+
+    def __init__(self, model):
+        self.model, self.calls = model, []
+
+    def cover(self, context_after):
+        self.calls.append((context_after, sum(len(d.calls) for d in self.model.dec)))
+
+
+@pytest.mark.parametrize("impl", ["flash_attention_2", "sdpa", "eager"])
+@pytest.mark.parametrize("new, past", [(1, 5), (3, 0), (4, 9)])
+def test_forward_covers_the_context_it_leaves_behind_before_any_layer_runs(impl, new, past):
+    """The REAL forward, on the stand-in model of tests/test_s33_host_edits.py: one
+    cover call per pass, with past + this pass's tokens, and before the first layer
+    -- on a decode step, a bare first pass and a multi-token pass, under every
+    attention kernel (gpt-oss runs eager). The no-OOM argument rests on this order."""
+    model = make()
+    model._active_attn_impl = impl
+    model.kv_cache_mode = "bf16"       # with no cache passed, forward builds its own
+    if impl == "eager":
+        model.max_seq_len = 64
+    model._elastic_tier = _RecordingCover(model)
+    VaayuBaseModel.forward(model, input_ids=torch.zeros(1, new, dtype=torch.long),
+                           past_key_values=(_Cache(past) if past else None), use_cache=True)
+    assert model._elastic_tier.calls == [(past + new, 0)]
+    assert sum(len(d.calls) for d in model.dec) > 0, "the layers must have run after it"
 
 
 # ── the prefill net ──────────────────────────────────────────────────────────────
@@ -275,34 +284,41 @@ def test_the_layer_range_follows_the_budget(name, capsys):
 # ── the load-time build ──────────────────────────────────────────────────────────
 
 
-def _loadable(tier, device="cuda:0", decode_graphs=None, plan=PLAN):
-    geo = dict(LAYER_GEOMETRIES["gptoss_like"])
+def _loadable(tier, device="cuda:0", decode_graphs=None, speculator=None, plan=PLAN,
+              geometry="gptoss_like", chunk=512):
+    geo = dict(LAYER_GEOMETRIES[geometry])
     geo["working_set_bytes"] = geo["top_k"] * geo["num_moe_layers"] * geo["expert_bytes"]
     return types.SimpleNamespace(
         _expert_vram_cache=tier, _vram_plan=plan, _vram_shape=SHAPE, device=device,
-        _moe_geometry=geo, _decode_graphs=decode_graphs, prefill_chunk_size=512,
-        _moe_blocks=[types.SimpleNamespace(layer_idx=i) for i in range(24)],
+        _moe_geometry=geo, _decode_graphs=decode_graphs, speculator=speculator,
+        prefill_chunk_size=chunk,
+        _moe_blocks=[types.SimpleNamespace(layer_idx=i) for i in range(geo["num_moe_layers"])],
         _vram_cacheable_layers=None)
 
 
-def test_the_load_builds_an_elastic_tier_from_the_plan_and_the_tier(cuda, capsys):
-    tier = ExpertVRAMCache(191 * EXPERT)
-    model = _loadable(tier)
+@pytest.mark.parametrize("geometry, chunk", [("gptoss_like", 512), ("minimax_like", 384)])
+def test_the_load_builds_an_elastic_tier_from_the_plan_and_the_tier(geometry, chunk, cuda,
+                                                                     capsys):
+    expert = LAYER_GEOMETRIES[geometry]["expert_bytes"]
+    top_k = LAYER_GEOMETRIES[geometry]["top_k"]
+    tier = ExpertVRAMCache(191 * expert)
+    model = _loadable(tier, geometry=geometry, chunk=chunk)
     elastic = VaayuBaseModel._build_elastic_tier(model)
     assert isinstance(elastic, ElasticTier)
-    assert elastic.base == 191 * EXPERT and elastic.base_floor == _VRAM_RESERVE_FLOOR_BYTES
-    assert elastic.grant_step == GRANT_CHUNKS * 512 and elastic.expert_bytes == EXPERT
+    assert elastic.base == 191 * expert and elastic.base_floor == _VRAM_RESERVE_FLOOR_BYTES
+    assert elastic.grant_step == GRANT_CHUNKS * chunk and elastic.expert_bytes == expert
     assert "elastic expert tier ON" in capsys.readouterr().out
-    # its budget writes reach the model's layer range
-    elastic._set_budget(4 * EXPERT)
-    assert tier.budget_bytes == 4 * EXPERT and model._vram_cacheable_layers == {0}
+    # its budget writes reach the model's layer range: one layer's top_k experts fit
+    elastic._set_budget(top_k * expert)
+    assert tier.budget_bytes == top_k * expert and model._vram_cacheable_layers == {0}
     # and its readings are the driver's and the allocator's
     cuda["free"] = 5 * GB
     assert elastic._driver_free() == 5 * GB
     assert elastic._allocated is torch.cuda.memory_allocated
 
 
-@pytest.mark.parametrize("case", ["no tier", "cpu", "no cuda", "floor plan", "decode graphs"])
+@pytest.mark.parametrize("case", ["no tier", "cpu", "no cuda", "floor plan", "decode graphs",
+                                  "speculator"])
 def test_the_load_builds_none_when_there_is_nothing_to_lend_or_nowhere_to_lend_it(
         case, cuda, monkeypatch, capsys):
     tier = ExpertVRAMCache(191 * EXPERT)
@@ -312,10 +328,12 @@ def test_the_load_builds_none_when_there_is_nothing_to_lend_or_nowhere_to_lend_i
              "cpu": lambda: _loadable(tier, device="cpu"),
              "no cuda": lambda: _loadable(tier),
              "floor plan": lambda: _loadable(tier, plan=floor_plan),
-             "decode graphs": lambda: _loadable(tier, decode_graphs=object())}[case]()
+             "decode graphs": lambda: _loadable(tier, decode_graphs=object()),
+             "speculator": lambda: _loadable(tier, speculator=object())}[case]()
     if case == "no cuda":
         monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
     assert VaayuBaseModel._build_elastic_tier(model) is None
     out = capsys.readouterr().out
-    assert ("elastic expert tier OFF" in out) == (case == "decode graphs")
+    assert ("elastic expert tier OFF: decode graphs" in out) == (case == "decode graphs")
+    assert ("elastic expert tier OFF: a speculator" in out) == (case == "speculator")
     assert "elastic expert tier ON" not in out

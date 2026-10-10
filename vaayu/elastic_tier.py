@@ -60,14 +60,19 @@ _GIB = 1024.0 ** 3
 
 def build_elastic_tier(*, tier, plan, shape, base_floor: int, expert_bytes: int,
                        decode_graphs: bool, driver_free, empty_cache, allocated,
-                       on_budget=None, prefill_chunk_size: int = 0) -> "ElasticTier | None":
+                       speculator: bool = False, on_budget=None,
+                       prefill_chunk_size: int = 0) -> "ElasticTier | None":
     """The load's ElasticTier, or None when there is nothing to lend.
 
     Silent when the plan's reserve is the base floor (every flash-kernel load): no
-    line is printed and nothing else in this module runs. Decode graphs keep a
-    private pool that empty_cache() has a known trap with (S12), and no checkpoint on
-    disk has both, so that pair is refused -- with a line, because there the lend
-    exists and is not used.
+    line is printed and nothing else in this module runs. Two loads have reserve to
+    lend and are refused -- each with a line, because there the lend exists and is
+    not used, and no checkpoint on disk is either:
+    * decode graphs keep a private pool that empty_cache() has a known trap with (S12);
+    * a speculator's verify pass sizes the tier's layer range for the routing union
+      of its draft width, and runs past the request's limit on its last rounds
+      (speculative_generate). A budget that moves with the request would overwrite
+      that range with the one-stream one.
     """
     if tier is None or plan is None or shape is None:
         return None
@@ -77,6 +82,11 @@ def build_elastic_tier(*, tier, plan, shape, base_floor: int, expert_bytes: int,
     if decode_graphs:
         print(f"[Vaayu-VRAM] elastic expert tier OFF: decode graphs are installed, and "
               f"their memory pool is not something this tier may return to the driver. "
+              f"{lendable / _GIB:.2f} GiB of the reserve stays unlent.")
+        return None
+    if speculator:
+        print(f"[Vaayu-VRAM] elastic expert tier OFF: a speculator is loaded, and its "
+              f"verify pass sizes the tier's layer range itself. "
               f"{lendable / _GIB:.2f} GiB of the reserve stays unlent.")
         return None
     elastic = ElasticTier(tier=tier, plan=plan, shape=shape, base_floor=base_floor,

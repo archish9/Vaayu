@@ -830,8 +830,9 @@ def compute_vram_layer_range(vram_budget_bytes: int, geometry: dict,
 
 def set_tier_layer_range(model, budget: int) -> None:
     """Re-derive which MoE layers the VRAM expert tier may hold from `budget`,
-    exactly as the load derives it. Called by everything that moves the budget after
-    the load: the admission cap below, and the elastic tier (S35-E).
+    exactly as the load derives it. Shared by the admission cap below and the elastic
+    tier (S35-E). (batched_generate and the decode graphs move the budget too, and
+    keep their own handling of the range.)
 
     A tier under one token's working set self-evicts to 0 % hits while every miss
     still pays for its entry, and a budget of zero must switch that off
@@ -3648,7 +3649,8 @@ class VaayuBaseModel(GenerationMixin):
 
     def _build_elastic_tier(self):
         """The load's ElasticTier (vaayu/elastic_tier.py), or None: no CUDA, no VRAM
-        expert tier, or nothing to lend. No knob -- every input is derived."""
+        expert tier, nothing to lend, or a load that is refused the lend (decode
+        graphs installed, a speculator loaded). No knob -- every input is derived."""
         tier = getattr(self, "_expert_vram_cache", None)
         plan = getattr(self, "_vram_plan", None)
         shape = getattr(self, "_vram_shape", None)
@@ -3661,6 +3663,7 @@ class VaayuBaseModel(GenerationMixin):
             tier=tier, plan=plan, shape=shape, base_floor=_VRAM_RESERVE_FLOOR_BYTES,
             expert_bytes=self._moe_geometry["expert_bytes"],
             decode_graphs=getattr(self, "_decode_graphs", None) is not None,
+            speculator=getattr(self, "speculator", None) is not None,
             driver_free=lambda: torch.cuda.mem_get_info()[0],
             empty_cache=torch.cuda.empty_cache,
             allocated=torch.cuda.memory_allocated,
@@ -4233,6 +4236,11 @@ class VaayuBaseModel(GenerationMixin):
         `prompt_tokens` is how much of `n_tokens` is prompt. Only the elastic tier
         reads it (S35-E): it grants the request VRAM for its prompt first and for its
         new tokens as they come. None means "all of it at once".
+
+        On a load with an ElasticTier this is more than a guard for a single-stream
+        request: admission there also SIZES the expert VRAM tier (it may empty it),
+        and its memory readings are not wrapped -- a failed reading is a failed
+        admission, because a request must not run on a tier nobody sized.
         """
         plan = getattr(self, "_vram_plan", None)
         shape = getattr(self, "_vram_shape", None)

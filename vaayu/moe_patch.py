@@ -1613,7 +1613,7 @@ def _ensure_prefill_headroom(vaayu_ref, layer_idx=-1) -> None:
         # in driver-free VRAM at admission, so a low reading here is usually the
         # allocator's own cache (each prefill chunk's score buffer is larger than the
         # last, and the old ones stay cached: 4.2 GiB behind an 8k prompt). Return
-        # that and look again before evicting -- measured without this: 218 of 536
+        # that and look again before evicting -- measured without this: 233 of 582
         # tier entries evicted during one cold 8k prefill. `is True`: a stand-in
         # model's attribute is not a grant.
         _elastic = getattr(vaayu_ref, "_elastic_tier", None)
