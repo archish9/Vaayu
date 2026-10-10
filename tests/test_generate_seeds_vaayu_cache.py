@@ -34,7 +34,7 @@ def bare(monkeypatch):
     m._prefix_cache = None
     m.telemetry = _Telemetry()
     m._keepawake_ctx = lambda: contextlib.nullcontext()
-    m._assert_context_fits = lambda n_tokens: None
+    m._assert_context_fits = lambda n_tokens, **_kw: None
     made = []
     m._create_kv_cache = lambda: made.append(object()) or made[-1]
     return m, seen, made

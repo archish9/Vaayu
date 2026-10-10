@@ -777,13 +777,16 @@ def test_the_top_k_hook_runs_at_the_end_of_init():
 
     S12 added `self._decode_graphs = install_decode_graphs(self)` directly after
     this call, so it is no longer __init__'s last statement -- but it must still
-    run after full model construction, so it must still precede that new line."""
+    run after full model construction, so it must still precede that new line.
+    S35-E added `self._elastic_tier = self._build_elastic_tier()` after both: it
+    takes the tier's budget as every load-time charge left it, and needs to know
+    whether decode graphs are installed."""
     import inspect
     lines = inspect.getsource(VaayuBaseModel.__init__).rstrip().splitlines()
     stripped = [l.strip() for l in lines]
-    assert stripped[-1] == "self._decode_graphs = install_decode_graphs(self)"
-    assert stripped.index("self._resolve_decode_top_k_auto()") < stripped.index(
-        "self._decode_graphs = install_decode_graphs(self)")
+    assert stripped[-1] == "self._elastic_tier = self._build_elastic_tier()"
+    graphs = stripped.index("self._decode_graphs = install_decode_graphs(self)")
+    assert stripped.index("self._resolve_decode_top_k_auto()") < graphs < len(stripped) - 1
 
 
 @pytest.mark.parametrize("bad", ["fast", "8", True, 7.5])
