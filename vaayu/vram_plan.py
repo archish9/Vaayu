@@ -898,3 +898,36 @@ def expert_vram_budget_for(plan: VramPlan, free_vram_now: int) -> int:
     context-insensitive by its own admission.
     """
     return max(0, int(free_vram_now) - plan.reserve_bytes)
+
+
+def peak_envelope_bytes(shape: VramShape, S: int) -> int:
+    """Largest predicted peak over EVERY context length up to S, in bytes.
+
+    predict_peak_vram is not monotone in S on a layer-major shape: crossing a chunk
+    boundary drops the logits term from a full chunk to one token. A budget that
+    must cover a request as its context GROWS to S therefore needs the largest peak
+    on the way, not the peak at S. Two evaluations give it exactly, by the two facts
+    solve_max_seq_len already rests on: within one boundary-to-boundary period the
+    peak only grows, and the values AT the boundaries only grow -- so the maximum is
+    at S itself or at the last chunk boundary at or below it.
+    """
+    s = int(S)
+    if s <= 0:
+        return 0
+    peak = predict_peak_vram(shape, s)
+    boundary = (s // max(1, int(shape.chunk))) * max(1, int(shape.chunk))
+    if 0 < boundary < s:
+        peak = max(peak, predict_peak_vram(shape, boundary))
+    return peak
+
+
+def request_reserve_bytes(plan: VramPlan, shape: VramShape, S: int, base_floor: int) -> int:
+    """VRAM ONE request whose context may reach S must be able to take (S35-E).
+
+    The load-time reserve is this figure at max_seq_len. A shorter request needs
+    less, and the difference is what the expert VRAM tier may borrow while that
+    request runs. Never under `base_floor` (the measured decode-boundary
+    requirement, 2026-07-24) and never over the plan's own reserve.
+    """
+    return min(int(plan.reserve_bytes),
+               max(int(base_floor), peak_envelope_bytes(shape, S)))
