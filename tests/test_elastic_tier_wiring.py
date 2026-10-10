@@ -285,13 +285,13 @@ def test_the_layer_range_follows_the_budget(name, capsys):
 
 
 def _loadable(tier, device="cuda:0", decode_graphs=None, speculator=None, plan=PLAN,
-              geometry="gptoss_like", chunk=512):
+              geometry="gptoss_like", chunk=512, preallocated=False):
     geo = dict(LAYER_GEOMETRIES[geometry])
     geo["working_set_bytes"] = geo["top_k"] * geo["num_moe_layers"] * geo["expert_bytes"]
     return types.SimpleNamespace(
         _expert_vram_cache=tier, _vram_plan=plan, _vram_shape=SHAPE, device=device,
         _moe_geometry=geo, _decode_graphs=decode_graphs, speculator=speculator,
-        prefill_chunk_size=chunk,
+        prefill_chunk_size=chunk, kv_cache_preallocated=lambda: preallocated,
         _moe_blocks=[types.SimpleNamespace(layer_idx=i) for i in range(geo["num_moe_layers"])],
         _vram_cacheable_layers=None)
 
@@ -318,7 +318,7 @@ def test_the_load_builds_an_elastic_tier_from_the_plan_and_the_tier(geometry, ch
 
 
 @pytest.mark.parametrize("case", ["no tier", "cpu", "no cuda", "floor plan", "decode graphs",
-                                  "speculator"])
+                                  "speculator", "preallocated kv"])
 def test_the_load_builds_none_when_there_is_nothing_to_lend_or_nowhere_to_lend_it(
         case, cuda, monkeypatch, capsys):
     tier = ExpertVRAMCache(191 * EXPERT)
@@ -329,11 +329,23 @@ def test_the_load_builds_none_when_there_is_nothing_to_lend_or_nowhere_to_lend_i
              "no cuda": lambda: _loadable(tier),
              "floor plan": lambda: _loadable(tier, plan=floor_plan),
              "decode graphs": lambda: _loadable(tier, decode_graphs=object()),
-             "speculator": lambda: _loadable(tier, speculator=object())}[case]()
+             "speculator": lambda: _loadable(tier, speculator=object()),
+             "preallocated kv": lambda: _loadable(tier, preallocated=True)}[case]()
     if case == "no cuda":
         monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
     assert VaayuBaseModel._build_elastic_tier(model) is None
     out = capsys.readouterr().out
     assert ("elastic expert tier OFF: decode graphs" in out) == (case == "decode graphs")
     assert ("elastic expert tier OFF: a speculator" in out) == (case == "speculator")
+    assert ("elastic expert tier OFF: this model's KV cache" in out) == (case == "preallocated kv")
     assert "elastic expert tier ON" not in out
+
+
+def test_only_a_model_that_brings_a_preallocated_cache_says_so():
+    """The base answers for every cache Vaayu builds (they grow with the context);
+    DeepSeek-V4 allocates its cache for max_seq_len in _create_kv_cache."""
+    from vaayu.vaayu_deepseek_v4 import VaayuDeepseekV4
+    assert VaayuBaseModel.kv_cache_preallocated(object()) is False
+    assert VaayuDeepseekV4.kv_cache_preallocated(object()) is True
+    assert "max_seq_len=self.max_seq_len" in __import__("inspect").getsource(
+        VaayuDeepseekV4._create_kv_cache)

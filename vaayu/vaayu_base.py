@@ -3650,7 +3650,8 @@ class VaayuBaseModel(GenerationMixin):
     def _build_elastic_tier(self):
         """The load's ElasticTier (vaayu/elastic_tier.py), or None: no CUDA, no VRAM
         expert tier, nothing to lend, or a load that is refused the lend (decode
-        graphs installed, a speculator loaded). No knob -- every input is derived."""
+        graphs installed, a speculator loaded, a KV cache preallocated at
+        max_seq_len). No knob -- every input is derived."""
         tier = getattr(self, "_expert_vram_cache", None)
         plan = getattr(self, "_vram_plan", None)
         shape = getattr(self, "_vram_shape", None)
@@ -3664,6 +3665,7 @@ class VaayuBaseModel(GenerationMixin):
             expert_bytes=self._moe_geometry["expert_bytes"],
             decode_graphs=getattr(self, "_decode_graphs", None) is not None,
             speculator=getattr(self, "speculator", None) is not None,
+            kv_preallocated=self.kv_cache_preallocated(),
             driver_free=lambda: torch.cuda.mem_get_info()[0],
             empty_cache=torch.cuda.empty_cache,
             allocated=torch.cuda.memory_allocated,
@@ -4386,6 +4388,14 @@ class VaayuBaseModel(GenerationMixin):
                     num_key_value_heads=getattr(self.config, "num_key_value_heads", n_heads),
                     head_dim=head_dim, kv_cache_mode=self.kv_cache_mode),
                 self._kv_cache_is_bucketed(), "config")
+
+    def kv_cache_preallocated(self) -> bool:
+        """Whether this model's KV cache takes its VRAM for max_seq_len when it is
+        created, instead of growing with the context. False for every cache Vaayu
+        builds; a model that brings its own preallocated cache (DeepSeek-V4)
+        overrides this. S35-E: such a load has no reserve a shorter request leaves
+        unused on the KV side, so it gets no elastic tier."""
+        return False
 
     def planned_kv_constant_bytes(self) -> int:
         """Bytes the windowed layers' rings hold whatever the context (S35): each

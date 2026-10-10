@@ -13,13 +13,14 @@ simulated. What the card models, each measured on gpt-oss-20b 2026-10-10
 
 Two regimes (ElasticTier.lends): a request whose lend pays for the allowance gets a
 MEASURED budget, and `assert_covered` is its invariant; a request near max_seq_len is
-lent nothing and runs the static plan to the byte, as a load without an ElasticTier
-does.
+lent nothing and runs the static plan -- the static budget under the static plan's own
+admission rule (S18's: the need must be there, to within what a filled tier occupies
+beyond its bytes; otherwise the shortfall comes out of the tier).
 """
 import pytest
 
 from vaayu.elastic_tier import (ALLOCATOR_ALLOWANCE, GRANT_CHUNKS, ElasticTier,
-                                build_elastic_tier)
+                                _lend_pays, build_elastic_tier)
 from vaayu.persist.expert_cache import ExpertVRAMCache
 from vaayu.vram_plan import (VramPlan, VramPlanError, VramShape, plan_vram,
                              reserve_floor_bytes)
@@ -150,12 +151,12 @@ class Card:
         self.tier.fresh_holes = 0
 
 
-def rig(name, *, rounding=0.012, returns=0.13, chunk=0):
+def rig(name, *, rounding=0.012, returns=0.13, chunk=0, base_experts=None):
     """(card, tier, elastic, budgets) for one geometry. The tier starts EMPTY, with
     its static budget, on a card that has exactly the plan's reserve free beside that
     budget -- as a load leaves it."""
     geo = GEOMETRIES[name]
-    base = geo["base_experts"] * geo["expert"]
+    base = (geo["base_experts"] if base_experts is None else base_experts) * geo["expert"]
     card = Card(base + geo["plan"].reserve_bytes, rounding=rounding, returns=returns)
     tier = CardTier(base, card)
     budgets = []
@@ -171,12 +172,16 @@ def assert_covered(card, tier, elastic, live=0):
     this process can still get what the granted request may yet take. PyTorch's pool
     counts: it is the request's own reusable memory, and the allocator returns it
     when a new block needs it. A request that is lent nothing has the static plan's
-    budget instead, exactly."""
-    if not elastic.lends(elastic.granted):
-        assert tier.budget_bytes == elastic.base
-        return
+    guarantee instead (S18's): never more than the static budget, and the need is
+    there to within what a filled tier occupies beyond its bytes -- which the
+    allowance estimates."""
     need = elastic.reserve_for(elastic.granted) - live
     worst = card.total - card.other - card.request - tier.footprint_when_full()
+    if not elastic.lends(elastic.granted):
+        assert tier.budget_bytes <= elastic.base
+        slack = int(elastic.allowance * tier.budget_bytes)
+        assert worst + slack >= need, (worst + slack - need, tier.budget_bytes)
+        return
     assert worst >= need, (worst - need, tier.budget_bytes)
 
 
@@ -472,7 +477,11 @@ def test_the_tier_never_passes_the_plans_cap_on_a_roomier_card(name):
 
 
 @pytest.mark.parametrize("name", ALL)
-def test_a_request_the_card_cannot_cover_is_refused_and_the_tier_kept(name):
+def test_a_request_the_card_cannot_cover_is_refused_once_the_tier_was_emptied_to_find_out(name):
+    """What the tier counts is the least an emptied tier returns, so a request that
+    count cannot cover is refused only after the tier was emptied and the driver read
+    again. The refusal leaves no grant behind, and the next request that fits is
+    admitted."""
     card, tier, elastic, _ = rig(name)
     elastic.admit(SHORT, SHORT + 64)
     finish(card, tier, elastic)
@@ -482,10 +491,63 @@ def test_a_request_the_card_cannot_cover_is_refused_and_the_tier_kept(name):
     granted = elastic.granted
     with pytest.raises(VramPlanError) as err:
         elastic.admit(limit - 64, limit)
-    assert f"Context of {limit} tokens does not fit" in str(err.value)
-    assert "is all it can be given" in str(err.value)
-    assert tier.current_usage == usage and tier.budget_bytes == budget
-    assert elastic.flushes == 0 and elastic.granted == granted, "a refusal changes nothing"
+    text = str(err.value)
+    assert f"Context of {limit} tokens does not fit" in text
+    assert "is all it can be given" in text and "expert VRAM tier emptied" in text
+    assert tier.current_usage == 0 and elastic.flushes == 1 and elastic.flushed_bytes == usage
+    assert tier.budget_bytes == budget and elastic.granted == granted
+    elastic.admit(SHORT, SHORT + 64)
+    assert_covered(card, tier, elastic)
+
+
+@pytest.mark.parametrize("name", ALL)
+def test_a_request_a_flush_would_serve_is_not_refused(name):
+    """The prefill net evicted part of a lent tier and the request ended before decode
+    refilled it: the holes are neither free nor counted by the tier, so free + usage
+    falls short of a full-window request -- which an emptied tier covers with room to
+    spare. It must be admitted, now and every time after."""
+    card, tier, elastic, _ = rig(name)
+    limit = elastic.plan.max_seq_len
+    elastic.admit(SHORT, SHORT + 64)
+    finish(card, tier, elastic)
+    tier.net_evicts(int(0.9 * tier.current_usage))
+    card.request, card.pool = 0, GB
+    card.empty_cache()
+    assert card.driver_free() + tier.current_usage < elastic.reserve_for(limit), \
+        "the scenario needs the count alone to say the request cannot be covered"
+    for _ in range(3):
+        elastic.admit(limit - 64, limit)
+        assert tier.holes == 0
+        assert_covered(card, tier, elastic)
+        finish(card, tier, elastic)
+    assert elastic.flushes == 1
+
+
+@pytest.mark.parametrize("name", ALL)
+def test_a_small_static_tier_does_not_get_full_window_requests_refused(name):
+    """A load planned for a long context has a static tier of a few experts, and a
+    short request grows it by the whole lend. What that filled tier occupies beyond
+    its bytes is then more than the static tier, so the count alone says a
+    full-window request cannot be covered. It can: the tier is emptied for it."""
+    card, tier, elastic, _ = rig(name, base_experts=3, rounding=0.047)
+    limit = elastic.plan.max_seq_len
+    for _ in range(3):
+        elastic.admit(SHORT, SHORT + 64)
+        finish(card, tier, elastic)
+        assert tier.current_usage * card.rounding > elastic.base
+        elastic.admit(limit - 64, limit)
+        assert tier.budget_bytes == elastic.base and tier.current_usage == 0
+        finish(card, tier, elastic)
+    assert elastic.unforced_flushes == 0
+
+
+@pytest.mark.parametrize("name", ALL)
+def test_a_request_is_covered_only_once_its_fit_succeeded(name):
+    card, tier, elastic, _ = rig(name)
+    elastic.fit = lambda granted, live=0: False
+    with pytest.raises(VramPlanError):
+        elastic.admit(SHORT, SHORT + 64)
+    assert not elastic.covering
 
 
 @pytest.mark.parametrize("name", ALL)
@@ -572,26 +634,114 @@ def test_a_lend_smaller_than_the_allowance_costs_is_not_made(name):
 
 
 @pytest.mark.parametrize("name", ALL)
-@pytest.mark.parametrize("rounding", [0.012, 0.047])
-def test_a_request_that_is_lent_nothing_runs_the_static_plan_whatever_the_driver_shows(
-        name, rounding, capsys):
-    """The static plan is not a measured one: a tier that is full at its static
-    budget, on a card where bytes went missing since the load, is neither emptied nor
-    shrunk for the next request at max_seq_len -- exactly as with no ElasticTier --
-    and nothing is learned from it."""
+@pytest.mark.parametrize("rounding", [0.0, 0.012, 0.047])
+def test_a_request_that_is_lent_nothing_keeps_a_full_static_tier(name, rounding, capsys):
+    """A tier that is full at its static budget occupies a little more than it
+    counts, so the driver shows a little less than the next full-window request's
+    need. That is the static plan's own state, not a shortage: the tier is neither
+    emptied nor shrunk, request after request, and nothing is learned from it."""
     card, tier, elastic, _ = rig(name, rounding=rounding)
     limit = elastic.plan.max_seq_len
     elastic.admit(limit - 64, limit)
+    assert tier.budget_bytes == elastic.base
     for _ in range(4):
-        card.other += 50 * MB
         finish(card, tier, elastic)
         usage = tier.current_usage
         assert usage == elastic.base, "the scenario needs the tier full at its static budget"
         elastic.admit(limit - 64, limit)
         assert elastic.flushes == 0 and tier.current_usage == usage
         assert tier.budget_bytes == elastic.base
+        assert_covered(card, tier, elastic)
     assert elastic.unforced_flushes == 0 and elastic.allowance == ALLOCATOR_ALLOWANCE
     assert "WARNING" not in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("name", ALL)
+def test_bytes_gone_before_a_request_that_is_lent_nothing_come_out_of_the_static_tier(name):
+    """The static plan's admission rule (S18), kept: when the driver is short of a
+    full-window request's need by more than a filled tier's own slack, the shortfall
+    comes out of the tier -- by emptying it, since a partial eviction would not return
+    the bytes -- and the tier is capped at what the driver backs. The cap is measured
+    at every fit, not kept: it follows the bytes when they come back."""
+    card, tier, elastic, _ = rig(name)
+    limit = elastic.plan.max_seq_len
+    elastic.admit(limit - 64, limit)
+    finish(card, tier, elastic)
+    assert tier.current_usage == elastic.base
+    card.other = GB                                   # taken between two requests
+    elastic.admit(limit - 64, limit)
+    assert elastic.flushes == 1 and tier.current_usage == 0
+    capped = tier.budget_bytes
+    assert capped == elastic.base - GB
+    assert card.driver_free() >= elastic.reserve_for(limit), "the request has its need"
+    assert_covered(card, tier, elastic)
+    for _ in range(3):                                # and it stays there, without a flush
+        finish(card, tier, elastic)
+        elastic.admit(limit - 64, limit)
+        assert elastic.flushes == 1
+        assert capped - elastic.expert_bytes < tier.budget_bytes <= capped
+        assert_covered(card, tier, elastic)
+    card.other = 0                                    # the bytes come back
+    finish(card, tier, elastic)
+    elastic.admit(limit - 64, limit)
+    assert elastic.flushes == 1
+    assert capped + GB // 2 < tier.budget_bytes <= elastic.base
+    assert elastic.unforced_flushes == 0 and elastic.allowance == ALLOCATOR_ALLOWANCE
+
+
+@pytest.mark.parametrize("name", ALL)
+def test_bytes_gone_within_a_filled_tiers_slack_do_not_empty_the_static_tier(name):
+    """About 70 MiB leaves every budget after a process's first requests (measured).
+    With the tier's own rounding that stays inside the slack the static rule
+    tolerates: no flush; the tier just stops growing."""
+    card, tier, elastic, _ = rig(name)
+    limit = elastic.plan.max_seq_len
+    elastic.admit(limit - 64, limit)
+    finish(card, tier, elastic)
+    card.other = 70 * MB
+    usage = tier.current_usage
+    elastic.admit(limit - 64, limit)
+    assert elastic.flushes == 0 and tier.current_usage == usage
+    assert tier.budget_bytes == usage
+    # ...and on an EMPTY tier the same missing bytes simply come off the budget
+    card, tier, elastic, _ = rig(name)
+    card.other = 70 * MB
+    elastic.admit(limit - 64, limit)
+    assert tier.budget_bytes == elastic.base - 70 * MB and elastic.flushes == 0
+
+
+@pytest.mark.parametrize("name", ALL)
+def test_a_static_grant_the_driver_cannot_back_is_unbacked_like_any_other(name, capsys):
+    card, tier, elastic, _ = rig(name, chunk=512)
+    limit = elastic.plan.max_seq_len
+    first_static = next(s for s in range(SHORT, limit + 1) if not elastic.lends(s))
+    elastic.admit(first_static - STEP - 10, limit)
+    assert elastic.lends(elastic.granted)
+    tier.fill(elastic.expert_bytes)
+    card.other = elastic.plan.reserve_bytes           # another process, mid-request
+    while elastic.lends(elastic.granted):
+        elastic.cover(elastic.granted + 1)
+    assert tier.budget_bytes == 0 and tier.current_usage == 0 and elastic.unbacked >= 1
+    assert capsys.readouterr().out.count("WARNING: the driver cannot back") == 1
+
+
+@pytest.mark.parametrize("name", ALL)
+def test_what_a_flush_taught_decides_who_is_lent_to(name):
+    """The lend must pay for the allowance the tier is REALLY held to: once a flush
+    has raised it, a request whose lend paid for 6 % and does not pay for the learned
+    share runs the static plan -- lending to it would give it less."""
+    card, tier, elastic, _ = rig(name)
+    limit = elastic.plan.max_seq_len
+    lend = lambda s: elastic.plan.reserve_bytes - elastic.reserve_for(s)
+    learned = 0.20
+    length = next(s for s in range(limit, SHORT, -1)
+                  if _lend_pays(elastic.base, lend(s), ALLOCATOR_ALLOWANCE)
+                  and not _lend_pays(elastic.base, lend(s), learned))
+    assert elastic.lends(length)
+    elastic.allowance = learned
+    assert not elastic.lends(length)
+    elastic.admit(length - 64, length)
+    assert tier.budget_bytes == elastic.base
 
 
 @pytest.mark.parametrize("name", ALL)
@@ -612,16 +762,21 @@ def test_a_tier_grown_by_a_short_request_is_emptied_for_one_that_is_lent_nothing
 
 @pytest.mark.parametrize("name", ALL)
 def test_a_shortage_behind_a_static_request_teaches_nothing(name):
-    """The tier a static request left was not sized by a measurement, so the next
-    lent request finding the driver short is not evidence about the allowance."""
+    """The tier a static request left was not sized with the allowance, so the next
+    lent request finding the driver short is not evidence about it -- even when the
+    request before the static one was that same lent length."""
     card, tier, elastic, _ = rig(name, rounding=0.047)
     limit = elastic.plan.max_seq_len
-    elastic.admit(limit - 64, limit)
-    finish(card, tier, elastic)
     long = lent_long(elastic)
+    elastic.admit(long - 64, long)                    # a lent fit: a reserve on record
+    finish(card, tier, elastic)
+    elastic.admit(limit - 64, limit)                  # the static one
+    finish(card, tier, elastic)
+    flushes = elastic.flushes
     card.other = elastic.plan.reserve_bytes - elastic.reserve_for(long)
     elastic.admit(long - 64, long)
-    assert elastic.flushes == 1, "the scenario needs the lent request to find the driver short"
+    assert elastic.flushes == flushes + 1, \
+        "the scenario needs the lent request to find the driver short"
     assert elastic.unforced_flushes == 0
     assert_covered(card, tier, elastic)
 
@@ -644,6 +799,7 @@ def test_a_grant_extended_into_the_static_zone_keeps_the_static_tier(name):
         elastic.cover(context)
         if not elastic.lends(elastic.granted):
             assert tier.budget_bytes == elastic.base
+            assert_covered(card, tier, elastic, live=card.request)
         tier.fill(elastic.expert_bytes)
     assert not elastic.lends(elastic.granted) and elastic.unbacked == 0
     assert elastic.flushes == 1 and tier.current_usage == elastic.base
@@ -904,6 +1060,18 @@ def test_a_load_whose_lend_cannot_pay_for_the_allowance_gets_none_and_prints_not
     over = VramPlan(max_seq_len=8192, reserve_bytes=FLOOR + cost + geo["expert"],
                     pinning_budget=0, s_max=65536, reason="")
     assert isinstance(_build(name, plan=over), ElasticTier)
+
+
+@pytest.mark.parametrize("name", ALL)
+def test_a_kv_cache_preallocated_at_max_seq_len_keeps_the_tier_static_and_says_so(
+        name, capsys):
+    """request_reserve_bytes charges KV at the granted length. A cache that takes its
+    VRAM for max_seq_len when it is created would leave every grant short by the
+    difference, so such a load is not lent to."""
+    assert _build(name, kv_preallocated=True) is None
+    out = capsys.readouterr().out
+    assert out.count("elastic expert tier OFF: this model's KV cache takes its VRAM") == 1
+    assert "elastic expert tier ON" not in out
 
 
 @pytest.mark.parametrize("name", ALL)
