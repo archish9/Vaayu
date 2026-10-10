@@ -162,6 +162,10 @@ class ElasticTier:
         self.granted = 0
         self.limit = 0
         self.covering = False
+        # The grant in force is lent to AND backed (fit's measured rule holds for it).
+        # The prefill net reads this: only then is a low driver-free reading the
+        # allocator's cache and not pressure (_ensure_prefill_headroom).
+        self.lent = False
         self.grants = 0
         self.extensions = 0
         self.flushes = 0
@@ -224,6 +228,11 @@ class ElasticTier:
         (the prefill net, an admission eviction): each leaves a hole."""
         return int(getattr(self.tier, "prefill_evictions", 0))
 
+    def _stranded(self) -> bool:
+        """Whether the tier may hold holes: something evicted part of it since it
+        was last emptied."""
+        return self._tier_evictions() != self._tier_evictions_seen
+
     def _set_budget(self, budget: int) -> None:
         self.tier.set_budget(int(budget))
         if self._on_budget is not None:
@@ -266,10 +275,12 @@ class ElasticTier:
         want = self.base + int(self.plan.reserve_bytes) - reserve   # the plan's cap
         free, usage = self._read()
         flushed = 0
-        if (free < need or usage > want) and usage > 0:
-            # The tier holds what this request needs. Evicting that much would not
-            # hand it to the driver (see the module docstring); emptying the tier
-            # does, and it refills by demand, most used experts first.
+        if (free < need or usage > want or self._stranded()) and usage > 0:
+            # The tier holds what this request needs -- or holes the net left, which
+            # no reading shows as free and which shrink every budget measured around
+            # them. Evicting would not hand either to the driver (see the module
+            # docstring); emptying the tier does, and it refills by demand, most
+            # used experts first.
             #
             # "Unforced": the driver is short although this request needs no more
             # than the last one, the tier is within its cap, and nothing has evicted
@@ -312,6 +323,7 @@ class ElasticTier:
                               f"{self.allowance:.1%}.")
         self._last_reserve = reserve
         ok = free >= need
+        self.lent = ok
         # A request that already holds its whole predicted reserve has out-run the
         # predictor: whatever the driver shows, none of it is given to the tier.
         surplus = free - need if live < reserve else 0
@@ -337,6 +349,13 @@ class ElasticTier:
         gives -- and a tier that has to give bytes back is emptied, because a partial
         eviction would not return them. The budget is what the driver backs, never
         more than `base`, and it is not kept: the next fit measures again.
+
+        The static plan's other half stays too: `lent` is False, so during this
+        request's prefill the net is today's (it evicts on the raw driver reading,
+        which with the last layer's score buffer still cached is a reading taken AT
+        the peak). Measured on gpt-oss-20b at max_seq_len with the tier resident:
+        without that, the prefill peaked 1.06 GiB under the card; with it, as on
+        `main`, the net hands the tier's bytes to the prefill.
         """
         reserve = self.reserve_for(granted)
         live = max(0, int(live))
@@ -347,6 +366,7 @@ class ElasticTier:
                           or free + int(self.allowance * usage) < need):
             flushed = self._empty_tier()
             free, usage = self._read()
+        self.lent = False
         ok = free + int(self.allowance * usage) >= need
         surplus = free - need if live < reserve else 0
         budget = min(self.base, max(usage, usage + surplus)) if ok else 0
@@ -453,4 +473,5 @@ class ElasticTier:
         self.granted = 0
         self.limit = 0
         self.covering = False
+        self.lent = False
         self._last_reserve = None

@@ -44,8 +44,8 @@ class Stop(Exception):
 
 
 class RecordingElastic:
-    def __init__(self, covering=True, admit_returns=123, admit_raises=None):
-        self.covering = covering
+    def __init__(self, lent=True, admit_returns=123, admit_raises=None):
+        self.covering, self.lent = True, lent
         self.calls = []
         self._returns, self._raises = admit_returns, admit_raises
 
@@ -210,36 +210,41 @@ def _net_ref(elastic):
                                  _elastic_tier=elastic)
 
 
-def test_on_a_granted_request_the_net_returns_the_allocators_cache_before_it_evicts(
+def test_on_a_lent_request_the_net_returns_the_allocators_cache_before_it_evicts(
         monkeypatch):
     """Driver-free under the headroom, but only because the prefill's own blocks are
-    cached: on a granted request that is not pressure, and nothing is evicted."""
+    cached: on a request that is lent to that is not pressure, and nothing is evicted."""
     driver = _Driver(monkeypatch, free=GB, cached=3 * GB)
-    ref = _net_ref(RecordingElastic(covering=True))
+    ref = _net_ref(RecordingElastic(lent=True))
     mp._ensure_prefill_headroom(ref)
     assert driver.empties == 1
     ref._expert_vram_cache.evict_until_free.assert_not_called()
 
 
-def test_on_a_granted_request_the_net_still_evicts_when_the_cache_was_not_the_reason(
+def test_on_a_lent_request_the_net_still_evicts_when_the_cache_was_not_the_reason(
         monkeypatch):
     driver = _Driver(monkeypatch, free=GB, cached=GB // 2)
-    ref = _net_ref(RecordingElastic(covering=True))
+    ref = _net_ref(RecordingElastic(lent=True))
     mp._ensure_prefill_headroom(ref)
     assert driver.empties == 1
     ref._expert_vram_cache.evict_until_free.assert_called_once_with(mp._PREFILL_VRAM_HEADROOM)
 
 
-def test_outside_a_grant_the_net_is_todays_eviction(monkeypatch):
+def test_on_a_request_that_is_lent_nothing_the_net_is_todays_eviction(monkeypatch):
+    """The static plan keeps both its halves: the request was admitted by the elastic
+    tier (`covering`), is lent nothing, and the net evicts on the raw reading -- which,
+    with the last layer's score buffer still cached, is a reading taken at the peak."""
     driver = _Driver(monkeypatch, free=GB, cached=3 * GB)
-    ref = _net_ref(RecordingElastic(covering=False))
+    elastic = RecordingElastic(lent=False)
+    assert elastic.covering is True
+    ref = _net_ref(elastic)
     mp._ensure_prefill_headroom(ref)
     assert driver.empties == 0
     ref._expert_vram_cache.evict_until_free.assert_called_once_with(mp._PREFILL_VRAM_HEADROOM)
 
 
 def test_a_stand_in_whose_attributes_are_mocks_is_not_a_grant(monkeypatch):
-    """A MagicMock model answers every attribute, `covering` included, with a truthy
+    """A MagicMock model answers every attribute, `lent` included, with a truthy
     mock. The net must run today's eviction for it."""
     driver = _Driver(monkeypatch, free=GB, cached=3 * GB)
     ref = MagicMock()
@@ -251,7 +256,7 @@ def test_a_stand_in_whose_attributes_are_mocks_is_not_a_grant(monkeypatch):
 
 def test_with_headroom_to_spare_the_net_touches_nothing(monkeypatch):
     driver = _Driver(monkeypatch, free=mp._PREFILL_VRAM_HEADROOM, cached=GB)
-    ref = _net_ref(RecordingElastic(covering=True))
+    ref = _net_ref(RecordingElastic(lent=True))
     mp._ensure_prefill_headroom(ref)
     assert driver.empties == 0
     ref._expert_vram_cache.evict_until_free.assert_not_called()

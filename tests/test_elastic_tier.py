@@ -409,31 +409,58 @@ def test_a_flush_behind_the_nets_partial_eviction_teaches_nothing(name, reuse, c
 
 
 @pytest.mark.parametrize("name", ALL)
-def test_holes_the_net_left_outlive_a_fit_that_flushes_nothing(name, capsys):
-    """The net evicts part of the tier, and the NEXT request is admitted without a
-    flush (the driver shows its need). The holes are still there. A later request
-    that has to empty the tier -- for bytes that went missing outside -- gets them
-    back with it, and what that flush measures is the holes, not the tier's packing:
-    it must not be counted as unforced, and must not raise the allowance."""
+def test_holes_the_net_left_are_returned_by_the_next_lent_fit(name, capsys):
+    """The net evicts part of the tier. The holes it leaves are neither free nor the
+    tier's, the driver may still show the next request its need -- and every budget
+    measured around them would be short by them until something emptied the tier. So
+    the next lent fit empties it: the holes go back, the budget is whole again, and
+    the flush is not counted as the allocator's packing. (A request that is lent
+    nothing needs no such rule: its budget is capped at the static one, and holes
+    that leave the driver short of its need empty the tier by the shortage itself.)"""
     card, tier, elastic, _ = rig(name)
+    length = SHORT + 64
     elastic.admit(SHORT, SHORT + 64)
-    card.other += 700 * MB                           # the one quiet unforced flush
     finish(card, tier, elastic)
-    elastic.admit(SHORT, SHORT + 64)
-    assert elastic.unforced_flushes == 1 and elastic.flushes == 1
-    finish(card, tier, elastic)
-    tier.net_evicts(int(0.3 * tier.current_usage))   # during this request's prefill
-    card.request, card.pool = 0, GB                  # ...which ends without refilling
-    elastic.admit(SHORT, SHORT + 64)                 # a fit that flushes nothing
-    assert elastic.flushes == 1, "the scenario needs this admit not to flush"
-    assert tier.holes > 50 * elastic.expert_bytes, "...and the holes to survive it"
-    finish(card, tier, elastic, reuse=0.0)
-    card.other += 700 * MB
-    elastic.admit(SHORT, SHORT + 64)
-    assert elastic.flushes == 2, "the scenario needs the missing bytes to cost a flush"
-    assert elastic.unforced_flushes == 1 and elastic.allowance == ALLOCATOR_ALLOWANCE
-    assert tier.holes == 0 and "WARNING" not in capsys.readouterr().out
+    whole = tier.budget_bytes
+    tier.net_evicts(int(0.3 * tier.current_usage))   # during a prefill
+    card.request, card.pool = 0, GB                  # ...of a request that then ends
+    card.empty_cache()
+    assert tier.holes > 50 * elastic.expert_bytes
+    assert card.driver_free() >= elastic.reserve_for(length), \
+        "the scenario needs the driver to show the need although the holes are there"
+    elastic.admit(length - 64, length)
+    assert elastic.flushes == 1 and tier.holes == 0 and tier.current_usage == 0
+    assert elastic.unforced_flushes == 0 and "WARNING" not in capsys.readouterr().out
+    assert tier.budget_bytes == whole
     assert_covered(card, tier, elastic)
+    # ...once: the evictions are history when the tier has been emptied
+    finish(card, tier, elastic)
+    elastic.admit(length - 64, length)
+    assert elastic.flushes == 1
+
+
+@pytest.mark.parametrize("name", ALL)
+def test_only_a_backed_grant_that_is_lent_to_is_marked_lent(name):
+    """`lent` is what the prefill net reads: only on such a grant is a low driver-free
+    reading the allocator's cache. A request that is lent nothing, a grant the driver
+    could not back, and a suspended tier all leave the net its own rule."""
+    card, tier, elastic, _ = rig(name, chunk=512)
+    limit = elastic.plan.max_seq_len
+    assert elastic.lent is False
+    elastic.admit(SHORT, SHORT + 64)
+    assert elastic.lent is True
+    elastic.admit(limit - 64, limit)
+    assert elastic.lent is False and elastic.covering is True
+    elastic.admit(SHORT - 1, limit)
+    assert elastic.lent is True
+    card.other = elastic.plan.reserve_bytes          # another process, mid-request
+    elastic.cover(STEP + 1)
+    assert elastic.unbacked == 1 and elastic.lent is False
+    card.other = 0
+    elastic.admit(SHORT, SHORT + 64)
+    assert elastic.lent is True
+    elastic.suspend()
+    assert elastic.lent is False
 
 
 @pytest.mark.parametrize("name", ALL)
