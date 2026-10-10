@@ -233,18 +233,58 @@ attention implementation:
   flash parity the floor does not move; a longer request (up to `S_max`) is still planned
   and its larger reserve comes out of pinning and the expert cache. On gpt-oss-20b: `None`
   → 33,213 tokens, 184 experts in the VRAM tier, 8k decode 60.1 ms/token; a 40,442-token
-  plan → 3 experts, 85.6 ms/token. The floor is also never allowed to take the pin budget
+  plan → 3 experts, 85.6 ms/token. (Those are the tier's STATIC sizes — what it holds while
+  a request runs at the full window. Since 2026-10-10 the tier on such a load is sized to
+  the running request and an 8k request decodes faster than that; see "The expert VRAM tier
+  follows the running request" below.) The floor is also never allowed to take the pin budget
   an MoE load's non-expert weights need (`protected pin demand` in the load log).
   gpt-oss is the eager example: its floor is the parity floor priced at the full-length KV
   cost of its cache (8.77 GiB at the derived 33,213 tokens; the pinning budget is 5.59 GiB,
   so the 3.35 GiB protected demand does not bind), so a shorter request returns VRAM, and a
-  LONGER one (up to `S_max`) is allowed and costs the expert tier: `None` gives 184 experts
-  in the VRAM tier (8k decode 60.1 ms/token); a 40,442-token plan gives 3 (85.6 ms/token,
-  measured at a derived 40,442-token plan). A MoE load whose
+  LONGER one (up to `S_max`) is allowed and costs the expert tier: `None` gives a static
+  tier of 184 experts (8k decode 60.1 ms/token with the tier held at that size); a
+  40,442-token plan gives 3 (85.6 ms/token, measured at a derived 40,442-token plan). A MoE
+  load whose
   floor is already held at the 3.50 GiB base by that protection gets **nothing** back from
   a shorter context: DeepSeek-V4 today (its 8.24 GiB protected demand exceeds the 7.82 GiB
   above the base floor; requests of None / 32,768 / 16,384 / 4,096 all plan floor 3.50,
   reserve 3.50, pin 7.80 GiB).
+
+**The expert VRAM tier follows the running request (since 2026-10-10).** On a load whose VRAM
+reserve is larger than the 3.5 GiB base floor — gpt-oss-20b today, because eager attention needs
+a large prefill buffer at the full window — that reserve is sized for a request at `max_seq_len`,
+and a shorter request cannot use most of it. The engine lends the unused part to the expert VRAM
+tier while that request runs, and takes it back before a longer one can need it. Measured on
+gpt-oss-20b (decode, median ms/token, static tier → sized to the request, `max_tokens` omitted):
+**60.3 → 40.9 at 2k, 60.2 → 45.4 at 8k, 72.3 → 55.4 at 16k**; at 30.7k there is nothing left to
+lend and the tier is the static one (88.9 → 88.0). A growing session — 8 turns appending from
+7,000 to 11,550 tokens, 150 new tokens each, served by the prefix cache — took **74.6 s → 55.9 s**
+over its turns 2–8 (−25 %). Token ids are identical to the static tier's in every one of those
+runs, and logits stay bit-identical to stock transformers.
+
+There is no setting for it. It works with `max_tokens` set or omitted: with it omitted, the
+request is granted context in steps of four prefill chunks (2,048 tokens on the default chunk)
+and the grant is extended before the forward that would pass it. `MAX_SEQ_LEN` caps the context
+exactly as before. A load whose reserve already sits on the base floor has nothing to lend and
+nothing changes for it — on this box that is Qwen3-Next, MiniMax-M2.7 and DeepSeek-V4 (their load
+logs show `reserve=3.50 GiB`), and the dense models, which have no expert tier. The tier also
+stays static on a load with decode graphs or with a speculative-decoding drafter; the load log
+then says `elastic expert tier OFF:` and why.
+
+What it costs: a partly evicted tier does not hand its VRAM back to the driver (PyTorch returns
+memory in whole 20 MiB units that are entirely free), so when a request needs more of the reserve
+than the tier leaves, the tier is **emptied** before that request's prefill and refills as it
+decodes. That one request's time to first token is higher. At 16k, the first request after an 8k
+one took 30.95 s to its first token and the second 24.93 s, against 28.48 s with the static tier.
+At 8k with `max_tokens` omitted a cold request took 13.12 s against 11.70 s static — and 8.92 s
+when the same request set `max_tokens=64`, because its smaller grant needed no flush. A request
+near `max_seq_len` (on gpt-oss-20b a grant above about 32,250 tokens, which every prompt over
+30,720 tokens gets when `max_tokens` is omitted) is lent nothing and runs the static plan exactly.
+
+In the log: `[Vaayu-VRAM] elastic expert tier ON: up to 5.27 GiB of the 8.77 GiB reserve ... is
+lent to the expert VRAM tier` at load, and `[Vaayu-VRAM] elastic tier: granted N of M tokens; tier
+budget a -> b GB (~n experts)` whenever the budget moves by an expert or more — followed by
+`; flushed x GB` when the tier was emptied, and by `(the static plan)` when nothing was lent.
 
 What a shorter context *does* do is shrink the same RAM reservation `prefix_sessions` scales —
 and only as the product. `prefix_sessions=1 × 8192` and `prefix_sessions=2 × 4096` are
