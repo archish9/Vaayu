@@ -23,6 +23,11 @@ What the design rests on, each measured on gpt-oss-20b 2026-10-10
   is read again at every grant.
 * A low driver-free reading is often the allocator's own cache, not demand. So the
   cache is returned before every reading.
+* Holding back that allowance costs a share of the WHOLE tier, so a request near
+  max_seq_len -- whose lend is smaller than that share -- got fewer experts than the
+  static plan gives it (160 against 176 at 30.7k, decode 91.7 ms against 87.9). So a
+  lend that does not pay for the allowance is not made: that request runs the static
+  plan, to the byte (ElasticTier.lends).
 """
 from __future__ import annotations
 
@@ -58,15 +63,24 @@ _ALLOWANCE_CAP = 0.5
 _GIB = 1024.0 ** 3
 
 
+def _lend_pays(base: int, lend: int, allowance: float) -> bool:
+    """Whether lending `lend` bytes of reserve can give the tier more than its static
+    budget `base`. The allowance is held back from the whole tier, static part
+    included, so a lend under base * allowance / (1 - allowance) leaves the tier
+    SMALLER than the static plan does."""
+    return (int(base) + int(lend)) * (1.0 - allowance) > int(base)
+
+
 def build_elastic_tier(*, tier, plan, shape, base_floor: int, expert_bytes: int,
                        decode_graphs: bool, driver_free, empty_cache, allocated,
                        speculator: bool = False, on_budget=None,
                        prefill_chunk_size: int = 0) -> "ElasticTier | None":
     """The load's ElasticTier, or None when there is nothing to lend.
 
-    Silent when the plan's reserve is the base floor (every flash-kernel load): no
-    line is printed and nothing else in this module runs. Two loads have reserve to
-    lend and are refused -- each with a line, because there the lend exists and is
+    Silent when the plan's reserve is the base floor (every flash-kernel load), and
+    when what lies above the floor would not pay for the allowance even on the
+    shortest request (_lend_pays): no line is printed and nothing else in this module
+    runs. Two loads have reserve to lend and are refused -- each with a line, because there the lend exists and is
     not used, and no checkpoint on disk is either:
     * decode graphs keep a private pool that empty_cache() has a known trap with (S12);
     * a speculator's verify pass sizes the tier's layer range for the routing union
@@ -77,7 +91,8 @@ def build_elastic_tier(*, tier, plan, shape, base_floor: int, expert_bytes: int,
     if tier is None or plan is None or shape is None:
         return None
     lendable = int(plan.reserve_bytes) - int(base_floor)
-    if lendable < int(expert_bytes):
+    if lendable < int(expert_bytes) or not _lend_pays(
+            int(tier.budget_bytes), lendable, ALLOCATOR_ALLOWANCE):
         return None
     if decode_graphs:
         print(f"[Vaayu-VRAM] elastic expert tier OFF: decode graphs are installed, and "
@@ -106,7 +121,8 @@ class ElasticTier:
     `base` is the tier's budget when this is built: the static entitlement, what the
     tier keeps while a request runs at max_seq_len. `granted` is the context length
     the running request has been promised VRAM for; the budget never exceeds
-    base + (reserve - request_reserve(granted)).
+    base + (reserve - request_reserve(granted)), and is exactly `base` for a grant
+    whose lend does not pay for the allowance (lends).
 
     Three readings, injected: `driver_free()` -- bytes the driver reports free;
     `empty_cache()` -- return the allocator's cached blocks to the driver;
@@ -151,6 +167,13 @@ class ElasticTier:
     def reserve_for(self, context: int) -> int:
         return request_reserve_bytes(self.plan, self.shape, context, self.base_floor)
 
+    def lends(self, context: int) -> bool:
+        """Whether a request granted `context` tokens is lent anything. Read off the
+        PLAN, not off the driver: the requests that are lent to keep the measured
+        check in fit(), whatever the driver says."""
+        lend = int(self.plan.reserve_bytes) - self.reserve_for(context)
+        return _lend_pays(self.base, lend, self.allowance)
+
     def _grant_for(self, context: int) -> int:
         """The context length to grant a request that is about to hold `context`
         tokens: the next grant step at or above it, never past the request's limit;
@@ -194,6 +217,26 @@ class ElasticTier:
         if self._on_budget is not None:
             self._on_budget(int(budget))
 
+    def _empty_tier(self) -> int:
+        """Empty the tier; returns the bytes it counted. An emptied tier has no
+        holes, so this -- and nothing else -- is where a partial eviction by the
+        prefill net stops mattering to what a later flush measures (see fit)."""
+        flushed = int(self.tier.current_usage)
+        self.tier.clear()
+        self.flushes += 1
+        self.flushed_bytes += flushed
+        self._tier_evictions_seen = self._tier_evictions()
+        return flushed
+
+    def _say(self, granted: int, before: int, budget: int, flushed: int,
+             note: str = "") -> None:
+        if flushed or abs(budget - before) >= self.expert_bytes:
+            print(f"[Vaayu-VRAM] elastic tier: granted {int(granted)} of "
+                  f"{int(self.limit) or int(granted)} tokens; tier budget "
+                  f"{before / 1e9:.2f} -> {budget / 1e9:.2f} GB "
+                  f"(~{budget // self.expert_bytes} experts)" + note
+                  + (f"; flushed {flushed / 1e9:.2f} GB" if flushed else ""))
+
     def fit(self, granted: int, live: int = 0) -> bool:
         """Size the tier for a request granted `granted` tokens of context; `live` is
         what the request already holds on the device (_live()). Returns False when
@@ -202,11 +245,25 @@ class ElasticTier:
 
         The only place the budget is written while this object exists.
         """
+        before = int(self.tier.budget_bytes)
+        if not self.lends(granted):
+            # Nothing to lend this request: it runs the static plan, exactly as a
+            # load without this object does -- the tier keeps `base`, is emptied only
+            # when it holds more than that, and the driver is not consulted (the
+            # allowance that makes a measured budget hold would cost the tier more
+            # than the lend gives it). A shortage found after this says nothing
+            # about the allowance, so the next fit does not learn from one.
+            flushed = self._empty_tier() if int(self.tier.current_usage) > self.base else 0
+            if flushed:
+                self._empty_cache()
+            self._last_reserve = None
+            self._set_budget(self.base)
+            self._say(granted, before, self.base, flushed, " (the static plan)")
+            return True
         reserve = self.reserve_for(granted)
         live = max(0, int(live))
         need = max(0, reserve - live)                 # what the driver must still show
         want = self.base + int(self.plan.reserve_bytes) - reserve   # the plan's cap
-        before = int(self.tier.budget_bytes)
         free, usage = self._read()
         flushed = 0
         if (free < need or usage > want) and usage > 0:
@@ -216,18 +273,18 @@ class ElasticTier:
             #
             # "Unforced": the driver is short although this request needs no more
             # than the last one, the tier is within its cap, and nothing has evicted
-            # PART of the tier since the last fit. That last condition matters: the
-            # prefill net can, the holes it leaves are not the tier's own packing,
-            # and they are gone after this flush -- learning from them would shrink
-            # the tier for the life of the process.
+            # PART of the tier since it was last emptied. That last condition
+            # matters: the prefill net can, the holes it leaves are not the tier's
+            # own packing and stay until the tier is emptied -- a fit that flushes
+            # nothing does not remove them -- and learning from them would shrink
+            # the tier for the life of the process. The price: a load whose packing
+            # really is worse than the allowance is not learned from while the net
+            # keeps evicting; it pays one flush per request until the net is quiet.
             unforced = (free < need and usage <= want
                         and self._tier_evictions() == self._tier_evictions_seen
                         and self._last_reserve is not None and reserve <= self._last_reserve)
             short, shown = need - free, free
-            flushed = usage
-            self.tier.clear()
-            self.flushes += 1
-            self.flushed_bytes += flushed
+            flushed = self._empty_tier()
             free, usage = self._read()
             if unforced:
                 # Once can be bytes this process allocated for good at its first
@@ -252,7 +309,6 @@ class ElasticTier:
                               f"this model's tensor sizes; the allowance is now "
                               f"{self.allowance:.1%}.")
         self._last_reserve = reserve
-        self._tier_evictions_seen = self._tier_evictions()
         ok = free >= need
         # A request that already holds its whole predicted reserve has out-run the
         # predictor: whatever the driver shows, none of it is given to the tier.
@@ -263,12 +319,7 @@ class ElasticTier:
         budget = (min(want, max(usage, int((usage + surplus) * (1.0 - self.allowance))))
                   if ok else 0)
         self._set_budget(budget)
-        if flushed or abs(budget - before) >= self.expert_bytes:
-            print(f"[Vaayu-VRAM] elastic tier: granted {int(granted)} of "
-                  f"{int(self.limit) or int(granted)} tokens; tier budget "
-                  f"{before / 1e9:.2f} -> {budget / 1e9:.2f} GB "
-                  f"(~{budget // self.expert_bytes} experts)"
-                  + (f"; flushed {flushed / 1e9:.2f} GB" if flushed else ""))
+        self._say(granted, before, budget, flushed)
         return ok
 
     # ── a request ───────────────────────────────────────────────────────────────
@@ -327,7 +378,10 @@ class ElasticTier:
         """Called before a forward that leaves the context at `context_after` tokens:
         extend the grant when that passes it, and re-fit the tier BEFORE the forward
         allocates. One comparison when the grant already covers it, and nothing at
-        all for a request this object did not admit."""
+        all before the first admit() and after suspend(). Nothing tells this object
+        that a request has ended, so `covering` stays set: a forward that runs
+        outside any admitted request is held to the last grant, which can only
+        extend that grant and shrink the tier."""
         context_after = int(context_after)
         if not self.covering or context_after <= self.granted:
             return
@@ -353,9 +407,7 @@ class ElasticTier:
         (batched_generate): no lend, and nothing resident that a partial eviction of
         its own could strand."""
         if int(self.tier.current_usage) > 0:
-            self.flushes += 1
-            self.flushed_bytes += int(self.tier.current_usage)
-            self.tier.clear()
+            self._empty_tier()
         self._empty_cache()
         self._set_budget(self.base)
         self.granted = 0
