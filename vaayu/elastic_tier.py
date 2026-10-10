@@ -360,14 +360,17 @@ class ElasticTier:
         reserve = self.reserve_for(granted)
         live = max(0, int(live))
         need = max(0, reserve - live)
+        # The slack is the STARTING allowance, never a learned one: here a larger
+        # share would tolerate a larger shortfall -- the unsafe direction -- while in
+        # fit() it holds more back.
+        slack = min(self.allowance, ALLOCATOR_ALLOWANCE)
         free, usage = self._read()
         flushed = 0
-        if usage > 0 and (usage > self.base
-                          or free + int(self.allowance * usage) < need):
+        if usage > 0 and (usage > self.base or free + int(slack * usage) < need):
             flushed = self._empty_tier()
             free, usage = self._read()
         self.lent = False
-        ok = free + int(self.allowance * usage) >= need
+        ok = free + int(slack * usage) >= need
         surplus = free - need if live < reserve else 0
         budget = min(self.base, max(usage, usage + surplus)) if ok else 0
         # A shortage the next fit finds says nothing about the allowance: this budget
@@ -402,6 +405,10 @@ class ElasticTier:
             self._empty_tier()
             free, usage = self._read()
         if free + usage < whole:
+            # The tier was just emptied for nothing: it must not refill into memory
+            # known to be short before the next admission measures again.
+            self.covering = self.lent = False
+            self._set_budget(0)
             raise VramPlanError(self._cannot_give(limit, whole, free))
         self.limit = limit
         # The grant covers the first decode forward too (prompt + 1): a re-fit there

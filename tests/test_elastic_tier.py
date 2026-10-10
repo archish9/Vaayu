@@ -522,8 +522,15 @@ def test_a_request_the_card_cannot_cover_is_refused_once_the_tier_was_emptied_to
     assert f"Context of {limit} tokens does not fit" in text
     assert "is all it can be given" in text and "expert VRAM tier emptied" in text
     assert tier.current_usage == 0 and elastic.flushes == 1 and elastic.flushed_bytes == usage
-    assert tier.budget_bytes == budget and elastic.granted == granted
+    # nothing may refill the emptied tier into memory known to be short before the
+    # next admission measures again
+    assert tier.budget_bytes == 0 and not elastic.covering and not elastic.lent
+    assert elastic.granted == granted
+    elastic.cover(granted + 1)
+    assert tier.budget_bytes == 0 and elastic.extensions == 0
+    card.other = 0
     elastic.admit(SHORT, SHORT + 64)
+    assert tier.budget_bytes > elastic.base and elastic.covering
     assert_covered(card, tier, elastic)
 
 
@@ -735,6 +742,51 @@ def test_bytes_gone_within_a_filled_tiers_slack_do_not_empty_the_static_tier(nam
     card.other = 70 * MB
     elastic.admit(limit - 64, limit)
     assert tier.budget_bytes == elastic.base - 70 * MB and elastic.flushes == 0
+
+
+@pytest.mark.parametrize("name", ALL)
+def test_a_learned_allowance_does_not_widen_the_static_zones_tolerance(name):
+    """In fit() a larger allowance holds more of the tier back -- the safe direction.
+    In the static zone it would tolerate a larger shortfall. Once a flush has taught
+    a large share, a full-window request on a card short by more than a filled tier's
+    usual slack must still have the shortfall taken out of the tier."""
+    card, tier, elastic, _ = rig(name)
+    limit = elastic.plan.max_seq_len
+    elastic.admit(limit - 64, limit)
+    finish(card, tier, elastic)
+    assert tier.current_usage == elastic.base
+    elastic.allowance = 0.30
+    card.other = int(0.15 * tier.current_usage)      # past 6 %, inside 30 %
+    elastic.admit(limit - 64, limit)
+    assert elastic.flushes == 1 and tier.current_usage == 0
+    assert card.driver_free() >= elastic.reserve_for(limit)
+    assert tier.budget_bytes <= elastic.base - card.other + MB
+
+
+@pytest.mark.parametrize("name", ALL)
+def test_a_tier_over_the_static_budget_is_emptied_not_trimmed_for_a_static_request(name):
+    """A request just under the static threshold is lent a little and leaves the tier
+    a few experts over the static budget. The full-window request after it finds the
+    driver within the tier's slack of its need, so only `usage > base` says the tier
+    must shrink -- and it must be emptied, not trimmed: trimming leaves holes no
+    reading shows."""
+    card, tier, elastic, _ = rig(name)
+    limit = elastic.plan.max_seq_len
+    a = 1.0 - ALLOCATOR_ALLOWANCE
+    over = lambda s: int((elastic.base + elastic.plan.reserve_bytes
+                          - elastic.reserve_for(s)) * a) - elastic.base
+    length = max(s for s in range(SHORT, limit) if elastic.lends(s)
+                 and over(s) >= 3 * elastic.expert_bytes)
+    elastic.admit(length - 64, length)
+    finish(card, tier, elastic)
+    assert tier.current_usage > elastic.base, "the scenario needs the tier over its static budget"
+    slack_ok = (card.total - card.other - tier.footprint()
+                + int(ALLOCATOR_ALLOWANCE * tier.current_usage) >= elastic.reserve_for(limit))
+    assert slack_ok, "the scenario needs the shortfall inside the tier's slack"
+    elastic.admit(limit - 64, limit)
+    assert elastic.flushes == 1 and tier.holes == 0 and tier.current_usage == 0
+    assert tier.budget_bytes <= elastic.base
+    assert_covered(card, tier, elastic)
 
 
 @pytest.mark.parametrize("name", ALL)
