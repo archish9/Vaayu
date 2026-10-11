@@ -828,6 +828,29 @@ def compute_vram_layer_range(vram_budget_bytes: int, geometry: dict,
     return set(sorted(moe_layer_ids)[:n_fit])
 
 
+def set_tier_layer_range(model, budget: int) -> None:
+    """Re-derive which MoE layers the VRAM expert tier may hold from `budget`,
+    exactly as the load derives it. Shared by the admission cap below and the elastic
+    tier (S35-E). (batched_generate and the decode graphs move the budget too, and
+    keep their own handling of the range.)
+
+    A tier under one token's working set self-evicts to 0 % hits while every miss
+    still pays for its entry, and a budget of zero must switch that off
+    (compute_vram_layer_range returns an empty set, which _vram_tier_visit reads as
+    "no tier for any layer").
+    """
+    geometry = getattr(model, "_moe_geometry", None)
+    blocks = getattr(model, "_moe_blocks", None)
+    if geometry and blocks:
+        layers = compute_vram_layer_range(budget, geometry, [b.layer_idx for b in blocks])
+        if layers is not None and layers != getattr(model, "_vram_cacheable_layers", None):
+            print(f"[Vaayu-MoE] WARNING: VRAM cache budget {budget / 1e9:.2f}GB is now under "
+                  f"the per-token working set {geometry['working_set_bytes'] / 1e9:.2f}GB -- "
+                  f"restricting the VRAM cache to the first {len(layers)}/{len(blocks)} MoE "
+                  f"layers (partial caching).")
+        model._vram_cacheable_layers = layers
+
+
 def cap_tier_after_admission_eviction(model, tier) -> "tuple[int, int]":
     """Keep the promise an admission eviction makes (S18); returns (budget before,
     budget after).
@@ -839,26 +862,14 @@ def cap_tier_after_admission_eviction(model, tier) -> "tuple[int, int]":
     `budget - evicted`: with the tier not full, only the usage left after the
     eviction satisfies budget <= free + usage - need.
 
-    The layer range is re-derived from the new budget exactly as the load derives
-    it: a tier under one token's working set self-evicts to 0 % hits while every
-    miss still pays for its entry, and a budget of zero must switch that off
-    (compute_vram_layer_range returns an empty set, which _vram_tier_visit reads as
-    "no tier for any layer"). Raises if the tier cannot be capped; the caller then
-    refuses instead of admitting on a promise it cannot keep.
+    The layer range is re-derived from the new budget (set_tier_layer_range).
+    Raises if the tier cannot be capped; the caller then refuses instead of
+    admitting on a promise it cannot keep.
     """
     before = int(tier.budget_bytes)
     after = min(before, int(tier.current_usage))
     tier.set_budget(after)
-    geometry = getattr(model, "_moe_geometry", None)
-    blocks = getattr(model, "_moe_blocks", None)
-    if geometry and blocks:
-        layers = compute_vram_layer_range(after, geometry, [b.layer_idx for b in blocks])
-        if layers is not None and layers != getattr(model, "_vram_cacheable_layers", None):
-            print(f"[Vaayu-MoE] WARNING: VRAM cache budget {after / 1e9:.2f}GB is now under "
-                  f"the per-token working set {geometry['working_set_bytes'] / 1e9:.2f}GB -- "
-                  f"restricting the VRAM cache to the first {len(layers)}/{len(blocks)} MoE "
-                  f"layers (partial caching).")
-        model._vram_cacheable_layers = layers
+    set_tier_layer_range(model, after)
     return before, after
 
 
@@ -3021,6 +3032,7 @@ class VaayuBaseModel(GenerationMixin):
         self._non_expert_tier = None  # S14 P: filled below for MoE, after the arena
         self._layer_from_cache = {}  # records whether each layer's last load was a cache hit
         self._expert_vram_cache = None  # initialized below for MoE (Fix #7)
+        self._elastic_tier = None  # S35-E: built at the end of the load, if there is reserve to lend
         # Expert usage histogram (measurement only, ships dark). Default None
         # so the attribute always exists, on every load path (dense, CPU, or
         # no VRAM cache) — the hook's getattr must never be the only guard.
@@ -3629,6 +3641,37 @@ class VaayuBaseModel(GenerationMixin):
         from .decode_graphs import install_decode_graphs
         self._decode_graphs = install_decode_graphs(self)
 
+        # S35-E: lend the part of the VRAM reserve the running request cannot use to
+        # the expert VRAM tier. Last, because it takes the tier's budget as it stands
+        # after every load-time charge, and needs to know whether decode graphs are in.
+        # None -- and silent -- on every load whose reserve is the base floor.
+        self._elastic_tier = self._build_elastic_tier()
+
+    def _build_elastic_tier(self):
+        """The load's ElasticTier (vaayu/elastic_tier.py), or None: no CUDA, no VRAM
+        expert tier, nothing to lend, or a load that is refused the lend (decode
+        graphs installed, a speculator loaded, a KV cache preallocated at
+        max_seq_len). No knob -- every input is derived."""
+        tier = getattr(self, "_expert_vram_cache", None)
+        plan = getattr(self, "_vram_plan", None)
+        shape = getattr(self, "_vram_shape", None)
+        if (tier is None or plan is None or shape is None
+                or not torch.cuda.is_available()
+                or not str(self.device).startswith("cuda")):
+            return None
+        from .elastic_tier import build_elastic_tier
+        return build_elastic_tier(
+            tier=tier, plan=plan, shape=shape, base_floor=_VRAM_RESERVE_FLOOR_BYTES,
+            expert_bytes=self._moe_geometry["expert_bytes"],
+            decode_graphs=getattr(self, "_decode_graphs", None) is not None,
+            speculator=getattr(self, "speculator", None) is not None,
+            kv_preallocated=self.kv_cache_preallocated(),
+            driver_free=lambda: torch.cuda.mem_get_info()[0],
+            empty_cache=torch.cuda.empty_cache,
+            allocated=torch.cuda.memory_allocated,
+            on_budget=lambda budget: set_tier_layer_range(self, budget),
+            prefill_chunk_size=self.prefill_chunk_size)
+
     # if derived class needs to create generation config differently, like Mistrial, this function can be overridden
     def get_generation_config(self):
         # protective on generation config
@@ -4153,7 +4196,8 @@ class VaayuBaseModel(GenerationMixin):
 
     def _assert_context_fits(self, n_tokens: int, N: int = 1,
                              expert_giveback_bytes: int = 0,
-                             batched_prefill: bool = False) -> int | None:
+                             batched_prefill: bool = False,
+                             prompt_tokens: int | None = None) -> int | None:
         """Refuse an oversized request HERE, where the prompt length is known.
 
         Without this, the wall surfaces as an OOM inside the layer loop ~30
@@ -4190,6 +4234,15 @@ class VaayuBaseModel(GenerationMixin):
         trailing chunk. The second is the dangerous one -- it admits a batch
         whose real peak was never priced. Default False, so every single-stream
         caller keeps today's decision byte for byte.
+
+        `prompt_tokens` is how much of `n_tokens` is prompt. Only the elastic tier
+        reads it (S35-E): it grants the request VRAM for its prompt first and for its
+        new tokens as they come. None means "all of it at once".
+
+        On a load with an ElasticTier this is more than a guard for a single-stream
+        request: admission there also SIZES the expert VRAM tier (it may empty it),
+        and its memory readings are not wrapped -- a failed reading is a failed
+        admission, because a request must not run on a tier nobody sized.
         """
         plan = getattr(self, "_vram_plan", None)
         shape = getattr(self, "_vram_shape", None)
@@ -4197,6 +4250,17 @@ class VaayuBaseModel(GenerationMixin):
             return
         if not torch.cuda.is_available():
             return
+        # S35-E: on a load with reserve to lend, a single-stream request is admitted
+        # by the elastic tier -- the same rule (the predicted peak may not pass the
+        # reserve), checked against driver-free VRAM, and the tier's budget moves with
+        # the request. It replaces the evict-and-cap path below for these loads. A
+        # batch (N > 1, or a giveback) keeps the static rules.
+        _elastic = getattr(self, "_elastic_tier", None)
+        if (_elastic is not None and int(N) == 1 and not batched_prefill
+                and not expert_giveback_bytes):
+            return _elastic.admit(
+                int(n_tokens) if prompt_tokens is None else int(prompt_tokens),
+                int(n_tokens))
         import dataclasses
 
         from .vram_plan import (VramPlanError, _too_big_message,
@@ -4324,6 +4388,14 @@ class VaayuBaseModel(GenerationMixin):
                     num_key_value_heads=getattr(self.config, "num_key_value_heads", n_heads),
                     head_dim=head_dim, kv_cache_mode=self.kv_cache_mode),
                 self._kv_cache_is_bucketed(), "config")
+
+    def kv_cache_preallocated(self) -> bool:
+        """Whether this model's KV cache takes its VRAM for max_seq_len when it is
+        created, instead of growing with the context. False for every cache Vaayu
+        builds; a model that brings its own preallocated cache (DeepSeek-V4)
+        overrides this. S35-E: such a load has no reserve a shorter request leaves
+        unused on the KV side, so it gets no elastic tier."""
+        return False
 
     def planned_kv_constant_bytes(self) -> int:
         """Bytes the windowed layers' rings hold whatever the context (S35): each
@@ -5665,6 +5737,11 @@ class VaayuBaseModel(GenerationMixin):
 
         _past_len_for_pos = (self.get_past_key_values_cache_seq_len(past_key_values)
                              if past_key_values is not None else 0)
+        # S35-E: before this pass allocates anything, make sure the request's grant
+        # covers the context it leaves behind (one comparison when it does).
+        _elastic = getattr(self, "_elastic_tier", None)
+        if _elastic is not None:
+            _elastic.cover(_past_len_for_pos + int(_seq_total))
         # Create attention mask for the largest input, and position ids to use KV cache
         if self._active_attn_impl in ("flash_attention_2", "sdpa"):
             if getattr(self, '_batch_decode_active', False) and _caller_attention_mask is not None and _caller_attention_mask.dim() == 2:
@@ -6430,7 +6507,8 @@ class VaayuBaseModel(GenerationMixin):
                 # generation_config happens deeper inside super().generate(),
                 # replicating it here was judged not worth the duplication for a
                 # gap no current call site hits.
-                self._assert_context_fits(input_ids.shape[-1] + kwargs.get("max_new_tokens", 0))
+                self._assert_context_fits(input_ids.shape[-1] + kwargs.get("max_new_tokens", 0),
+                                          prompt_tokens=input_ids.shape[-1])
 
             pc = getattr(self, "_prefix_cache", None)
             if pc is None:
@@ -6967,6 +7045,11 @@ class VaayuBaseModel(GenerationMixin):
                 f"batched_generate requires sdpa attention, got {self._active_attn_impl}")
             N = len(requests)
             device = self.running_device
+            # S35-E: a batch runs the static giveback rules below, which read the
+            # tier's budget as its load-time entitlement. Take the lend back first.
+            _elastic = getattr(self, "_elastic_tier", None)
+            if _elastic is not None:
+                _elastic.suspend()
             pad_id = self.tokenizer.pad_token_id
             if pad_id is None:
                 pad_id = self.tokenizer.eos_token_id

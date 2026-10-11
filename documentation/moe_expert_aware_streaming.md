@@ -194,14 +194,21 @@ you got:
 On gpt-oss-20b routed delivery routes top_k × layers = 96 experts (1.27 GB) per token instead of
 10.17 GB, and after warm-up all of its experts sit in the RAM cache, so decode no longer waits on
 the disk. The routed experts that are already in the VRAM expert cache are not uploaded again:
-about 58 % of them at 8k context (53 % at 30.7k) on this model, whose cache holds about 184 of its 768 experts beside the
-context reserve. The output is bit-identical to stock transformers. There is no setting for it.
+about 58 % of them at 8k context (53 % at 30.7k) on this model when its cache holds the about 184 of
+its 768 experts that fit beside the full context reserve. Since 2026-10-10 that is the cache's size only
+while a request runs near the full window: the reserve a shorter request does not need is lent to the
+cache, which then holds 550–590 experts at 8k or less and serves 90–98 % of the routed experts
+(`TUNING.md`, "The expert VRAM tier follows the running request"). The output is bit-identical to stock
+transformers. There is no setting for it.
 
 Two log lines belong to this path. `Expert VRAM cache budget A -> B GB (~N experts): the routed
 fused-3D buffers (… B) were allocated from it after it was sized` — the kernel buffer's bytes are
 taken out of the cache's budget. And, when a request arrives: `admission: evicted X GiB of the expert VRAM
 tier to admit N tokens … and capped its budget A -> B GB` — a full cache had left less than the
-context reserve free, so part of it was given up for the request and stays given up.
+context reserve free, so part of it was given up for the request and stays given up. On gpt-oss-20b a
+single request is admitted by the elastic tier instead, and the line is `elastic tier: granted N of M
+tokens; tier budget A -> B GB` — a cache that has to give bytes back is emptied (a partial eviction
+would not return them to the driver), and its budget is measured again at every request.
 
 **Attention note for this family:** a model whose attention carries *sinks* cannot use the
 flash kernel shipped here unless the GPU is Hopper — the kernel raises *"S aux is currently

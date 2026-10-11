@@ -1609,6 +1609,19 @@ def _ensure_prefill_headroom(vaayu_ref, layer_idx=-1) -> None:
         return
     free, _ = torch.cuda.mem_get_info()
     if free < _PREFILL_VRAM_HEADROOM:
+        # S35-E: on a request the elastic tier lends to, the whole predicted peak was
+        # in driver-free VRAM at its grant, so a low reading here is usually the
+        # allocator's own cache (each prefill chunk's score buffer is larger than the
+        # last, and the old ones stay cached: 4.2 GiB behind an 8k prompt). Return
+        # that and look again before evicting -- measured without this: 233 of 582
+        # tier entries evicted during one cold 8k prefill. A request that is lent
+        # nothing (near max_seq_len) runs the static plan, and with it today's rule
+        # below, unchanged. `is True`: a stand-in model's attribute is not a grant.
+        _elastic = getattr(vaayu_ref, "_elastic_tier", None)
+        if _elastic is not None and _elastic.lent is True:
+            torch.cuda.empty_cache()
+            free, _ = torch.cuda.mem_get_info()
+    if free < _PREFILL_VRAM_HEADROOM:
         _vram.evict_until_free(_PREFILL_VRAM_HEADROOM)
     if os.environ.get("VAAYU_VRAM_DIAG"):
         free_now, _ = torch.cuda.mem_get_info()

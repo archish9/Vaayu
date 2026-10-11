@@ -686,6 +686,11 @@ class VaayuDeepseekV4(VaayuBaseModel):
         return (per_elem, 0.0,
                 f"derived from config: DSA indexer, {cfg.index_n_heads} heads over keys/{min(ratios)}")
 
+    def kv_cache_preallocated(self) -> bool:
+        """True: `DeepseekV4Cache` is allocated for `max_seq_len` in
+        `_create_kv_cache`, whatever the request's length."""
+        return True
+
     def planned_kv_bytes_per_token(self):
         """KV bytes per token MEASURED from this model's own preallocated cache
         (S15 L-b, user decision 2026-10-01). `DeepseekV4Cache` stores one
