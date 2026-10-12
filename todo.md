@@ -313,6 +313,29 @@ the clean 0.45–0.56 ms/token before any build.
          ran clean at 10,273 slabs. No measurement.
       **§8:** per item, at close.
 
+- [ ] **S37 — re-prioritise with the USER — INPUTS PRE-GATHERED 2026-10-12, IN ITS OWN FRESH SESSION (USER rule
+      `fresh_session_per_row`); run the brainstorming skill there.** All S21…S36 closed; `[bug]` M2 closed and merged
+      `60b56f7` (2026-10-12). No perf win is banked — every lever below needs a measurement/census first. Candidate pool,
+      ranked against the workload (agentic, prefill-heavy, N=1 on the server; N>1 worth 0 today — Rudra has no Vaayu
+      dependency and runs subagents sequentially, batching parked backlog #37):
+      - **Qwen3-Next (the agent's model, highest user value):** heavily tuned already — S21 census (turn 20.1 s,
+        decode 87 %, top cost miss-stall 5.3 s/turn) PREDATES the S27–S33 host edits and the S20 packed kernel, so it is
+        STALE; prefetch refuted (S25). Finding a new lever needs a FRESH HEAD census first (decode + TTFT, server mode,
+        frozen GC).
+      - **DeepSeek-V4 (slowest, 1.78 tok/s, biggest headroom, not the agent's model):** L-c planner VRAM priority
+        (unpriced; tier 34.9 % vs streamed non-expert 100 %); L-d built-in MTP draft (72 % per-forward bytes → a dense-like
+        speculative amortise) — but GATED on the row-37 re-gate, itself blocked by backlog #2 (lower-bpw download the USER
+        declined).
+      - **Dense (Llama), on the roadmap (§0):** M-6 free the embedding's VRAM for transformer layers; unbuilt, needs a
+        measure on the 70B streamed checkpoint.
+      - **gpt-oss:** S35-E done; stage-3 default context → 40,442 is PARKED on the USER's word (backlog #41) — a ship, not a
+        measure.
+      - **Stability (no perf, high-confidence):** `_inject_expert_weights` silent expert drop on H2D OOM
+        (module-list / MiniMax — silent wrong output; needs the raise-mid-decode-vs-degrade decision, I4 settled the layer
+        loop's side); G4 uniform-attention guard. Two more bugs are unreachable on this box today (VaayuQWen/ChatGLM no
+        checkpoint; current-CUDA-device single-GPU).
+      **§8:** per item, at the pick.
+
 ---
 
 # OPEN — not sequenced (re-rank at the re-prioritise row after S36; items taken by S32–S36 are tagged)
