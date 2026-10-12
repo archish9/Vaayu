@@ -550,12 +550,25 @@ def spec_recurrent_refusal(cache) -> str | None:
     layers. Measured 2026-09-18 on Qwen3-Next before this refusal existed:
     `speculative_generate` emitted garbage from the first drafting round. This
     is correctness, not a byte bound, so VAAYU_SPEC_FORCE does not override it.
+
+    A cache that DECLARES itself one-length (`is_one_length`, e.g. DeepSeek-V4's
+    preallocated sliding window plus compressed half) is refused for the same
+    reason even though it holds no recurrent state: a rejected draft reaches
+    `_trim_kv_cache` -> `crop`, which cannot rewind that layout, so the request
+    dies (500/SSE). This catches USE_PROMPT_LOOKUP=True, which has no
+    `drafter_model_path` for the by-name refusal to see ([bug] M2). A windowed
+    cache stays croppable and sets no such flag, so it is NOT refused (S35).
     """
     if cache_holds_recurrent_state(cache):
         return ("this model has recurrent (linear-attention) layers, and a "
                 "rejected draft cannot be rolled back out of a recurrent state "
                 "-- every partially accepted round would decode later tokens "
                 "against drafts that were never emitted.")
+    if bool(getattr(cache, "is_one_length", False)):
+        return ("this model's cache is servable at one length only (a "
+                "preallocated / compressed layout), and a rejected draft "
+                "reaches crop(), which cannot rewind it -- the request would "
+                "die mid-decode.")
     return None
 
 

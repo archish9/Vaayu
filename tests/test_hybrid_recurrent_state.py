@@ -200,6 +200,33 @@ def test_speculation_is_not_refused_on_a_uniform_cache(cache):
     assert spec_recurrent_refusal(cache) is None
 
 
+class _DeclaredOneLengthCache:
+    """A cache that DECLARES itself servable at one length (DeepSeek-V4's
+    contract: a preallocated sliding window plus a compressed half that `crop`
+    cannot rewind), without any recurrent-state layers. Mirrors the one
+    attribute `spec_recurrent_refusal` reads."""
+    is_one_length = True
+    layers = ()
+
+
+def test_speculation_is_refused_on_a_declared_one_length_cache():
+    """[bug] M2: USE_PROMPT_LOOKUP=True reaches `_trim_kv_cache` -> `crop` on a
+    cache that cannot be cropped back, raising a 500/SSE. `spec_recurrent_refusal`
+    must decline it at setup so no proposer is built -- a declared one-length
+    cache has no recurrent state, so the recurrent check alone misses it."""
+    cache = _DeclaredOneLengthCache()
+    assert not cache_holds_recurrent_state(cache)
+    reason = spec_recurrent_refusal(cache)
+    assert reason and "one length" in reason
+
+
+def test_speculation_is_not_refused_on_a_windowed_cache():
+    """A windowed cache stays croppable (S35), so speculation must NOT be
+    refused on it -- only a DECLARED one-length cache is."""
+    from vaayu.windowed_kv import WindowedKVCache
+    assert spec_recurrent_refusal(WindowedKVCache(quantize=False)) is None
+
+
 def test_trim_raises_on_a_recurrent_cache():
     """`_trim_kv_cache`'s own contract: a cache that cannot be trimmed must
     raise, because the alternative is wrong text. `crop` on a hybrid cache

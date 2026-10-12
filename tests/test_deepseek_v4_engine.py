@@ -357,6 +357,19 @@ def test_speculative_decoding_is_refused_by_name(monkeypatch):
         VaayuDeepseekV4("/some/path", drafter_model_path="/some/drafter")
 
 
+def test_prompt_lookup_speculation_is_refused_by_the_shared_gate():
+    """[bug] M2: USE_PROMPT_LOOKUP=True carries no `drafter_model_path`, so the
+    by-name refusal above never sees it. The shared setup gate
+    (`spec_recurrent_refusal(self._create_kv_cache())`, `vaayu_base.py`) must
+    decline it instead -- DeepSeek's cache declares `is_one_length`, which the
+    gate now refuses (it holds no recurrent state, so the recurrent check
+    alone passed it through to `crop` and a 500/SSE)."""
+    from vaayu.batch import cache_holds_recurrent_state, spec_recurrent_refusal
+    assert modeling.DeepseekV4Cache.is_one_length is True
+    assert not cache_holds_recurrent_state(modeling.DeepseekV4Cache)
+    assert spec_recurrent_refusal(modeling.DeepseekV4Cache) is not None
+
+
 def test_generate_hands_a_real_deepseek_cache_to_the_ordinary_path(monkeypatch):
     """Task 6d's regression test.
 
