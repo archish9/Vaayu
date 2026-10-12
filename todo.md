@@ -29,6 +29,13 @@ closed accumulates in this file again.
 
 ## Where things stand (2026-10-03, `main` `8310e11`)
 
+- **⭐ CURRENT Qwen3-Next baseline (S38, 2026-10-12, HEAD `5d3d8ac` = engine S36 `a89b445`; server mode, server's own
+  budget 19.31–19.33 GB, NO ballast, graphs ON, O_DIRECT, GC frozen, 3 processes, spread ≤ 1.1 %):** HIT agent turn
+  **14.95 s**, decode **47.0 ms/tok**, TTFT **2.95 s**, expert-miss stall **3.98 s**; cold-8k **19.85 s** / TTFT
+  **9.26 s**. HIT decomposition: TTFT 20 %, decode 80 % (stall 27 %, **host+GPU compute 53 % — now the largest block**).
+  Faster than S28 (16.04 s @ 18.4–18.9 GB) and S33 (15.65 s @ 17.5–17.7 GB) but at a bigger budget (not separated).
+  **Compare a new Qwen3-Next measurement with THESE at ~19.3 GB no-ballast, or re-pin the budget.** The older figures
+  below (buffered, S22/S28/S33) are superseded for Qwen3-Next. `docs/2026-10-12-S38-qwen3next-head-census-RESULTS.md`.
 - **Qwen3-Next-80B-A3B int4 (AWQ)** — the agent's model; fused non-EXL3 forward (`_make_fused_sparse_forward`).
   Decode at 8k, fresh content, 256 tokens, server mode (S21, 2026-10-03): **67.8 ms/token** at `BALLAST_GB=25`
   (graphs OFF 82.1); in an agent session at the server's own RAM budget (18.30 GB) **63–80 ms/token**, of which
@@ -85,7 +92,7 @@ closed accumulates in this file again.
 
 ---
 
-# ▶▶▶ THE SEQUENCE — S21…S41 (S21–S24 set 2026-10-03; S25–S26 set by the USER at S24, 2026-10-05; S27–S30 set by the USER at S26, 2026-10-06; S31 set by S26's rule when S30 closed, 2026-10-07; S32–S36 set by the USER at S31, 2026-10-07; S38–S41 set by the USER at S37, 2026-10-12). One per fresh session, in order. NEXT = **S38** (Qwen3-Next fresh HEAD census). ◀◀◀
+# ▶▶▶ THE SEQUENCE — S21…S41 (S21–S24 set 2026-10-03; S25–S26 set by the USER at S24, 2026-10-05; S27–S30 set by the USER at S26, 2026-10-06; S31 set by S26's rule when S30 closed, 2026-10-07; S32–S36 set by the USER at S31, 2026-10-07; S38–S41 set by the USER at S37, 2026-10-12). One per fresh session, in order. NEXT = **S39** (MiniMax silent expert-drop on H2D OOM). ◀◀◀
 
 **HOW A FRESH SESSION PICKS — no judgement needed:** take the **first row of the table that is not ✅**. Its durable
 row below IS the brief (write a handoff in `docs/superpowers/specs/` first only if the row needs more than it
@@ -181,7 +188,7 @@ the clean 0.45–0.56 ms/token before any build.
 | **S35** ✅ | ~~gpt-oss: 47-m4 (sliding-window KV at window length)~~ — **CLOSED 2026-10-10, A WIN, MERGED `5aa44cc`:** gpt-oss decode 79.1 → 60.1 ms/token at 8k and 129.0 → 85.8 at 30.7k, cold TTFT 15.6 → 12.8 s / 110.3 → 71.4 s, expert VRAM tier 125 → 184 experts, logits bit-identical to stock transformers' default cache; the USER picked arm C (freed VRAM → tier). The elastic-tier half is S35-E. Full row: the S35 row in the backlog archive | — | done |
 | **S35-E** ✅ | ~~gpt-oss elastic tier: size the reserve to the running request~~ — **CLOSED 2026-10-11, A WIN, MERGED `5bd31c3` on the USER's word:** gpt-oss decode (`max_tokens` omitted on both arms, static → elastic) 56.7 → 39.6 ms/token at 2k, 58.2 → 44.4 at 8k, 71.0 → 55.0 at 16k, equal at 30.7k; 8-turn session 71.6 → 54.4 s (−24 %); `MAX_SEQ_LEN=40442` 8k 84.0 → 45.0; ids identical, stock 64/64, no OOM; cost +1.6–3.9 s TTFT on a request that empties the tier, thinnest margin 0.11 GiB (open). Stage 3 (context → 40,442) not built, on the USER's word. Full row: the S35-E row in the backlog archive | — | done |
 | **S36** ✅ (6/6) | ~~Cheap sweep + 47-m6~~ — **CLOSED 2026-10-12, MERGED `a89b445`.** Items 3 (`e453b01`, gpt-oss usage gap + 2 tests), 4 (`1871aef`, Rust asserts + clamp), 6 (G5 closed on record), 2 (capture_begin NO REPRO), 1 (fp32 rotary ppl immaterial ≤0.32 %, fix stays) done in the merge; **item 5 (MiniMax census, backlog #9) CLOSED 2026-10-12 in its own fresh session: the pageable EXPERT prefill H2D is GONE on MiniMax — all 129 GB of EXL3 expert uploads PINNED/async; only residual pageable is `_pair_gpu` 0.016 GB (the refuted S1-b). backlog #9 CLOSED. Measure-only, suite floor unchanged.** Dense gate green both Llama. Full verdicts: the S36 durable row | *(c)* hours each | **6/6 done** |
-| **S38** | Qwen3-Next fresh HEAD census — decode + TTFT, server mode, frozen GC, MEASURE ONLY | *(a)* agent's model; the S21 baseline PREDATES the 6 merged host/kernel edits (S27–S33 + S20) so it is stale; nothing new can be ranked without it | hours–day |
+| **S38** ✅ | ~~Qwen3-Next fresh HEAD census~~ — **CLOSED 2026-10-12, MEASURE ONLY, no regression, no new N=1 lever.** HEAD (`5d3d8ac`, engine = S36 `a89b445`), server mode, server's own budget 19.32 GB (no ballast, USER's choice), 3 processes, spread ≤ 1.1 %: HIT turn **14.95 s**, decode **47.0 ms/tok**, TTFT **2.95 s**, stall **3.98 s**, cold-8k 19.85 s / 9.26 s. Breakdown: TTFT 20 %, decode 80 % (expert-miss stall 3.98 s = 27 %; **host+GPU decode compute 7.96 s = 53 %, now the LARGEST block**, overtaking the stall since S21). Faster than S28 (16.04 s @ 18.4–18.9 GB) and S33 (15.65 s @ 17.5–17.7 GB) but at a bigger budget — gain is budget + merged edits, not separated. Remaining N=1 levers all tapped/settled (GPU compute needs an algorithmic lever; prefetch REFUTED S25; host tapped S27/28/33; prefix+packed kernel shipped). Full row: the S38 durable row; `docs/2026-10-12-S38-qwen3next-head-census-RESULTS.md` | — | done |
 | **S39** | MiniMax silent expert-drop on H2D OOM (`_inject_expert_weights`) — raise-vs-degrade decision, then fix | *(b)/correctness* silent WRONG output, reachable on device; worst failure class, outranks an unreachable (d) bug | small + decision |
 | **S40** | DeepSeek L-c — price the planner's VRAM priority at HEAD, MEASURE ONLY | *(b)* slowest model (1.78 tok/s), biggest headroom; not the agent's model; tier 34.9 % vs streamed non-expert 100 % | price row |
 | **S41** | Dense M-6 — measure the embedding's VRAM share on Llama-3.3-70B streamed, then free it for transformer layers | *(b)/roadmap* on the §0 dense roadmap; unbuilt; ~5 % of ~37 GB/token read | measure → build |
@@ -351,18 +358,23 @@ re-prioritises with the USER.**
         checkpoint; current-CUDA-device single-GPU).
       **§8:** per item, at the pick.
 
-- [ ] **S38 — Qwen3-Next fresh HEAD census — decode + TTFT, server mode, frozen GC, MEASURE ONLY.** The S21 census
-      (turn 20.1 s, decode 87 %, top cost miss-stall 5.3 s/turn) is STALE: it predates the merged host edits (S27 `6fd79fa`,
-      S33 `6c9a31f`) and the S20 packed prefill kernel (`4eeab9b`) and was taken under buffered I/O (the O_DIRECT fix
-      `a588ff4` came after). Re-measure at HEAD against the current recorded baseline (the "Where things stand" S33-stage-1
-      block: HIT turn 15.65 s, HIT decode 49.15 ms/token, HIT TTFT 3.11 s, at `BALLAST_GB=29.4`, budget 17.5–17.7 GB),
-      then rank what remains. **Probe traps that MUST be honoured** (memories, all CONFIRMED): a different prompt per decode
-      arm or the warm tier serves 0 disk (`decode_probe_traps_s21`); freeze GC or say "library mode" (`probe_gc_freeze_server_mode`);
-      ABBA ordering, disk-bound arms drift ~3 % by position (`abba_ordering_disk_bound_ab`); a CUPTI window poisons every
-      later arm in the process (`s32_probe_traps`, `TEARDOWN_CUPTI=1`); `profiling_mode` decode no longer takes the server's
-      path — price host levers with S27's exposed-time method (S28 note). Prefetch is SETTLED (S25, +5.56 %); do not re-open.
-      Qwen3-Next = `_make_fused_sparse_forward`, non-EXL3 fused. §8: measure only, nothing banked. **When S38 closes, point
-      S39 at the right state.** Cost: hours–day.
+- [x] **S38 — Qwen3-Next fresh HEAD census — ✅ CLOSED 2026-10-12, MEASURE ONLY.** Baseline refreshed; **no regression
+      from the six merges since S21, no new rankable N=1 lever.** HEAD `5d3d8ac` (engine = S36 `a89b445`), server mode
+      (`PIECES=all` = the server's config; at HEAD `_s33_pieces` is a dead attribute, the E1–E7 edits are baked in
+      unconditionally and only `defer_decode_hygiene`/E5 is live, which the server sets), decode graphs ON, engine's own
+      O_DIRECT, GC frozen, no profiler. **Server's own budget, NO ballast (USER's choice this session): 19.31–19.33 GB** (the
+      S33 baseline's 17.5–17.7 GB needs ≥ 29.4 GB RAM free, only 27 was). 3 fresh processes (discarded warm + cold-8k + 6
+      HIT turns, different diff/turn), spread ≤ 1.1 %: **HIT turn 14.95 s, decode 47.0 ms/tok, TTFT 2.95 s, stall 3.98 s;
+      cold-8k 19.85 s / 9.26 s.** HIT decomposition: TTFT/prefill 2.95 s = 20 %; decode 11.95 s = 80 %, of which expert-miss
+      disk stall 3.98 s = 27 % (0.22 ms/miss, ~70 misses/tok, 23.9 GB/turn) and **host+GPU decode compute 7.96 s = 53 % —
+      now the LARGEST block**, having overtaken the stall since S21. Faster than S28 (16.04 s @ 18.4–18.9 GB) and S33
+      (15.65 s @ 17.5–17.7 GB) but at a bigger budget → gain is budget + merged edits, not separated (no matched-ballast arm;
+      future Qwen3-Next compares match ~19.3 GB no-ballast or re-pin). Ranking of what remains, all tapped/settled: (1) decode
+      GPU compute 7.96 s — needs an algorithmic lever (MoE spec-decode unpriced; batching worth 0 at N=1); (2) stall 3.98 s —
+      prefetch REFUTED (S25 +5.56 %), read-wave shipped (S22-A2), budget at max; (3) TTFT 2.95 s — ~58–64 % NVMe wait (S20),
+      prefix cache + packed kernel shipped. Rust ext rebuilt from HEAD `lib.rs`. §8: measure only, nothing banked; suite floor
+      unchanged. Qwen3-Next = `_make_fused_sparse_forward`, non-EXL3 fused. Full row: `todo-backlog.md` "Closed after the
+      2026-10-03 cleanup"; RESULTS `docs/2026-10-12-S38-qwen3next-head-census-RESULTS.md`.
 
 - [ ] **S39 — MiniMax silent expert-drop on H2D OOM (`_inject_expert_weights`, `vaayu/moe_patch.py:1253`).** On the
       module-list forward (MiniMax-M2.7, DeepSeek-V4), an expert whose H2D upload fails with a non-`PackedInjectionError`
@@ -375,6 +387,10 @@ re-prioritises with the USER.**
       enclosing guard, not just the predicate — `reach_check_enclosing_guard`). Gate any fix on both module-list models
       (MiniMax EXL3, DeepSeek non-EXL3) and keep dense + fused green (shared `moe_patch`). §8: decision gates whether a knob
       is needed. Cost: small code + a USER decision.
+      **Inputs re-verified at HEAD `5d3d8ac` (S38 session, 2026-10-12):** anchors hold — `PackedInjectionError` at
+      `moe_patch.py:1152` (docstring :1158–1159), `_inject_expert_weights` at :1253, the continue-on-failed-injection
+      check inside the try at :1934 with `entry = _inject_expert_weights(...)` at :1957; both module-list models on disk
+      (`NeuroSenko--MiniMax-M2.7-exl3`, `deepseek-ai--DeepSeek-V4-Flash-0731`). Dense + all four MoE forwards green at HEAD.
 
 - [ ] **S40 — DeepSeek L-c: price the planner's VRAM priority at HEAD, MEASURE ONLY.** DeepSeek's expert VRAM tier
       (3.5 GB) hits 34.9 % while the non-expert layers it streams are used on 100 % of tokens — so the plan may be giving
