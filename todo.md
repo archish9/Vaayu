@@ -92,7 +92,7 @@ closed accumulates in this file again.
 
 ---
 
-# ▶▶▶ THE SEQUENCE — S21…S41 (S21–S24 set 2026-10-03; S25–S26 set by the USER at S24, 2026-10-05; S27–S30 set by the USER at S26, 2026-10-06; S31 set by S26's rule when S30 closed, 2026-10-07; S32–S36 set by the USER at S31, 2026-10-07; S38–S41 set by the USER at S37, 2026-10-12). One per fresh session, in order. NEXT = **S40** (DeepSeek L-c: price the planner's VRAM priority, MEASURE ONLY). ◀◀◀
+# ▶▶▶ THE SEQUENCE — S21…S41 (S21–S24 set 2026-10-03; S25–S26 set by the USER at S24, 2026-10-05; S27–S30 set by the USER at S26, 2026-10-06; S31 set by S26's rule when S30 closed, 2026-10-07; S32–S36 set by the USER at S31, 2026-10-07; S38–S41 set by the USER at S37, 2026-10-12). One per fresh session, in order. NEXT = **S41** (Dense M-6: measure the embedding's VRAM share on Llama-3.3-70B streamed, then free it). ◀◀◀
 
 **HOW A FRESH SESSION PICKS — no judgement needed:** take the **first row of the table that is not ✅**. Its durable
 row below IS the brief (write a handoff in `docs/superpowers/specs/` first only if the row needs more than it
@@ -190,7 +190,7 @@ the clean 0.45–0.56 ms/token before any build.
 | **S36** ✅ (6/6) | ~~Cheap sweep + 47-m6~~ — **CLOSED 2026-10-12, MERGED `a89b445`.** Items 3 (`e453b01`, gpt-oss usage gap + 2 tests), 4 (`1871aef`, Rust asserts + clamp), 6 (G5 closed on record), 2 (capture_begin NO REPRO), 1 (fp32 rotary ppl immaterial ≤0.32 %, fix stays) done in the merge; **item 5 (MiniMax census, backlog #9) CLOSED 2026-10-12 in its own fresh session: the pageable EXPERT prefill H2D is GONE on MiniMax — all 129 GB of EXL3 expert uploads PINNED/async; only residual pageable is `_pair_gpu` 0.016 GB (the refuted S1-b). backlog #9 CLOSED. Measure-only, suite floor unchanged.** Dense gate green both Llama. Full verdicts: the S36 durable row | *(c)* hours each | **6/6 done** |
 | **S38** ✅ | ~~Qwen3-Next fresh HEAD census~~ — **CLOSED 2026-10-12, MEASURE ONLY, no regression, no new N=1 lever.** HEAD (`5d3d8ac`, engine = S36 `a89b445`), server mode, server's own budget 19.32 GB (no ballast, USER's choice), 3 processes, spread ≤ 1.1 %: HIT turn **14.95 s**, decode **47.0 ms/tok**, TTFT **2.95 s**, stall **3.98 s**, cold-8k 19.85 s / 9.26 s. Breakdown: TTFT 20 %, decode 80 % (expert-miss stall 3.98 s = 27 %; **host+GPU decode compute 7.96 s = 53 %, now the LARGEST block**, overtaking the stall since S21). Faster than S28 (16.04 s @ 18.4–18.9 GB) and S33 (15.65 s @ 17.5–17.7 GB) but at a bigger budget — gain is budget + merged edits, not separated. Remaining N=1 levers all tapped/settled (GPU compute needs an algorithmic lever; prefetch REFUTED S25; host tapped S27/28/33; prefix+packed kernel shipped). Full row: the S38 durable row; `docs/2026-10-12-S38-qwen3next-head-census-RESULTS.md` | — | done |
 | **S39** ✅ | ~~MiniMax silent expert-drop on H2D OOM (`_inject_expert_weights`) — raise-vs-degrade decision, then fix~~ — **CLOSED 2026-10-12: FIXED (raise all), USER-decided, MERGED `159ca6d` 2026-10-12 on the USER's word.** The module-list injector's catch-all `except Exception → warn + return None` dropped a routed expert mid-forward (incl. swallowed OOM) = silent WRONG output on MiniMax-M2.7 + DeepSeek-V4. USER chose **raise all**: `except OutOfMemoryError: raise` (→ vaayu_base's I4 handler names the levers) + generic failures re-raised as RuntimeError with layer/expert context; no warn-and-skip. Module-list injector only (fused/dense untouched). 3 new + 2 updated tests; suite **4106 passed, 26 skipped**; error-path-only, cannot regress a healthy run. §8: no knob, N=1 server default, SHIPPED, merged `159ca6d`. Full row: the S39 durable row; `docs/2026-10-12-S39-modulelist-injection-raise-RESULTS.md` | — | done |
-| **S40** | DeepSeek L-c — price the planner's VRAM priority at HEAD, MEASURE ONLY | *(b)* slowest model (1.78 tok/s), biggest headroom; not the agent's model; tier 34.9 % vs streamed non-expert 100 % | price row |
+| **S40** ✅ | ~~DeepSeek L-c — price the planner's VRAM priority at HEAD, MEASURE ONLY~~ — **CLOSED 2026-10-12: TRADE WORKS, +15.18 % decode, CLEARS 5 % → warrants a build row (sequence at post-S41 re-prioritise).** Stale L-c numbers (3.5 GB tier / 34.9 %) corrected at HEAD: baseline pins 40/43 non-expert layers, streams **3** (167.3 MB ea); expert VRAM tier **1.73 GB / 138 experts / 24 % hit**. Oracle (residency-first: `plan_vram.pinning_budget += 0.667 GiB`, pin all 43, tier → 1.16 GB / 93 / 23 %): decode **414.4 → 351.5 ms/token (2.41 → 2.85 tok/s)**, bit-identical (max\|d\|=0), ABBA spread 1.01 % ≪ signal. MEASURE ONLY, no engine code, suite floor unchanged. Full row: the S40 durable row; `docs/2026-10-12-S40-deepseek-lc-vram-priority-RESULTS.md` | — | done |
 | **S41** | Dense M-6 — measure the embedding's VRAM share on Llama-3.3-70B streamed, then free it for transformer layers | *(b)/roadmap* on the §0 dense roadmap; unbuilt; ~5 % of ~37 GB/token read | measure → build |
 
 **S37 DECIDED 2026-10-12 by the USER:** all four candidate levers picked; after confirming, the USER took **the
@@ -395,27 +395,35 @@ re-prioritises with the USER.**
       §8: no server knob (correctness-always, not configurable degrade), reachable at N=1 server default on both module-list
       models — SHIPPED, merged `159ca6d`. `docs/2026-10-12-S39-modulelist-injection-raise-RESULTS.md`.
 
-- [ ] **S40 — DeepSeek L-c: price the planner's VRAM priority at HEAD, MEASURE ONLY.** DeepSeek's expert VRAM tier
-      (3.5 GB) hits 34.9 % while the non-expert layers it streams are used on 100 % of tokens — so the plan may be giving
-      VRAM to experts that would pay more held as resident non-expert weights (the S6 lesson: `reach_projection_residency`,
-      residency first). Price what moving the priority buys on decode (DeepSeek 1.78 tok/s, S15) with a bit-identical oracle
-      arm (`oracle_arm_and_lru_threshold`: patch the factory BEFORE load) against the recorded baseline. DeepSeek =
-      `_make_modulelist_sparse_forward`, non-EXL3 (fp4 experts + fp8), MLA + sparse-index attention; nothing may be written
-      into its model dir. L-d (MTP draft) is NOT this row — it is blocked on backlog #2. §8: measure only. Cost: a price row.
-      **Inputs pre-gathered at HEAD (S39 session, 2026-10-12, working tree = `5d3d8ac` + S39's uncommitted module-list fix):**
-      DeepSeek on disk (`/home/a/code/ai-ml/models/deepseek-ai--DeepSeek-V4-Flash-0731`); `_make_modulelist_sparse_forward`
-      at `vaayu/moe_patch.py:1710`; the planner's VRAM reserve / expert-tier code is in `vaayu/vaayu_base.py`. Baseline to
-      beat: DeepSeek decode 1.78 tok/s (S15). S40 must do its own detailed anchor re-verify at its own HEAD (and note whether
-      S39 is merged by then).
+- [x] **S40 — DeepSeek L-c: price the planner's VRAM priority at HEAD — ✅ CLOSED 2026-10-12, MEASURE ONLY, TRADE WORKS.**
+      At HEAD `0532397` (S39 merged `159ca6d`), server-faithful load, server's own budget, L=2048 / G=96, ABBA ×4 cold
+      processes. **Stale L-c numbers corrected** (the 3.5 GB / 34.9 % tier was S6-era, pre-S15): baseline pins 40 of 43
+      non-expert layers and streams **3** (167.3 MB each, read 100 %/token); the expert VRAM tier is **1.73 GB = 138
+      experts, 24 % decode hit** (partial, restricted to 23/43 layers — 1.9 GB < the 3.4 GB per-token working set). The
+      oracle (residency-first: `vaayu.vram_plan.plan_vram` wrapped before load, `pinning_budget += 0.667 GiB` = the 3
+      streamed layers + 0.20 margin) pins all 43 and shrinks the tier to 1.16 GB = 93 experts, 23 % hit. **Decode 414.4 →
+      351.5 ms/token (2.41 → 2.85 tok/s), +15.18 %**; bitwise identical (ids match, max\|d\|=0, relL2=0 — compute
+      unchanged); baseline ABBA spread 4.17 ms = 1.01 % of mean ≪ the signal. Clears the 5 % threshold the USER set →
+      **warrants a BUILD row** (a module-list planner rule: fund non-expert residency before the expert VRAM tier;
+      model-agnostic — derive the streamed set + bytes, never hardcode 3/0.667; measure the crossover where the tier would
+      starve). To be sequenced at the post-S41 re-prioritise. §8: no engine code (throwaway probes `plans/probes/s40_lc.py`,
+      `s40_run.sh`, `s40_cmp.py`), N=1 server-reachable, suite floor unchanged. RESULTS
+      `docs/2026-10-12-S40-deepseek-lc-vram-priority-RESULTS.md`. (Absolute note: 2.41 tok/s baseline ≠ S15's 1.78 — a
+      different operating point; this row prices the delta, not S15's figure.)
 
-- [ ] **S41 — Dense M-6: free the embedding's VRAM for transformer layers on Llama-3.3-70B streamed.** The dense lead
-      (`todo.md:519`, originally M-6): the embedding sits in VRAM that streamed transformer layers could use; ~5 % of the
-      ~37 GB/token read on the 70B streamed checkpoint (`archish9--Llama-3.3-70B-Instruct-exl3-4.5bpw`). MEASURE the share
-      first (per the backlog note at `todo-backlog.md:8982`), then free it only if the measure justifies the build. Dense is
-      on the §0 roadmap (the deferral was lifted 2026-09-02). Baseline: Llama-3.3-70B O_DIRECT decode 1.961 s/token, TTFT
-      3.34 s (S29). Keep MoE green (shared infra; dense gate `tests/test_dense_gate.py`, `DENSE_CKPT=`, run on BOTH Llama
-      checkpoints for any shared-infra change). §8: per the build. **When S41 closes, the next fresh session re-prioritises
-      with the USER.** Cost: measure → build.
+- [ ] **S41 — Dense M-6: free the embedding's VRAM for transformer layers on Llama-3.3-70B streamed.** The dense M-6 lead
+      (the "(M-6) Lead" item, now at **`todo.md:606`** — was cited as :519): Llama-3.3-70B pins **2.10 GB of embedding in
+      VRAM** (19 fully-pinned = 16 transformer + 3 shared); freeing it buys ~4 more resident transformer layers, ~5 % of the
+      ~37 GB/token read on the 70B streamed checkpoint (`archish9--Llama-3.3-70B-Instruct-exl3-4.5bpw`, confirmed on disk
+      2026-10-12). MEASURE the share first (per the backlog note at `todo-backlog.md:~8981`), then free it only if the
+      measure justifies the build. **The machinery already exists for MoE:** `_install_cpu_resident_embedding` (S14 E,
+      `vaayu/vaayu_base.py:4549`) + `vaayu/cpu_embedding.py` (`CpuResidentEmbedding`, `cpu_embedding_eligibility`); S41 is
+      applying/pricing "E for DENSE". Watch the measured E-everywhere cost (Qwen3-Next +1.14 %) — measure the dense crossover
+      before building. Dense is on the §0 roadmap (deferral lifted 2026-09-02). Baseline: Llama-3.3-70B O_DIRECT decode
+      1.961 s/token, TTFT 3.34 s (S29); dense gate `tests/test_dense_gate.py` (`DENSE_CKPT=`, confirmed present), run on BOTH
+      Llama checkpoints for any shared-infra change — keep MoE green. §8: per the build. **When S41 closes, the next fresh
+      session re-prioritises with the USER.** Cost: measure → build. *(S40 closed 2026-10-12; S39 merged `159ca6d`; HEAD
+      `0532397` + this session's docs/probe edits. S41 does its own anchor re-verify at its HEAD.)*
 
 ---
 
@@ -511,8 +519,11 @@ at HEAD before acting.
 
 *From the S6 reach-projection row (closed 2026-09-26). L-a = S9, L-b = S15, L-e = S15 — all done; these two remain. DeepSeek decodes at 1.78 tok/s (S15) and, since S34 (2026-10-08, awaiting the merge), has a cross-turn prefix cache for turns that append.*
 
-- [ ] **L-c — the planner's VRAM priority is unpriced.** DeepSeek's expert VRAM tier (3.5 GB) hits 34.9 %,
-      while the non-expert layers it streams are used on 100 % of tokens.
+- [x] **L-c — the planner's VRAM priority — ✅ PRICED by S40 (2026-10-12): the trade WORKS, +15.18 % decode, CLEARS
+      5 % → a BUILD row is warranted** (to be sequenced at the post-S41 re-prioritise). At HEAD, not the stale S6 numbers:
+      baseline pins 40/43 non-expert layers, streams 3; expert VRAM tier 1.73 GB / 138 experts / 24 % hit. Pinning all 43
+      (+0.667 GiB, tier → 1.16 GB / 93 / 23 %) gives 414.4 → 351.5 ms/token, bit-identical. Build = module-list planner
+      rule (non-expert residency before the expert tier; model-agnostic). `docs/2026-10-12-S40-deepseek-lc-vram-priority-RESULTS.md`.
 - [ ] **L-d — DeepSeek's token is now 72 % per-FORWARD bytes**, like dense, so its built-in MTP draft would
       amortise that share (row 37's re-gate).
 - [ ] (S34 STEP 0) DeepSeek prefill re-reads its experts once per chunk (6.7× at 4.3k; price a RAM-arena hold with a real-cache replay) — **moved to `todo-backlog.md` #42** 2026-10-12
