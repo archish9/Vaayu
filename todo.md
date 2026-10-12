@@ -85,7 +85,7 @@ closed accumulates in this file again.
 
 ---
 
-# ▶▶▶ THE SEQUENCE — S21…S36 (S21–S24 set 2026-10-03; S25–S26 set by the USER at S24, 2026-10-05; S27–S30 set by the USER at S26, 2026-10-06; S31 set by S26's rule when S30 closed, 2026-10-07; S32–S36 set by the USER at S31, 2026-10-07). One per fresh session, in order. ◀◀◀
+# ▶▶▶ THE SEQUENCE — S21…S41 (S21–S24 set 2026-10-03; S25–S26 set by the USER at S24, 2026-10-05; S27–S30 set by the USER at S26, 2026-10-06; S31 set by S26's rule when S30 closed, 2026-10-07; S32–S36 set by the USER at S31, 2026-10-07; S38–S41 set by the USER at S37, 2026-10-12). One per fresh session, in order. NEXT = **S38** (Qwen3-Next fresh HEAD census). ◀◀◀
 
 **HOW A FRESH SESSION PICKS — no judgement needed:** take the **first row of the table that is not ✅**. Its durable
 row below IS the brief (write a handoff in `docs/superpowers/specs/` first only if the row needs more than it
@@ -181,6 +181,19 @@ the clean 0.45–0.56 ms/token before any build.
 | **S35** ✅ | ~~gpt-oss: 47-m4 (sliding-window KV at window length)~~ — **CLOSED 2026-10-10, A WIN, MERGED `5aa44cc`:** gpt-oss decode 79.1 → 60.1 ms/token at 8k and 129.0 → 85.8 at 30.7k, cold TTFT 15.6 → 12.8 s / 110.3 → 71.4 s, expert VRAM tier 125 → 184 experts, logits bit-identical to stock transformers' default cache; the USER picked arm C (freed VRAM → tier). The elastic-tier half is S35-E. Full row: the S35 row in the backlog archive | — | done |
 | **S35-E** ✅ | ~~gpt-oss elastic tier: size the reserve to the running request~~ — **CLOSED 2026-10-11, A WIN, MERGED `5bd31c3` on the USER's word:** gpt-oss decode (`max_tokens` omitted on both arms, static → elastic) 56.7 → 39.6 ms/token at 2k, 58.2 → 44.4 at 8k, 71.0 → 55.0 at 16k, equal at 30.7k; 8-turn session 71.6 → 54.4 s (−24 %); `MAX_SEQ_LEN=40442` 8k 84.0 → 45.0; ids identical, stock 64/64, no OOM; cost +1.6–3.9 s TTFT on a request that empties the tier, thinnest margin 0.11 GiB (open). Stage 3 (context → 40,442) not built, on the USER's word. Full row: the S35-E row in the backlog archive | — | done |
 | **S36** ✅ (6/6) | ~~Cheap sweep + 47-m6~~ — **CLOSED 2026-10-12, MERGED `a89b445`.** Items 3 (`e453b01`, gpt-oss usage gap + 2 tests), 4 (`1871aef`, Rust asserts + clamp), 6 (G5 closed on record), 2 (capture_begin NO REPRO), 1 (fp32 rotary ppl immaterial ≤0.32 %, fix stays) done in the merge; **item 5 (MiniMax census, backlog #9) CLOSED 2026-10-12 in its own fresh session: the pageable EXPERT prefill H2D is GONE on MiniMax — all 129 GB of EXL3 expert uploads PINNED/async; only residual pageable is `_pair_gpu` 0.016 GB (the refuted S1-b). backlog #9 CLOSED. Measure-only, suite floor unchanged.** Dense gate green both Llama. Full verdicts: the S36 durable row | *(c)* hours each | **6/6 done** |
+| **S38** | Qwen3-Next fresh HEAD census — decode + TTFT, server mode, frozen GC, MEASURE ONLY | *(a)* agent's model; the S21 baseline PREDATES the 6 merged host/kernel edits (S27–S33 + S20) so it is stale; nothing new can be ranked without it | hours–day |
+| **S39** | MiniMax silent expert-drop on H2D OOM (`_inject_expert_weights`) — raise-vs-degrade decision, then fix | *(b)/correctness* silent WRONG output, reachable on device; worst failure class, outranks an unreachable (d) bug | small + decision |
+| **S40** | DeepSeek L-c — price the planner's VRAM priority at HEAD, MEASURE ONLY | *(b)* slowest model (1.78 tok/s), biggest headroom; not the agent's model; tier 34.9 % vs streamed non-expert 100 % | price row |
+| **S41** | Dense M-6 — measure the embedding's VRAM share on Llama-3.3-70B streamed, then free it for transformer layers | *(b)/roadmap* on the §0 dense roadmap; unbuilt; ~5 % of ~37 GB/token read | measure → build |
+
+**S37 DECIDED 2026-10-12 by the USER:** all four candidate levers picked; after confirming, the USER took **the
+ordering-rule order (the session's recommendation)** — S38 Qwen3-Next census, S39 MiniMax silent-drop, S40 DeepSeek
+L-c, S41 Dense M-6. The reason, by the ordering rule: S38 is *(a)* the agent's model and its baseline is stale; S39 is
+a reachable silent-wrong-output correctness bug (above an unreachable (d) bug); S40/S41 are *(b)* N=1 levers off the
+agent's model. OUT: gpt-oss stage-3 (a ship, backlog #41) and DeepSeek L-d (blocked on backlog #2, the lower-bpw
+download the USER declined). **Each row runs in its OWN fresh session** (`fresh_session_per_row`); a session closes its
+row, updates this table, pre-gathers the next row's inputs, and STOPS. **When S41 closes, the next fresh session
+re-prioritises with the USER.**
 
 ## Durable rows (the briefs)
 
@@ -313,11 +326,13 @@ the clean 0.45–0.56 ms/token before any build.
          ran clean at 10,273 slabs. No measurement.
       **§8:** per item, at close.
 
-- [ ] **S37 — re-prioritise with the USER — INPUTS PRE-GATHERED 2026-10-12, IN ITS OWN FRESH SESSION (USER rule
-      `fresh_session_per_row`); run the brainstorming skill there.** All S21…S36 closed; `[bug]` M2 closed and merged
-      `60b56f7` (2026-10-12). No perf win is banked — every lever below needs a measurement/census first. Candidate pool,
-      ranked against the workload (agentic, prefill-heavy, N=1 on the server; N>1 worth 0 today — Rudra has no Vaayu
-      dependency and runs subagents sequentially, batching parked backlog #37):
+- [x] **S37 — re-prioritise with the USER — ✅ DECIDED 2026-10-12.** The USER picked all four candidate levers and,
+      after confirming, took the ordering-rule order (my recommendation): **S38** Qwen3-Next fresh HEAD census, **S39**
+      MiniMax silent expert-drop on H2D OOM, **S40** DeepSeek L-c planner VRAM priority, **S41** Dense M-6 free the
+      embedding's VRAM. gpt-oss stage-3 (backlog #41) and DeepSeek L-d (blocked on backlog #2) stay out. Rows written into
+      the sequence table below and pre-gathered as durable briefs. Inputs re-verified at HEAD `1bbaa3c`
+      (`_inject_expert_weights` `moe_patch.py:1253`; M-6 lead `todo.md:519`; L-d blocked backlog #2). Candidate pool as
+      presented:
       - **Qwen3-Next (the agent's model, highest user value):** heavily tuned already — S21 census (turn 20.1 s,
         decode 87 %, top cost miss-stall 5.3 s/turn) PREDATES the S27–S33 host edits and the S20 packed kernel, so it is
         STALE; prefetch refuted (S25). Finding a new lever needs a FRESH HEAD census first (decode + TTFT, server mode,
@@ -335,6 +350,48 @@ the clean 0.45–0.56 ms/token before any build.
         loop's side); G4 uniform-attention guard. Two more bugs are unreachable on this box today (VaayuQWen/ChatGLM no
         checkpoint; current-CUDA-device single-GPU).
       **§8:** per item, at the pick.
+
+- [ ] **S38 — Qwen3-Next fresh HEAD census — decode + TTFT, server mode, frozen GC, MEASURE ONLY.** The S21 census
+      (turn 20.1 s, decode 87 %, top cost miss-stall 5.3 s/turn) is STALE: it predates the merged host edits (S27 `6fd79fa`,
+      S33 `6c9a31f`) and the S20 packed prefill kernel (`4eeab9b`) and was taken under buffered I/O (the O_DIRECT fix
+      `a588ff4` came after). Re-measure at HEAD against the current recorded baseline (the "Where things stand" S33-stage-1
+      block: HIT turn 15.65 s, HIT decode 49.15 ms/token, HIT TTFT 3.11 s, at `BALLAST_GB=29.4`, budget 17.5–17.7 GB),
+      then rank what remains. **Probe traps that MUST be honoured** (memories, all CONFIRMED): a different prompt per decode
+      arm or the warm tier serves 0 disk (`decode_probe_traps_s21`); freeze GC or say "library mode" (`probe_gc_freeze_server_mode`);
+      ABBA ordering, disk-bound arms drift ~3 % by position (`abba_ordering_disk_bound_ab`); a CUPTI window poisons every
+      later arm in the process (`s32_probe_traps`, `TEARDOWN_CUPTI=1`); `profiling_mode` decode no longer takes the server's
+      path — price host levers with S27's exposed-time method (S28 note). Prefetch is SETTLED (S25, +5.56 %); do not re-open.
+      Qwen3-Next = `_make_fused_sparse_forward`, non-EXL3 fused. §8: measure only, nothing banked. **When S38 closes, point
+      S39 at the right state.** Cost: hours–day.
+
+- [ ] **S39 — MiniMax silent expert-drop on H2D OOM (`_inject_expert_weights`, `vaayu/moe_patch.py:1253`).** On the
+      module-list forward (MiniMax-M2.7, DeepSeek-V4), an expert whose H2D upload fails with a non-`PackedInjectionError`
+      error takes the warn-and-skip path (the `PackedInjectionError` docstring at :1158 names it: "print-and-continue is how
+      769 parameters were left on meta while a load reported success"). A skip mid-decode = a routed expert silently absent =
+      WRONG output with no error — the worst failure class, and reachable on device (MiniMax is on disk). **This row is a
+      DECISION first, then a fix:** raise-mid-decode (fail the request) vs degrade (skip + a loud WARNING + a correctness
+      flag) — I4 (`f54a799`) settled only the layer-loop OOM retry, not the per-expert skip inside injection. Bring the
+      options to the USER before building. Re-verify the skip path's reach from the server entry at HEAD (trace every
+      enclosing guard, not just the predicate — `reach_check_enclosing_guard`). Gate any fix on both module-list models
+      (MiniMax EXL3, DeepSeek non-EXL3) and keep dense + fused green (shared `moe_patch`). §8: decision gates whether a knob
+      is needed. Cost: small code + a USER decision.
+
+- [ ] **S40 — DeepSeek L-c: price the planner's VRAM priority at HEAD, MEASURE ONLY.** DeepSeek's expert VRAM tier
+      (3.5 GB) hits 34.9 % while the non-expert layers it streams are used on 100 % of tokens — so the plan may be giving
+      VRAM to experts that would pay more held as resident non-expert weights (the S6 lesson: `reach_projection_residency`,
+      residency first). Price what moving the priority buys on decode (DeepSeek 1.78 tok/s, S15) with a bit-identical oracle
+      arm (`oracle_arm_and_lru_threshold`: patch the factory BEFORE load) against the recorded baseline. DeepSeek =
+      `_make_modulelist_sparse_forward`, non-EXL3 (fp4 experts + fp8), MLA + sparse-index attention; nothing may be written
+      into its model dir. L-d (MTP draft) is NOT this row — it is blocked on backlog #2. §8: measure only. Cost: a price row.
+
+- [ ] **S41 — Dense M-6: free the embedding's VRAM for transformer layers on Llama-3.3-70B streamed.** The dense lead
+      (`todo.md:519`, originally M-6): the embedding sits in VRAM that streamed transformer layers could use; ~5 % of the
+      ~37 GB/token read on the 70B streamed checkpoint (`archish9--Llama-3.3-70B-Instruct-exl3-4.5bpw`). MEASURE the share
+      first (per the backlog note at `todo-backlog.md:8982`), then free it only if the measure justifies the build. Dense is
+      on the §0 roadmap (the deferral was lifted 2026-09-02). Baseline: Llama-3.3-70B O_DIRECT decode 1.961 s/token, TTFT
+      3.34 s (S29). Keep MoE green (shared infra; dense gate `tests/test_dense_gate.py`, `DENSE_CKPT=`, run on BOTH Llama
+      checkpoints for any shared-infra change). §8: per the build. **When S41 closes, the next fresh session re-prioritises
+      with the USER.** Cost: measure → build.
 
 ---
 
