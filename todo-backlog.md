@@ -24,7 +24,7 @@ Status keys, as in `todo.md`: `[ ]` pending · `[~]` in progress · `[!]` blocke
 | 6 | Row 6a-b — `head_bytes` is probably not a transient | top-level row | buys batch-admission headroom, never tok/s — N>1 only | batching reaches the server |
 | 7 | Row 5 — quality certification of prefix compression | top-level row | affects only users who opt into `PREFIX_COMPRESS` (server default `None`) | compression becomes a default, or a user opts in |
 | 8 | Row 49 step 3 — re-price the CPU hybrid | row 49 sub-item | the CPU-AVX2 hybrid was priced and recommended CLOSED (rows 26/28); EXL3 has no CPU kernel | row 49 step 2 lands AND a CPU expert kernel exists |
-| 9 | Row 49 — MiniMax PREFILL's H2D is pageable | row 49 sub-item | very probably already fixed: S1-L1 (2026-09-25) removed prefill's pageable HtoD on MiniMax (+17.5–18.9 % TTFT) | verify with one MiniMax prefill census; if the pageable copies are gone, close it |
+| 9 | Row 49 — MiniMax PREFILL's H2D is pageable | row 49 sub-item | **✅ CLOSED 2026-10-12 (S36 item 5): census confirms the pageable expert HtoD is GONE — all 129 GB of EXL3 expert uploads are PINNED/async; only residual pageable is `moe_patch.py:1795` `_pair_gpu`, 0.016 GB, the already-refuted S1-b sibling.** See section 9 and `docs/2026-10-12-S36-item5-minimax-prefill-h2d-census-RESULTS.md` | — (closed) |
 | 10 | 47-m2 — `expert_read_buffer_bytes` builds the index config-less | row 47 sub-item | harmless: the real guard raises later in the same load; only the ordering is undocumented | the load order changes |
 | 11 | 47-m5-b — a whole-layer model advertises caches it never fills | row 47 sub-item | cosmetic log lines; costs no bytes | S8 (gpt-oss) touches the whole-layer forward's cache sizing |
 | 12 | G3 — only one MoE forward takes `compute_device` | row 47 gap | matters only for CPU compute, which has never run a model on this box | a CPU-compute feature is wired into any MoE forward |
@@ -435,13 +435,24 @@ prefix-reused turn, or a task score), not another score-error number.
 
 ---
 
-## 9. Row 49 — MiniMax PREFILL's H2D is pageable
+## 9. Row 49 — MiniMax PREFILL's H2D is pageable — ✅ CLOSED 2026-10-12 (S36 item 5)
 
-*Moved from `todo.md` (row 49 sub-item) 2026-09-26.* **Why here:** very probably already fixed: S1-L1 (2026-09-25) removed prefill's pageable HtoD on MiniMax (+17.5–18.9 % TTFT). **Re-open when:** verify with one MiniMax prefill census; if the pageable copies are gone, close it.
+*Moved from `todo.md` (row 49 sub-item) 2026-09-26. **CLOSED 2026-10-12 by the S36 item-5 census.***
+**Verdict:** the pageable EXPERT prefill HtoD is GONE on MiniMax-M2.7. One cold census
+(`plans/probes/s1l1_attrib.py MODEL=minimax LENS=135,2048`, `main` `a89b445`): at 2,048 tokens
+175,544 H2D copies, only **248 pageable (0.016 GB)**, while all **129.242 GB of EXL3 expert-weight
+uploads** (`loader_strategy.py:389:build_exl3_qmatrix`) are **pinned** and async. The 248 pageable
+are `moe_patch.py:1795` `_pair_gpu` (the expert-dispatch pairing tensor, 1 per layer per chunk:
+62×1 at 135 tok, 62×4 at 2k) — the exact S1-b sibling S1-L1 §3 already found and refuted (Qwen's
+was `moe_patch.py:2310`), tiny and non-draining. S1-L1's staging-slab fix
+(`_stage_prefill_expert` → `load_expert_into_slab`, reached from the shared miss loader) is confirmed
+on the module-list / MiniMax path. **Re-open only if** a profile shows the `_pair_gpu` pageable copy
+drains the stream and costs > ~1 % of prefill (it does not). Measure-only; no engine code; suite floor
+unchanged. RESULTS `docs/2026-10-12-S36-item5-minimax-prefill-h2d-census-RESULTS.md` (gitignored).
 
-- [ ] **NOT IN SCOPE, recorded so it is not lost: MiniMax PREFILL's H2D is pageable** (step 0(d);
-  row 45 measured h2d at 59.8 % of prefill wall). H1 does not cover it. Either pin the prefill clone
-  path or leave it synchronous — decide after step 2, it is a separate question.
+- [x] **CLOSED: MiniMax PREFILL's expert H2D is PINNED, not pageable** (was step 0(d); row 45
+  measured h2d at 59.8 % of prefill wall). S1-L1 pinned the expert clone path; the census above
+  confirms it on MiniMax. The residual pageable `_pair_gpu` (0.016 GB) is the already-refuted S1-b.
 
 ---
 
