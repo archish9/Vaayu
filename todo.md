@@ -180,7 +180,7 @@ the clean 0.45–0.56 ms/token before any build.
 | **S34** ✅ | ~~DeepSeek-V4 cross-turn prefix cache~~ — **CLOSED 2026-10-08: BUILT, MEASURED, GATED; branch `s34-deepseek-prefix-cache` (engine code at `75c4278`; the final-review fix wave on top changes no engine file), MERGED `e7c69ea` 2026-10-08 on the USER's word. Final whole-branch review 2026-10-08: no Critical issue; `[bug]` I4 is fixed NEXT, in its own fresh session (USER, at the merge).** 1k appending turns 10.26 s vs 51.08 s to first token pool ON vs OFF (ON/OFF 0.201), 4k 11.33 s vs 165.00 s (OFF is ONE turn; 0.069); decode -0.72 % at the own RAM budget (+0.4 % without one slow first OFF arm) and -0.10 % at BALLAST_GB=15, both inside the 5 % rule; a pool HIT is bitwise identical to handing the live cache over; suite 3815 passed, 26 skipped. Reach: N=1 on the server default, at `ENABLE_THINKING=False` (the default); none with thinking on. A turn that ends in an ERROR drops the entry; a cancelled / disconnected turn is stored at its partial reply, which a retry of the same request cannot use. Full row: the S34 row in the backlog archive; `docs/2026-10-08-S34-deepseek-prefix-cache-RESULTS.md` | — | done |
 | **S35** ✅ | ~~gpt-oss: 47-m4 (sliding-window KV at window length)~~ — **CLOSED 2026-10-10, A WIN, MERGED `5aa44cc`:** gpt-oss decode 79.1 → 60.1 ms/token at 8k and 129.0 → 85.8 at 30.7k, cold TTFT 15.6 → 12.8 s / 110.3 → 71.4 s, expert VRAM tier 125 → 184 experts, logits bit-identical to stock transformers' default cache; the USER picked arm C (freed VRAM → tier). The elastic-tier half is S35-E. Full row: the S35 row in the backlog archive | — | done |
 | **S35-E** ✅ | ~~gpt-oss elastic tier: size the reserve to the running request~~ — **CLOSED 2026-10-11, A WIN, MERGED `5bd31c3` on the USER's word:** gpt-oss decode (`max_tokens` omitted on both arms, static → elastic) 56.7 → 39.6 ms/token at 2k, 58.2 → 44.4 at 8k, 71.0 → 55.0 at 16k, equal at 30.7k; 8-turn session 71.6 → 54.4 s (−24 %); `MAX_SEQ_LEN=40442` 8k 84.0 → 45.0; ids identical, stock 64/64, no OOM; cost +1.6–3.9 s TTFT on a request that empties the tier, thinnest margin 0.11 GiB (open). Stage 3 (context → 40,442) not built, on the USER's word. Full row: the S35-E row in the backlog archive | — | done |
-| **S36** | **Cheap sweep + 47-m6 (fp32 rotary quality check)** | *(c)* hours each | a day or two |
+| **S36** `[~]` | **Cheap sweep + 47-m6 (fp32 rotary quality check)** | *(c)* hours each | a day or two |
 
 ## Durable rows (the briefs)
 
@@ -262,7 +262,13 @@ the clean 0.45–0.56 ms/token before any build.
 
 - [x] **S35-E — gpt-oss: the elastic expert VRAM tier, stages 1 + 2 — ✅ CLOSED 2026-10-11, A WIN: MERGED `5bd31c3` on the USER's word (never pushed).** `ElasticTier` (`vaayu/elastic_tier.py`, torch-free) lends the part of the VRAM reserve a short request cannot use to the expert VRAM tier: `request_reserve(g) = max(3.50 GiB floor, largest predicted peak up to g)`, grants in steps of 4 prefill chunks, and at every grant returns the allocator's cache, reads driver-free VRAM, EMPTIES the tier if the driver is short, then budgets `min(cap, max(usage, 0.94 × (usage + surplus)))`; admission empties the tier before it refuses; a request whose lend does not pay for the allowance runs the static plan's rules (S18's measured admission, `main`'s prefill net). gpt-oss-20b, `max_tokens` omitted on both arms, static → elastic: decode **56.7 → 39.6 / 58.2 → 44.4 / 71.0 → 55.0 ms/token at 2k / 8k / 16k**, 30.7k equal (86.5 / 86.8); a growing 8-turn session 71.6 → 54.4 s (−24 %); `MAX_SEQ_LEN=40442` 8k 84.0 → 45.0. ids identical in every run, stock 64/64, no OOM (a request at `max_seq_len`: lowest driver-free 2.80 GiB, 0.28 static); all gates green, the other models print the OFF line or build nothing; suite 4099 (on `main` at `5bd31c3`). Cost: a request that needs more of the reserve empties the tier first (+1.6 / +2.8 / +3.9 s TTFT at 8k-omitted / 16k / 30.7k); thinnest margin 0.11 GiB driver-free (two 30.7k `max_tokens=64` requests back to back; `main` 0.62). §8: no knob, reachable at N=1 on the server default on gpt-oss (shown through the real app); N>1 takes the lend back. Open follow-ups (stage 3, C, the GPU arena, the margin, the grant band, minors): "gpt-oss-20b" below; the N>1 `plan_batch` minor is backlog #40. Full row: `todo-backlog.md` "Closed after the 2026-10-03 cleanup"; RESULTS `docs/2026-10-10-S35-E-elastic-tier-RESULTS.md`; rulings `.superpowers/sdd/2026-10-10-S35-E-elastic-tier/progress.md`.
 
-- [ ] **S36 — the cheap sweep + 47-m6 (set by the USER at S31, 2026-10-07).** Hours each; one commit per item.
+- [~] **S36 — the cheap sweep + 47-m6 (set by the USER at S31, 2026-10-07).** Hours each; one commit per item.
+      Re-verified at HEAD `9923526` 2026-10-12: all 6 items valid, line anchors drifted (item1 `_precompute_rope`
+      :5092→:5302; item3 `_make_whole_layer_sparse_forward` :2148→:2161, `_maybe_record_usage` :1656→:1669 — gap
+      REAL, whole-layer forward 2161-2280 never calls it, the :2340/:2435 calls are in `_make_fused_sparse_forward`;
+      item4 asserts still absent, only the comment at `lib.rs:355`; item2 `_capture` :618 already has one
+      `_cleanup_pool` in its except at :634). Order this session: 3, 4, 6, 2 (no GPU, deterministic), then 1 + 5
+      (on-device, FOREGROUND).
       1. **47-m6 — fp32 rotary table, quality never measured.** `_precompute_rope` (`vaayu/vaayu_base.py:5092`);
          `inv_freq` went bf16 → fp32 in `cac352e` (A3 task 5). Teacher-forced ppl before (`cac352e^`'s dtype, or stash
          the one-line change) vs after, on Qwen3-Next AND MiniMax, ≥ 4k context, several null-perturbed draws per arm
@@ -616,7 +622,11 @@ arithmetic, not the repack.**
       (Qwen3-Next: KV to the boundary + the recurrent state; DeepSeek: a whole parked cache, 0.42 GB, unless
       compact). Reach: N=1, server default. Ordering rule *(a)* if (1) shows divergence is common.
 
-- [ ] **= S36 item 6 (close on the record). G5 — slab scale.** `SlabArena` (`vaayu/persist/expert_cache.py:25`) was exercised at ~1,000–1,250 slabs of
+- [x] **= S36 item 6 — ✅ CLOSED ON THE RECORD 2026-10-12.** Both halves of G5 are already answered and there is
+      nothing left to measure: the `_NVME_READ_CONCURRENCY` half was MEASURED by S21 (it does NOT transfer to
+      1.58 MB reads — below) and its fix was S22-A1, which was REFUTED (3 rings −1.6 % under O_DIRECT, S22 row);
+      the slab-count half ran clean at 10,273 slabs at the server budget. No action, no new measurement.
+      **G5 — slab scale.** `SlabArena` (`vaayu/persist/expert_cache.py:25`) was exercised at ~1,000–1,250 slabs of
       8–12 MiB. Qwen3-Next is already 24,576 slabs of ~1.6 MiB and works, so this is partly disproven — but
       `_NVME_READ_CONCURRENCY` (`safetensor_model_persister.py:181`, **2 since row 49, 2026-09-21**) was tuned at ~11 MiB reads and **has never been
       re-measured at 1.6 MiB**. Re-measure with `plans/probes/p8_samepath.py`; do not assume it transfers.
@@ -628,8 +638,21 @@ arithmetic, not the repack.**
 
 ## Engine-wide — reliability and minors
 
-- [ ] **= S36 item 2. Lead (S28 final re-review, 2026-10-07; from reading, NOT reproduced): a `capture_begin` failure may leave its
-      graph pool registered as capturing.** `torch.cuda.CUDAGraph.capture_begin` calls `beginAllocateToPool` before
+- [x] **= S36 item 2 — ✅ CLOSED 2026-10-12: NO REPRO in the installed torch; gap is real but unreachable, so NOT
+      FIXED.** Reading confirmed the gap in both sites (`packed_expert_kernels._capture:618` and
+      `decode_graphs._Capture.begin_graph:359` call `capture_begin` OUTSIDE the `_cleanup_pool` try, which wraps
+      `capture_end` only), and torch 2.11+cu130 does call `beginAllocateToPool` immediately before
+      `cudaStreamBeginCapture`. BUT every Python-reachable way to make `capture_begin` fail is caught by torch's own
+      pre-checks BEFORE `beginAllocateToPool` runs: a default-stream capture and a nested same-thread capture both
+      failed with the pool NOT left allocating (probe: `_cuda_endAllocateToPool(dev, pool)` raises "not currently
+      recording"; control pool same). The one remaining trigger — `cudaStreamBeginCapture` itself erroring after
+      `beginAllocateToPool` — needs a driver-level fault not producible from Python. Per the brief, no repro → close
+      with the reason; a defensive wrap untestable against a condition torch prevents would be speculative (§2). Probes:
+      `scratchpad/s36_capture_begin_repro.py`, `s36_capture_begin_order.py` (this session; `docs/` not written —
+      measure-only). **Re-open only if** a torch upgrade reorders `capture_begin`'s pre-checks after
+      `beginAllocateToPool`, or a repro surfaces.
+      Original lead text: a `capture_begin` failure may leave its
+      graph pool registered as capturing. `torch.cuda.CUDAGraph.capture_begin` calls `beginAllocateToPool` before
       `cudaStreamBeginCapture`; if the second fails, `_cleanup_pool` does not run on that path — in `vaayu/packed_expert_kernels.py`
       `_capture` (C5; the cleanup sits around the capture body only) or in `vaayu/decode_graphs.py` `_Capture.begin_graph`
       (S12, same shape). Both catch the exception, so nothing raises into a request. If real, `torch.cuda.empty_cache()`
