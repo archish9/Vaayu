@@ -1259,11 +1259,15 @@ def _inject_expert_weights(
     dtype,
     timing: dict | None = None,
     pinned_source: bool = False,
-) -> dict | None:
+) -> dict:
     """
     Inject expert tensor weights into expert_mod for inference.
-    Returns the per-submodule state it injected on success, None if any submodule
-    failed (expert skipped). The returned dict is
+    Returns the per-submodule state it injected on success, and RAISES if any
+    submodule fails (S39): a routed expert cannot be skipped mid-forward without
+    silently corrupting the output, so there is no warn-and-return-None path. An
+    H2D OutOfMemoryError keeps its own type (for vaayu_base's OOM handler); every
+    other failure is re-raised as a RuntimeError naming the layer and expert. The
+    returned dict is
     {submod_path: {tensor_name: gpu_tensor}, ..., "bc": {submod_path: qmatrix}} —
     the exact shape ExpertVRAMCache stores, whose _group_bytes skips the "bc" key.
 
@@ -1374,11 +1378,24 @@ def _inject_expert_weights(
             # _load_inject_run's `finally` still runs _detach_expert, so nothing
             # is left bound off-meta on the way out.
             raise
+        except torch.cuda.OutOfMemoryError:
+            # A transient VRAM shortage, not an unloadable expert. Keep its own
+            # type so vaayu_base's layer-level OOM handler (the I4 "raise and
+            # name the levers" path) catches it. Swallowing it here — the old
+            # warn-and-return-None — dropped a routed expert mid-forward and
+            # returned a WRONG token with no error (S39).
+            raise
         except Exception as e:
-            _log.warning(
-                f"Expert weight inject failed: {submod_path} ({list(bases)}): {e}"
-            )
-            return None
+            # Any other injection failure is re-raised, not skipped (S39). A
+            # routed expert silently absent from final_hidden is silently wrong
+            # output — the worst failure class — and the same project decision
+            # already governs the attach-failure arm of this forward (it falls
+            # through to a real disk load rather than skipping compute).
+            raise RuntimeError(
+                f"Expert weight inject failed: {layer_name} expert {expert_idx} "
+                f"{submod_path} ({list(bases)}): {e} -- a routed expert cannot be "
+                f"skipped mid-forward without silently corrupting the output (S39)"
+            ) from e
     if bc_objs:
         state["bc"] = bc_objs
     return state

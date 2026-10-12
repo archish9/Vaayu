@@ -855,14 +855,46 @@ def test_inject_expert_weights_returns_state_non_exl3():
     assert expert.w1.weight.shape == (8, 8)
 
 
-def test_inject_expert_weights_returns_none_on_failure():
-    """A submodule path that doesn't exist on the module yields None, not a partial dict."""
+def test_inject_expert_weights_raises_on_failure():
+    """A submodule path that doesn't exist on the module RAISES (S39): a routed
+    expert cannot be skipped mid-forward without silently corrupting the output,
+    so injection no longer warns-and-returns-None."""
     from vaayu.moe_patch import _inject_expert_weights
 
     expert = MockExpert(hidden=8)
     raw = {"layers.0.block_sparse_moe.experts.3.nonexistent.weight": torch.randn(8, 8)}
-    state = _inject_expert_weights(expert, raw, 3, "layers.0", "cpu", torch.float32)
-    assert state is None
+    with pytest.raises(RuntimeError, match="inject failed"):
+        _inject_expert_weights(expert, raw, 3, "layers.0", "cpu", torch.float32)
+
+
+def test_inject_expert_weights_oom_keeps_its_type(monkeypatch):
+    """An H2D OOM during injection must propagate as torch.cuda.OutOfMemoryError,
+    NOT be swallowed or wrapped (S39): only then does vaayu_base's layer-level OOM
+    handler see it and name the real levers (I4). A swallowed OOM drops a routed
+    expert and returns a wrong token with no error."""
+    from vaayu.moe_patch import _inject_expert_weights
+
+    expert = MockExpert(hidden=8)
+    real_to = torch.Tensor.to
+
+    def _oom_to(self, *a, **kw):
+        raise torch.cuda.OutOfMemoryError("CUDA out of memory (injected)")
+
+    monkeypatch.setattr(torch.Tensor, "to", _oom_to)
+    raw = {"layers.0.block_sparse_moe.experts.3.w1.weight": torch.randn(8, 8)}
+    with pytest.raises(torch.cuda.OutOfMemoryError):
+        _inject_expert_weights(expert, raw, 3, "layers.0", "cpu", torch.float32)
+
+
+def test_inject_expert_weights_wraps_generic_error_with_context():
+    """A non-OOM, non-PackedInjectionError failure is re-raised as a RuntimeError
+    naming the layer and expert (S39), not silently skipped."""
+    from vaayu.moe_patch import _inject_expert_weights
+
+    expert = MockExpert(hidden=8)
+    raw = {"layers.0.block_sparse_moe.experts.7.nonexistent.weight": torch.randn(8, 8)}
+    with pytest.raises(RuntimeError, match="expert 7"):
+        _inject_expert_weights(expert, raw, 7, "layers.0", "cpu", torch.float32)
 
 
 def test_inject_expert_weights_collects_bc_objects():

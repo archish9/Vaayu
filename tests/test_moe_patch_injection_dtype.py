@@ -187,14 +187,17 @@ def test_a_shape_mismatch_against_an_allowlisted_target_raises():
     assert "(4, 4)" in str(excinfo.value) and "(4, 2)" in str(excinfo.value)
 
 
-def test_a_structural_failure_still_warns_and_returns_none():
-    """The OTHER failure mode is deliberately unchanged: only the new branch
-    raises. Changing this one is a behaviour change on two production forwards
-    and has its own todo.md row."""
+def test_a_structural_failure_now_raises():
+    """S39: a structural injection failure used to warn-and-return-None, which
+    dropped a routed expert mid-forward and returned a WRONG token with no error
+    on two production forwards (MiniMax-M2.7, DeepSeek-V4). It now raises a
+    RuntimeError naming the layer and expert."""
+    import pytest
     mod = _expert(w1={"weight": torch.zeros(2, 2, dtype=torch.bfloat16)})
 
-    assert _inject(mod, {PREFIX + "nope.weight":
-                         torch.zeros(2, 2, dtype=torch.float32)}) is None
+    with pytest.raises(RuntimeError, match="inject failed"):
+        _inject(mod, {PREFIX + "nope.weight":
+                      torch.zeros(2, 2, dtype=torch.float32)})
 
 
 def test_the_declared_dtype_survives_a_detach_and_reinject_cycle():
@@ -292,10 +295,12 @@ def test_a_cuda_oom_during_the_device_copy_is_not_relabelled(monkeypatch):
     and relabel it as `PackedInjectionError` — hiding it from
     `vaayu_base.py`'s isinstance-based OOM handler and stating the opposite of
     the truth (a transient VRAM shortage is not a packed-dtype defect). The OOM
-    must propagate as itself out of `_inject_no_cast`, where
-    `_inject_expert_weights`'s existing (unchanged, out of this fix's scope)
-    per-group `except Exception` warns and returns None — the same
-    warn-and-skip behaviour the pre-branch code had for a cast-side OOM."""
+    must propagate as itself. Since S39 it propagates all the way OUT of
+    `_inject_expert_weights` as `torch.cuda.OutOfMemoryError` — the per-group
+    handler no longer warns-and-returns-None, which used to drop a routed expert
+    silently; now vaayu_base's layer-level OOM handler sees it and names the
+    levers (I4)."""
+    import pytest
 
     class _OOMOnTo:
         """Stands in for a real tensor: `.to(device, ...)` raises OOM, exactly
@@ -312,7 +317,6 @@ def test_a_cuda_oom_during_the_device_copy_is_not_relabelled(monkeypatch):
     mod = _expert(w1={"weight": torch.zeros(4, 2, dtype=FP4)})
     raw = {PREFIX + "w1.weight": _OOMOnTo()}
 
-    entry = mp._inject_expert_weights(mod, raw, EIDX, LAYER, "cpu",
-                                      torch.bfloat16, pinned_source=False)
-
-    assert entry is None
+    with pytest.raises(torch.cuda.OutOfMemoryError):
+        mp._inject_expert_weights(mod, raw, EIDX, LAYER, "cpu",
+                                  torch.bfloat16, pinned_source=False)
