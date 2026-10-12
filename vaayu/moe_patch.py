@@ -1680,6 +1680,13 @@ def _maybe_record_usage(vaayu_ref, layer_idx, expert_indices) -> None:
         return
     if getattr(vaayu_ref, "_moe_prefill_pass", False):
         return
+    # The routed fused-3D forward knows its routed set as a plain list of expert
+    # ids (one visit = one token at decode, so the set IS that token's top-k);
+    # the other forwards pass a [tokens, top_k] device tensor. Convert here, once
+    # we already know the tracker is on, so the off path stays a single getattr.
+    if not torch.is_tensor(expert_indices):
+        expert_indices = torch.as_tensor(
+            expert_indices, dtype=torch.int64, device=tracker.counts.device)
     tracker.record(layer_idx, expert_indices)
 
 

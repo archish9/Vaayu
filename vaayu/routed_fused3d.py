@@ -157,9 +157,9 @@ def make_routed_experts_forward(*, experts_mod, prior_forward, experts_path: str
     wrapper was installed, so a release restores the wrapper with everything else.
     """
     from .moe_patch import (_dispatch_expert_misses, _iter_expert_loads,
-                            _populate_fused_experts, _release_fused_experts,
-                            _release_prefill_staged, _settle_miss_upload,
-                            _vram_tier_visit)
+                            _maybe_record_usage, _populate_fused_experts,
+                            _release_fused_experts, _release_prefill_staged,
+                            _settle_miss_upload, _vram_tier_visit)
     num_experts = int(experts_mod.num_experts)
     as_raw = {f"{experts_path}.{leaf}": buf for leaf, buf in buffers.items()}
 
@@ -175,6 +175,9 @@ def make_routed_experts_forward(*, experts_mod, prior_forward, experts_path: str
                 f"call shape; running on would leave the kernel reading rows nobody "
                 f"uploaded.")
         vaayu_ref._expert_history[layer_idx] = used
+        # Feed the decode-time usage histogram like every other MoE forward
+        # (no-op unless ENABLE_EXPERT_USAGE); `used` is this visit's routed set.
+        _maybe_record_usage(vaayu_ref, layer_idx, used)
         held, vram = _vram_tier_visit(vaayu_ref, layer_idx, used)
         expert_tensors, miss_futures, pinned_keys = _dispatch_expert_misses(
             used, layer_idx=layer_idx, layer_name=layer_name, shard_file=shard_file,

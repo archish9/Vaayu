@@ -7,6 +7,7 @@ import pytest
 import torch
 
 from tests.routed_fused3d_fakes import NUM_EXPERTS, WIDTH, Ref, build, patch, routed_ok
+from vaayu.expert_usage import ExpertUsageTracker
 
 
 def _run(block, hidden):
@@ -105,6 +106,36 @@ def test_a_decode_visit_caches_the_routed_experts(tmp_path):
     hits_before = cache.hits
     _run(blocks[0], hidden)
     assert cache.hits > hits_before
+
+
+def test_a_decode_visit_records_routed_experts_when_usage_is_on(tmp_path):
+    """S36 item 3: the routed fused-3D forward must feed the expert-usage histogram
+    like the other MoE forwards do; before the fix `_maybe_record_usage` was never
+    called on this path, so ENABLE_EXPERT_USAGE recorded nothing on gpt-oss."""
+    model, idx, _ = build(tmp_path)
+    ref = Ref(model, routed_ok(idx))
+    ref._expert_usage = ExpertUsageTracker(n_rows=4, n_experts=NUM_EXPERTS, device="cpu")
+    blocks, _ = patch(tmp_path, model, idx, ref)
+    hidden = torch.randn(1, WIDTH)
+    router = blocks[0].moe_module.router
+    want = sorted(set(torch.topk(router(hidden), 2, dim=-1).indices.flatten().tolist()))
+    _run(blocks[0], hidden)
+    counts = ref._expert_usage.snapshot()
+    assert counts[0].sum().item() == len(want)
+    assert [e for e in range(NUM_EXPERTS) if counts[0, e].item() > 0] == want
+    assert all(counts[0, e].item() == 1 for e in want)
+
+
+def test_a_prefill_visit_records_no_usage(tmp_path):
+    """Prefill routes are skipped on purpose (see _maybe_record_usage): a prefill
+    pass fills no VRAM cache, so counting its routes would skew the report."""
+    model, idx, _ = build(tmp_path)
+    ref = Ref(model, routed_ok(idx))
+    ref._expert_usage = ExpertUsageTracker(n_rows=4, n_experts=NUM_EXPERTS, device="cpu")
+    blocks, _ = patch(tmp_path, model, idx, ref)
+    ref._moe_prefill_pass = True
+    _run(blocks[0], torch.randn(6, WIDTH))
+    assert ref._expert_usage.snapshot().sum().item() == 0
 
 
 def test_a_prefill_visit_caches_nothing(tmp_path):
