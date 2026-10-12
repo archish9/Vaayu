@@ -12,7 +12,7 @@ Status keys, as in `todo.md`: `[ ]` pending · `[~]` in progress · `[!]` blocke
 
 ---
 
-## Index — 40 items (19 moved 2026-09-26; 20–21 added 2026-09-28 by S10b; 22–23 added 2026-09-28 by S10c; 24–25 added 2026-09-29 by S12; #1 = row 36 CLOSED by S12; 26 added 2026-10-01 by S16 (ii); 27 added 2026-10-02 from the S17 row; 28–35 added 2026-10-03 in the todo.md cleanup; 36 added 2026-10-07 by S29; 37 added 2026-10-07 by S30; 38 added 2026-10-08 by I4's final review; 39 added 2026-10-09 by S35; 40 added 2026-10-11 by S35-E)
+## Index — 44 items (19 moved 2026-09-26; 20–21 added 2026-09-28 by S10b; 22–23 added 2026-09-28 by S10c; 24–25 added 2026-09-29 by S12; #1 = row 36 CLOSED by S12; 26 added 2026-10-01 by S16 (ii); 27 added 2026-10-02 from the S17 row; 28–35 added 2026-10-03 in the todo.md cleanup; 36 added 2026-10-07 by S29; 37 added 2026-10-07 by S30; 38 added 2026-10-08 by I4's final review; 39 added 2026-10-09 by S35; 40 added 2026-10-11 by S35-E); 41–44 added 2026-10-12 in the todo.md closed-sequence cleanup)
 
 | # | item | was in `todo.md` | why it is here | re-open when |
 |---|---|---|---|---|
@@ -54,6 +54,10 @@ Status keys, as in `todo.md`: `[ ]` pending · `[~]` in progress · `[!]` blocke
 | 38 | I4-b — batched store-back stores a ragged entry after an error | I4 final review (added 2026-10-08) | N>1 only: `batched_generate` runs only with `MAX_BATCH_SIZE >= 2` + sdpa (not the default); worth 0 % to users today (CLAUDE.md §8) | `batched_generate` is wired into the server, i.e. with #37 |
 | 39 | S35 — `PREFIX_COMPRESS` and `ENABLE_KV_PERSIST` are refused on a windowed cache | S35 row (added 2026-10-09) | both are off by default and read the live GPU cache's per-position K/V, which a window ring does not hold; refused at load with a WARNING | someone wants either on a model with windowed layers (gpt-oss today) |
 | 40 | S35-E — `plan_batch` reads the lent tier budget before `batched_generate` suspends it | S35-E row (added 2026-10-11) | N>1 only: `batched_generate` is not wired into the server (`MAX_BATCH_SIZE = 1`); worth 0 % to users today (CLAUDE.md §8) | `batched_generate` is wired into the server, i.e. with #37 |
+| 41 | gpt-oss S18/S35/S35-E review follow-ups (24 leads/minors) | gpt-oss-20b section | All are leads and review minors from the (closed, merged) S18 / S35 / S35-E gpt-oss rows | gpt-oss perf work resumes, OR a specific lead's own trigger fires (an OOM or a predictor-tighten attempt → 381/409/410; an fp16 or every-layer-windowed model → 388/393/395; stage-3 context is authorised → 378). |
+| 42 | DeepSeek-V4 S34 review follow-ups (5 leads) | DeepSeek-V4-Flash section | Leads from the closed-and-merged S34 DeepSeek prefix-cache row | DeepSeek prefill/prefix work resumes, OR a client fans out one shared context over several session ids, OR thinking-on reuse is wanted (each lead carries its own price-first step). |
+| 43 | S34 final-review engine-wide + design follow-ups (5 leads/minors) | architecture-generality + reliability sections | Engine-wide and design leads/minors from the S34 final whole-branch review (and I4's final record) | the shared prefix store / server reliability is next worked, OR a one-length-entry, auto-match, or long-prefill-disconnect issue is reported. |
+| 44 | S33 review follow-ups (3 leads/docs) | reliability section | Leads/docs from the S33 host-fast-path row: server-mode gc / malloc_trim hygiene (parked for the USER's ruling) and a CLAUDE | server-mode gc/malloc_trim hygiene is revisited (an arena-less MoE appears, or RSS growth fires the valve), OR CLAUDE.md is next edited (the #44 docs item). |
 
 ---
 
@@ -1080,6 +1084,206 @@ only. `batched_generate` runs only with `MAX_BATCH_SIZE >= 2` + sdpa (not the de
 - **Candidate fix (reviewer, arithmetic checked for both cases, NOT built):**
   `_have = min(past.kv_layer_lengths() or [past.get_seq_length()])` + a CPU test built from the two replay scripts.
 - **Re-open when:** with #37.
+
+---
+
+<!-- 41. moved from todo.md 2026-10-12 (S-sequence review follow-ups; closed-sequence cleanup) -->
+## 41. gpt-oss-20b S18 / S35 / S35-E review follow-ups (24 leads/minors)
+
+**Why here:** All are leads and review minors from the (closed, merged) S18 / S35 / S35-E gpt-oss rows. None is a live sequenced task: several are N>1-only (389, 390), replay- or library-only (395, 398, 396), no-model-on-disk (393), or already ruled PASS in substance (384). Stage-3 context (378) is parked on the USER's word. **Re-open when:** gpt-oss perf work resumes, OR a specific lead's own trigger fires (an OOM or a predictor-tighten attempt → 381/409/410; an fp16 or every-layer-windowed model → 388/393/395; stage-3 context is authorised → 378).
+
+Members (verbatim from `todo.md`, markers preserved; each left a pointer at its old spot):
+
+- [ ] **(S35-E)** stage 3 — default context → 40,442 on an elastic load: NOT built; on the USER's word, with its own spec addendum and a limit run at 40,442
+- [ ] **(S35-E)** C — size the tier to the decode-phase need (30.7k and beyond gain nothing today: the reserve there is prefill score buffer a decode step does not allocate). Parked; re-open with its own oracle arm (raise the tier budget probe-side after a 30.7k prefill)
+- [ ] **(S35-E)** a tier that can shrink without being emptied (a GPU arena of large blocks with compaction) — removes the flush cost (+1.6 / +2.8 / +3.9 s TTFT at 8k-omitted / 16k / 30.7k, the S35-E row above); set aside by the USER 2026-10-10 as week-class
+- [ ] **(S35-E)** **the thinnest margin: a lent request near the top of the lent zone that prefills with the tier already full** (30.7k with `max_tokens` set, after another such request) went down to 0.11 GiB driver-free with the cache-aware prefill net; `main` keeps 0.62 GiB there because its net reads driver-free at the peak and dumps the tier. Mitigation ready to price: make the net cache-aware only on grants whose reserve is the floor (≤ ~8.6k on gpt-oss, where its benefit was measured: 233 of 582 entries kept during an 8k prefill), and re-measure 16k (it would partly evict there, and the next fit would flush). Re-open if any OOM is seen, or before tightening the VRAM predictor (the corrected lead below)
+- [ ] **(S35-E)** grants of 31,744–32,253 tokens (one prefill chunk of lengths; reached only with an explicit `max_tokens` that ends there) can come out 0–5 experts under the static tier on a card that shows ~70–80 MB less than the plan counted — computed, not measured; measure only if a client sends such limits
+- [ ] **(S35-E)** minors deferred by the reviews (none changes a number; the N>1 `plan_batch` one is backlog #40): `generate()` without `max_new_tokens` is granted `limit == prompt` (library only); `ElasticTier.covering` is not cleared when a request ends (safe direction, documented in `cover`); the grant line mixes GB with the load line's GiB; `vaayu/server/envinfo.py`'s `expert_vram_cache_gb` reports the last request's lent budget with no base figure; the chunk-major retention bound in `moe_patch.py` follows the lent budget (unreachable on device: those loads run decode graphs); a speculator the adaptive gate drops later leaves a static tier, silently; after the prefill net evicted the WHOLE tier (no holes), the next lent request still flushes (re-review N1: the eviction counter cannot tell total from partial; +0.4 s TTFT, only after back-to-back full-window requests); the preallocated-KV refusal is unit-tested only (on device DeepSeek-V4 is refused by its decode graphs first)
+- [ ] **(S35) the branch's VmHWM at 30.7k is 14–20 MB above main in the default config, unexplained.** After the 9b trim:
+      D1 16.196, D2 16.202 vs A4 16.182 GiB (B3 / C3 were 16.180 / 16.182 vs 16.181). The model-free diag
+      (`plans/probes/s35_rss_diag.py`) shows the windowed cache BELOW the full one (2.47 vs 2.49 GiB), so the cause is not the
+      cache itself. Ruled PASS in substance (cost if wrong: ≤ 20 MB of host RAM at the longest contexts).
+- [ ] **(S35) fp16 + `PREFILL_CHUNK_SIZE<=0` keeps main's misaligned windowed mask** — `kv_windows_of` (`vaayu/windowed_kv.py`, used at `vaayu_base.py` mask hook) returns `{}` there; on transformers 5.5.4 the request FAILS with a size error ("The size of tensor a (W) must match the size of tensor b (…)") past the window — it is not silent wrong attention — as on main. Small fix (final review 2026-10-09): apply the `chunk <= 0` rule in `kv_windows_of` only when the mode is not fp16, and make `per_token_window_discount` return 0 when `chunk <= 0`. Unverified: fp16 + `USE_PROMPT_LOOKUP=True`, and a multi-chunk fp16 prefill. Docstring says so since the final fix wave.
+- [ ] **(S35) the batched-pool and persist refusal guards are source-order tests only** (`tests/test_one_length_cache.py` / windowed-refusal tests; both paths need a loaded model; N>1 unreachable). Replace with behavioural tests when `batched_generate` is wired (backlog #37). Batched-prefill ring (final review M6): `batched_generate` chunks its own prefill; with `prefill_chunk_size` temporarily 0 the cache's chunk clamps to 1, the ring doubles, and can pass the plan's ring bound when chunk < W. N>1 only.
+- [ ] **(S35) N>1 admission does not charge the windowed rings' constant per stream** (`vaayu/batch.py` `geo_from_model`); N>1 only.
+- [ ] **(S35) crop-reload / store-hit / lending tests run bf16 only** (`tests/test_windowed_kv.py`); the fp8 scale + mirror lists on the reload path are unpinned.
+- [ ] **(S35) `WindowedKVCache.to_cpu` pops the host log before `out` is fully built** (`vaayu/windowed_kv.py`); a failed pinned alloc mid-way loses that layer's history (error path only).
+- [ ] **(S35, M2) a model whose EVERY KV layer is windowed gets a `WindowedKVCache` but no plan discount** (`per_token_window_discount` → 0): the rings are allocated at the first update while the plan charges per token — e.g. 48 layers, 4 KV heads × 128, W 4096, chunk 512: 480 MiB of rings from the first token against a 48 MiB charge at 512 tokens (short 432 MiB; covered from 8,192 tokens). No such model on disk. Fix when one appears: either do not window when every layer is windowed, or charge max(per-token, constant).
+- [ ] **(S35, M4) `WindowedKVCache.to_cpu` trims after every store that follows a HIT** (the `to_device` view counts as a freed block), ~24 ms worst case, unmeasured in the server heap; and one trim after all windowed layers equals main's host peak only because gpt-oss windows exactly half its layers (at a windowed share f the transient is pool + 2f entries against main's pool + 1).
+- [ ] **(S35, M1) under `KV_CACHE_MODE="fp16"` or with <= ~12 GiB free the floor's clamp binds**, so the window saving goes to context and the tier stays small (plan ≈ the 40,442 arm). Replay only (addendum review M1).
+- [ ] **(S35, M4) `MAX_SEQ_LEN=40442` under the parity rule was never loaded on device** (replay reserve 10.956 GiB, 3–7 experts by arithmetic); the 3 experts / 85.6 ms figure is the pre-rule derived plan.
+- [ ] **(S35, M6) the load-line identity check covers 4 of the 5 other models** — Llama-3.3-70B's gate log has no load line (the dense gate runs without `-s`); identity there is by construction.
+- [ ] **(S35, M7) a caller-supplied `FP8DynamicCache()` / `DynamicCache()` on a windowed load fails with a size error where main ran** (library / probes only; use `model._create_kv_cache()`).
+- [ ] **Open (S18 step 2):** the tier budget moves with whatever else holds VRAM at load (111–133 experts
+      this session); 30.7k HIT TTFT ON 0.052 s slower, unexplained. Deferred review minors for the final
+      review: admission's batch-giveback arm unpinned by tests (N>1 only); an eviction followed by a
+      refusal prints nothing about the tier having been cut; the load-wiring test pins order by source
+      text only; FakeTier frees exactly the deficit while the real method frees whole entries; the
+      admission tests skip without CUDA; two cosmetic items in the tier test file / the clone's leaf-name
+      source.
+- [ ] **Lead (S35-E, 2026-10-10): the VRAM plan over-predicts gpt-oss's prefill peak by about a third** — 3.31 GiB predicted at 8k against about 1.8–2.3 GiB live (driver-free fell from 3.5 to 1.2–1.5 GiB in `s35e_out/dry8-final-steady-ON`, part of that the allocator's cache), about 8.2 against 5.93 GiB at 30.7k (S35's arms). One candidate: `head_bytes` (1.08 GiB) is charged as a prefill transient while `lm_head` has been VRAM-resident since S14 3c; not checked. Worth up to ~1 GiB of reserve = ~80 experts for the static tier, or context. Price it with a peak-measurement arm (`tests/test_vram_peak_measurement.py`'s method) before touching the planner; it is shared by every model. **CORRECTED 2026-10-11 (S35-E's final runs): at the DRIVER level — the allocator's cache included, which is what a request actually competes for — the 30.7k prediction is about right, not a third high:** two 30.7k requests in a row on the elastic tier, the second one's whole predicted peak in driver-free VRAM at its fit, went down to 0.11 GiB free (`pair-ON-fin`). The "about a third" compared ALLOCATED bytes. Tightening the predictor would remove exactly that margin; measure at the driver level first.
+- [ ] **Lead (S35-E, 2026-10-10): S18's admission eviction re-checks with `free + pool`, and the pool it counts holds the holes a partial eviction leaves** (`_assert_context_fits`, `vaayu/vaayu_base.py`, after `evict_until_free`). Measured on gpt-oss (`plans/probes/s35e_out/frag.log`): a partial LRU eviction returned 13–78 % of its bytes to the driver; the rest stays in allocator segments shared with live entries and cannot serve a large allocation. Not reproduced as an OOM (S18's 33,108-token run passed; the planner over-predicts the 30.7k peak by about 2 GiB). `_ensure_prefill_headroom` (`vaayu/moe_patch.py`) evicts by the same byte count. S35-E's closed-loop shrink covers the elastic path only; decide there whether this path adopts it. **S35-E (merged `5bd31c3`):** on a load with an elastic tier (gpt-oss today) single-stream admission no longer takes this path — the elastic tier empties the tier instead of evicting part of it; the path stays for every other load and for N>1, and `_ensure_prefill_headroom` still evicts by byte count on a request that is lent nothing.
+- [ ] **Lead (S18 step 1): eager attention is the larger cost at long context on gpt-oss** — 75.3 ms
+      of the synchronized 30.7k token (45 %) against 60.2 ms of upload; after a full tier the 30.7k
+      floor is 96.3 ms. Unpriced as a lever.
+- [ ] **Lead (S18 step 1): decode graphs (S12) are refused on gpt-oss** (`capture failed: ... no
+      seamed attention interface followed it`); ≈19 ms/token of host-paced work sits in the 33.0 ms
+      2k floor. Unpriced.
+- [ ] **Lead (S18 step 1): a cold request's decode logits differ from a prefix-HIT request's on the
+      same prompt** (ids identical, 0/31 bit-identical, max|d| 2.35 / 0.70 / 1.25 at 2k / 8k /
+      30.7k; HIT-vs-HIT is bit-identical). Hypothesis, not investigated: the M>1-vs-M=1 rounding
+      class (the HIT recomputes the last prompt token alone).
+
+<!-- 42. moved from todo.md 2026-10-12 (S-sequence review follow-ups; closed-sequence cleanup) -->
+## 42. DeepSeek-V4-Flash S34 review follow-ups (5 leads)
+
+**Why here:** Leads from the closed-and-merged S34 DeepSeek prefix-cache row. Each carries a price-first trigger; none blocks a server user today (N=1 holds one session; thinking-on and the offload() path have no caller on the server default). **Re-open when:** DeepSeek prefill/prefix work resumes, OR a client fans out one shared context over several session ids, OR thinking-on reuse is wanted (each lead carries its own price-first step).
+
+Members (verbatim from `todo.md`, markers preserved; each left a pointer at its old spot):
+
+- [ ] **Lead (S34 STEP 0, 2026-10-08; measured, mechanism from reading, UNPRICED): DeepSeek's prefill re-reads
+      its experts once per chunk.** A full prefill of 4,352 tokens made **70,542 expert loads for a routed union of
+      10,509 (6.7×), 943.7 GB, 112.1 s of stall in a 148.2 s TTFT**; on one 1,280-token prompt, chunk 256 instead
+      of 512 raised loads 22,093 → 33,142 and TTFT 46.2 → 68.7 s (`plans/probes/s34_out/price-1k-dfc.log`,
+      `price-4k-df.log`). Prefill costs ≈ 17 s per 512-token chunk, so a cold 8k prompt is ≈ 270 s. Mechanism: the
+      module-list forward's chunk retention is budgeted by the expert VRAM tier (`_cm_budget`,
+      `vaayu/moe_patch.py:1825`; 1.88 GB ≈ 140 experts on this load, against ~225–245 routed per layer per
+      chunk) and prefill makes no RAM-cache puts. One layer's whole expert set is 256 × 13.4 MB = 3.4 GB and the
+      RAM arena is 9.1 GB, so holding a layer's routed experts in host RAM across that layer's chunk calls would
+      read each once: ≈ 141 GB instead of 943.7 GB at 4.3k. Reach: every cold DeepSeek turn and any diff longer
+      than one chunk, N=1, server default. It would also shrink S34's saving at long context (not the 11.3 s HIT
+      itself). Price it with a replay through the real cache before building (memory `replay_real_class_not_model`);
+      check MiniMax-M2.7 (same forward; row 45 found it H2D-bound after retention).
+- [ ] **Lead (a) (S34, 2026-10-08): the DeepSeek prefix pool's budget floats between loads, so `PREFIX_SESSIONS=3` holds
+      zero, one or two sessions in practice.** The pool's budget is the RAM left after the load, not what the reserve set
+      aside: 0.00 GB (x5, `BALLAST_GB=15`) and 0.54 / 0.60 / 0.62 / 0.69 / 0.72 / 0.73 / 0.76 / 0.84 / 0.90 / 0.91 / 1.08 GB on
+      Task 4's own-budget loads (the dry run saw up to 1.36 GB = three), against 0.44 GB per session. One session fits above
+      0.44 GB; several concurrent sessions over-fill it and the engine warns (`prefix pool over capacity`). Idea, NOT
+      designed: size the pool from the reserve, or take RAM from the expert cache. Reach: N=1 holds one session, so
+      only a client that fans out hits it. Evidence: RESULTS §7.
+- [ ] **Lead (b) (S34, 2026-10-08): `DeepseekV4CacheLayer.offload()` returns before its GPU-to-host copy has run.** It uses
+      `.to("cpu", non_blocking=True)`, and a CUDA tensor's non-blocking copy into pageable host memory returns before one
+      byte has arrived (220,000,000 of 220,000,000 elements read wrong at once in the S34 dry run; hidden when the GPU is
+      idle). Nothing in Vaayu calls it (S34's `to_cpu` is a blocking copy, pinned by a CUDA test). `prefetch()` after it is
+      safe only because a host-to-GPU copy from pageable memory synchronizes with the stream first. Fix = make `offload()`
+      blocking, or delete it, if a caller ever appears.
+- [ ] **Lead (c) (S34, 2026-10-08): no run holds host RAM low AFTER the load with the pool on.** The `BALLAST_GB=15` M4 run
+      (trough 15.16 GB) frees its ballast right after the load (`plans/probes/s34_session.py:94`) and samples
+      `MemAvailable` only then, so it shows reuse at a 0.00 GB pool budget but NOT survival under real RAM pressure. The
+      real headroom figures are the own-budget troughs (0.86 GB lowest, in the four-arm M2 process; one-session ON runs
+      1.76-2.59 GB, OFF runs 1.19-1.67 GB). Price it: hold ballast through the whole session (not freed after the load)
+      with the pool ON, at a budget the engine would pick on a 16 GB machine, and watch for an OOM kill or a trough
+      under 0.5 GB. Reach: a server on a small-RAM box. RESULTS §7.
+      **M4 (S34 final review, 2026-10-08; NOT measured):** `PrefixCacheStore.store()` parks the new cache in host RAM
+      (`vaayu/prefix_cache.py:200`, `to_cpu`) before it pops the session's stale entry (`:209`), so a MISS turn
+      briefly holds two sessions' worth of host RAM (2 × 0.44 GB on DeepSeek-V4). Every M4 turn was a HIT (the entry
+      was already checked out), so the troughs above do not include it; it is the steady state with thinking on
+      (lead I3). Put a MISS turn in the pricing run.
+- [ ] **Lead I3 (S34 final review, 2026-10-08; encoder-only evidence, not on device; UNPRICED): DeepSeek-V4 with
+      thinking ON gets no prefix reuse and still pays the pool's cost.** Trigger: a request with
+      `"enable_thinking": true`, or `ENABLE_THINKING=True`. The renderer calls the checkpoint's encoder with its
+      default `drop_thinking=True` (`vaayu/model_code/deepseek_v4/prompt.py:22-26`), which drops earlier reasoning
+      and re-renders the earlier assistant header as `</think>` instead of `<think>` (the checkpoint's
+      `encoding/encoding_dsv4.py:359-363, 399-407`). Encoder-only check, the controller's re-run: `mode=chat …
+      contains_whole_entry=True lcp_chars=99/99`; `mode=thinking … contains_whole_entry=False lcp_chars=60/119`,
+      whether or not the client echoes `reasoning_content`. The fix wave's own encoder-only run through the server's
+      renderer (`plans/probes/s34_i3_encoder_check.py` → `plans/probes/s34_out/i3-encoder-thinking-check.log`): chat
+      `contains_whole_entry=True lcp_chars=168/168`; thinking `contains_whole_entry=False lcp_chars=112/202`, with
+      and without the echo. Effect: every turn is a `recurrent_partial` MISS, while the session still parks 0.44 GB,
+      pays the ~130 ms store tail, and the load still gives up ~1.2 GB of expert RAM cache. Not a regression (before
+      S34 every turn was cold); the measured path is the server default (`ENABLE_THINKING=False`). A reply trimmed
+      by a `stop` string probably has the same effect (UNCONFIRMED). Documented remedy today:
+      `ENABLE_PREFIX_CACHE=False` avoids the cost. A fix needs the encoder's history rendering changed or a snapshot
+      at a stable boundary (the one-length lead under "Engine-wide — architecture generality") — a design, not
+      built. Confirm on device first: one two-turn session with `"enable_thinking": true`, then read
+      `recurrent_partial=` on `/health`. Reach: N=1, only with thinking on.
+
+<!-- 43. moved from todo.md 2026-10-12 (S-sequence review follow-ups; closed-sequence cleanup) -->
+## 43. S34 final-review engine-wide + design follow-ups (5 leads/minors)
+
+**Why here:** Engine-wide and design leads/minors from the S34 final whole-branch review (and I4's final record). They touch the shared prefix store, the auto-match rule, prefill-disconnect handling, and cosmetics; nothing was built because engine files were frozen for the fix wave. **Re-open when:** the shared prefix store / server reliability is next worked, OR a one-length-entry, auto-match, or long-prefill-disconnect issue is reported.
+
+Members (verbatim from `todo.md`, markers preserved; each left a pointer at its old spot):
+
+- [ ] **Lead (S34 design, 2026-10-08; UNPRICED): a one-length cache gives no reuse to a prompt that shares only
+      a PREFIX with the stored entry.** An entry that cannot be cropped is served only when the new prompt
+      contains all of it (42-B's rule in `PrefixCacheStore.lookup`, `vaayu/prefix_cache.py:113`). That holds for
+      Qwen3-Next's hybrid cache TODAY (the agent's model), for DeepSeek-V4 once S34 lands, and for gpt-oss once
+      S35 stores its sliding layers at window length. A new task under the same system prompt, a sub-agent that
+      shares the parent's system prompt, or a context edited in the middle all prefill in FULL; the store counts
+      them as `recurrent_partial=`. `test_multiturn.py` has exactly that shape (same system prompt, new task), so
+      it would score 0 HITs on these models. Idea, NOT designed: keep a snapshot of the cache at a stable boundary
+      (the end of the system prompt) so a diverging prompt restarts from there. Price it first: (1) how often a
+      real agent session diverges instead of appending — `prefix_hit` in `requests.jsonl` and the
+      `recurrent_partial=` count from a Rudra-shaped session on Qwen3-Next; (2) what a snapshot costs per session
+      (Qwen3-Next: KV to the boundary + the recurrent state; DeepSeek: a whole parked cache, 0.42 GB, unless
+      compact). Reach: N=1, server default. Ordering rule *(a)* if (1) shows divergence is common.
+- [ ] **Lead M3 (S34 final review, 2026-10-08; the rule predates S34, 42-B): auto-match hands a one-length entry to
+      ANOTHER session whose prompt contains all of it.** `PrefixCacheStore.lookup` (`vaayu/prefix_cache.py:82-94`,
+      `:143-144`, `:167-169`): a request whose own id is not in the pool falls back to the best auto-match; when its
+      prompt contains the WHOLE entry the match is a continuation, so the entry is checked out, not copied, and
+      stored back under the new id — and the owner's next turn is cold
+      (`test_another_sessions_continuation_checks_the_entry_out` pins the behaviour). The comment at
+      `vaayu/prefix_cache.py:137-142` ("checking it out loses nobody anything") is untrue for a one-length entry:
+      the superset stored back cannot be cropped to serve the owner. The engine comment was NOT edited (engine files
+      frozen); correct it with the code. Relevant to agent fan-out: a sub-agent that forks the parent's context
+      under a new session id takes the parent's entry. Same rule, second half: auto-match picks the LONGEST shared
+      prefix (`:89-94`) even when a shorter entry is the one that could be served whole — costs speed only.
+      `documentation/server.md` §6.2 now states the exception. To confirm on device: two session ids on Qwen3-Next
+      or DeepSeek-V4, the second forking the first's context, then the first's next turn (`recurrent_partial=` on
+      `/health`). Reach: N=1, a client that uses more than one session id over a shared context.
+- [ ] **Lead (S34 final review, 2026-10-08; from reading, not measured; predates S34): a disconnect during a
+      PREFILL is not honoured until the prefill ends.** The cancel is a `StoppingCriteria`
+      (`vaayu/server/engine.py:65-81`), checked per generated token; nothing in the engine's forward or chunked
+      prefill reads it. `documentation/server.md` §6.7 says closing the connection stops generation "within about a
+      second". On DeepSeek-V4 a prefill is 46–165 s (46.2 s at a 1.3k context, S34 STEP 0,
+      `plans/probes/s34_out/price-1k-dfc.log`; 165.00 s at 4.3k, M1's OFF arm, `s34-session-m1-4k-off.json`), so an
+      abandoned cold request holds the single slot that long; on any model the bound is the cold
+      TTFT. To confirm: drop a streaming request during a long cold prefill and time until the slot frees
+      (`finish="cancelled"` in `requests.jsonl`). Fix shape: read the token between prefill chunks (the layer loop
+      is shared infra), or correct the doc sentence.
+- [ ] Minor (cosmetic; S34 final review, 2026-10-08; predates S34 except the rewrap): the HIT log line and `saved`
+      are off by one ("prefill only 11 new positions" when 12 are fed), every cache class; `vaayu/vaayu_deepseek_v4.py`
+      docstrings carry stale `vaayu_base.py` line numbers (`:3770`, `:2274`); and the same file's docstring (~`:86-87`)
+      and comment (~`:108`) carry a ragged rewrap from S34 Task 2.
+- [ ] Minor (I4 final record, 2026-10-08; extend this bullet with any later I4 review minors): (a)
+      `tests/test_oom_does_not_truncate_kv.py:49` slices the source at the FIRST `except torch.cuda.OutOfMemoryError`
+      in forward, a source-text test that would silently pass if an earlier unrelated handler appeared (behaviour is now
+      pinned by `tests/test_oom_layer_is_not_retried.py`); (b) the `(... if hasattr(...) else None) or [...]` expression
+      in `restore_on_abort` (`vaayu/prefix_cache.py`) is dense; (c) no test covers a ragged cache where a LATER layer is
+      longer than layer 0 (covered only by the min over all lengths).
+
+<!-- 44. moved from todo.md 2026-10-12 (S-sequence review follow-ups; closed-sequence cleanup) -->
+## 44. S33 review follow-ups (3 leads/docs)
+
+**Why here:** Leads/docs from the S33 host-fast-path row: server-mode gc / malloc_trim hygiene (parked for the USER's ruling) and a CLAUDE.md wording fix. **Re-open when:** server-mode gc/malloc_trim hygiene is revisited (an arena-less MoE appears, or RSS growth fires the valve), OR CLAUDE.md is next edited (the #44 docs item).
+
+Members (verbatim from `todo.md`, markers preserved; each left a pointer at its old spot):
+
+- [ ] **Lead (S33 final review M-5, 2026-10-07; PARKED for the USER's ruling): keep `malloc_trim` in the request and
+  defer only `gc.collect()`.** S33's E5 defers both halves of the every-32-pass hygiene in server mode, as the USER
+  ruled, and the pre-registered valve rule (RSS growth > 0.25 GB over one long request) fired on none of five
+  models. All five are on the slab arena or have no expert cache. An ARENA-LESS expert cache (a mixed fused +
+  module-list MoE, or both arena allocations failing at load; no on-device model) is where the in-request trim
+  measurably returned memory (S5-M: 18.06 → 12.56 GB; S16 (ii): 8.64 → 2.81 GB), and a server response now runs no
+  trim at all. `malloc_trim` costs 0.28–0.38 ms per call against 77–89 ms for `gc.collect()` (S33 D0), so keeping it
+  on the 32-pass cadence costs about 0.01 ms/token. Build = one branch in `forward` (`vaayu_base.py`, the `% 32`
+  mark) + its test + one confirmation arm. In both measured arena-less cases the process was OOM-killed or the
+  retention saturated before pass 32, so the valve would not have saved them: ordering rule *(d)* today.
+- [ ] **Lead (S33 dry run, 2026-10-07): a full gc collection re-scans the expert cache's live tensors.** After
+  `freeze_after_load()` the collector still scans everything created since: on Qwen3-Next after one 1,024-token
+  request 271,704 objects, 184,270 of them `Tensor` (`plans/probes/s33_out/s33-rss-qwen-off.json`). A full
+  collection therefore costs 62–89 ms. S33's E5 moves the explicit one out of the turn, but an automatic gen-2
+  collection still runs inside a HIT turn about 1.3 times (0.087 s per turn, about 0.34 ms/token; automatic gen-0:
+  0.11 s per turn, timed through `gc.callbacks`, which adds its own cost), and the deferred one makes a client that
+  answers at once wait 62–82 ms. Idea, NOT designed: freeze again after each deferred collection. Open question: a
+  frozen object that later becomes cyclic garbage is never freed (the dead decode-graph runner cycle, S12's R3, is
+  one such). Price it with a census arm before any build; N=1, the server default, Qwen3-Next (ordering rule *(a)*).
+- [ ] **Docs (S33 final review, 2026-10-07): `CLAUDE.md` §8 says `batched_generate` is "deliberately NOT wired in",**
+  but `vaayu/server/scheduler.py:492` reaches `EngineHandle.run_batch` → `batched_generate` when `MAX_BATCH_SIZE > 1`
+  on sdpa (the default is 1, so the conclusion "a win measured only at N>1 is worth 0 % today" still holds). Reword
+  the sentence when `CLAUDE.md` is next edited; `CLAUDE.md` is the USER's file.
 
 ---
 
