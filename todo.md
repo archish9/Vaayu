@@ -92,7 +92,7 @@ closed accumulates in this file again.
 
 ---
 
-# ▶▶▶ THE SEQUENCE — S21…S41 (S21–S24 set 2026-10-03; S25–S26 set by the USER at S24, 2026-10-05; S27–S30 set by the USER at S26, 2026-10-06; S31 set by S26's rule when S30 closed, 2026-10-07; S32–S36 set by the USER at S31, 2026-10-07; S38–S41 set by the USER at S37, 2026-10-12). One per fresh session, in order. NEXT = **S41** (Dense M-6: measure the embedding's VRAM share on Llama-3.3-70B streamed, then free it). ◀◀◀
+# ▶▶▶ THE SEQUENCE — S21…S41 (S21–S24 set 2026-10-03; S25–S26 set by the USER at S24, 2026-10-05; S27–S30 set by the USER at S26, 2026-10-06; S31 set by S26's rule when S30 closed, 2026-10-07; S32–S36 set by the USER at S31, 2026-10-07; S38–S41 set by the USER at S37, 2026-10-12). One per fresh session, in order. **S21…S41 are ALL CLOSED. NEXT = re-prioritise with the USER** (the sequence's post-S41 rule). Live build candidate from this round: **S40** (DeepSeek L-c residency-first, +15.18 % decode) and **S41** (Dense M-6, +9.77 % decode) both CLEARED and warrant build rows. ◀◀◀
 
 **HOW A FRESH SESSION PICKS — no judgement needed:** take the **first row of the table that is not ✅**. Its durable
 row below IS the brief (write a handoff in `docs/superpowers/specs/` first only if the row needs more than it
@@ -191,7 +191,7 @@ the clean 0.45–0.56 ms/token before any build.
 | **S38** ✅ | ~~Qwen3-Next fresh HEAD census~~ — **CLOSED 2026-10-12, MEASURE ONLY, no regression, no new N=1 lever.** HEAD (`5d3d8ac`, engine = S36 `a89b445`), server mode, server's own budget 19.32 GB (no ballast, USER's choice), 3 processes, spread ≤ 1.1 %: HIT turn **14.95 s**, decode **47.0 ms/tok**, TTFT **2.95 s**, stall **3.98 s**, cold-8k 19.85 s / 9.26 s. Breakdown: TTFT 20 %, decode 80 % (expert-miss stall 3.98 s = 27 %; **host+GPU decode compute 7.96 s = 53 %, now the LARGEST block**, overtaking the stall since S21). Faster than S28 (16.04 s @ 18.4–18.9 GB) and S33 (15.65 s @ 17.5–17.7 GB) but at a bigger budget — gain is budget + merged edits, not separated. Remaining N=1 levers all tapped/settled (GPU compute needs an algorithmic lever; prefetch REFUTED S25; host tapped S27/28/33; prefix+packed kernel shipped). Full row: the S38 durable row; `docs/2026-10-12-S38-qwen3next-head-census-RESULTS.md` | — | done |
 | **S39** ✅ | ~~MiniMax silent expert-drop on H2D OOM (`_inject_expert_weights`) — raise-vs-degrade decision, then fix~~ — **CLOSED 2026-10-12: FIXED (raise all), USER-decided, MERGED `159ca6d` 2026-10-12 on the USER's word.** The module-list injector's catch-all `except Exception → warn + return None` dropped a routed expert mid-forward (incl. swallowed OOM) = silent WRONG output on MiniMax-M2.7 + DeepSeek-V4. USER chose **raise all**: `except OutOfMemoryError: raise` (→ vaayu_base's I4 handler names the levers) + generic failures re-raised as RuntimeError with layer/expert context; no warn-and-skip. Module-list injector only (fused/dense untouched). 3 new + 2 updated tests; suite **4106 passed, 26 skipped**; error-path-only, cannot regress a healthy run. §8: no knob, N=1 server default, SHIPPED, merged `159ca6d`. Full row: the S39 durable row; `docs/2026-10-12-S39-modulelist-injection-raise-RESULTS.md` | — | done |
 | **S40** ✅ | ~~DeepSeek L-c — price the planner's VRAM priority at HEAD, MEASURE ONLY~~ — **CLOSED 2026-10-12: TRADE WORKS, +15.18 % decode, CLEARS 5 % → warrants a build row (sequence at post-S41 re-prioritise).** Stale L-c numbers (3.5 GB tier / 34.9 %) corrected at HEAD: baseline pins 40/43 non-expert layers, streams **3** (167.3 MB ea); expert VRAM tier **1.73 GB / 138 experts / 24 % hit**. Oracle (residency-first: `plan_vram.pinning_budget += 0.667 GiB`, pin all 43, tier → 1.16 GB / 93 / 23 %): decode **414.4 → 351.5 ms/token (2.41 → 2.85 tok/s)**, bit-identical (max\|d\|=0), ABBA spread 1.01 % ≪ signal. MEASURE ONLY, no engine code, suite floor unchanged. Full row: the S40 durable row; `docs/2026-10-12-S40-deepseek-lc-vram-priority-RESULTS.md` | — | done |
-| **S41** | Dense M-6 — measure the embedding's VRAM share on Llama-3.3-70B streamed, then free it for transformer layers | *(b)/roadmap* on the §0 dense roadmap; unbuilt; ~5 % of ~37 GB/token read | measure → build |
+| **S41** ✅ | ~~Dense M-6 — measure the embedding's VRAM share on Llama-3.3-70B streamed, then free it~~ — **CLOSED 2026-10-12: TRADE WORKS, +9.77 % decode, CLEARS 5 % → warrants a build row (sequence at post-S41 re-prioritise).** Embedding VRAM share measured at HEAD: **1.957 GiB** bf16 (row's "2.10 GB" was GB-vs-GiB); one transformer layer 0.4984 GiB; baseline pins 16/80 transformer layers + 3 shared (19), streams 64. Oracle (force CPU-resident embedding, exactly the S14 E branch minus its budget gate): **+4 resident transformer layers** (streamed 64 → 60 of 80, +5.0 % of the per-token read removed), decode **3282.4 → 2961.7 ms/token (+9.77 %)**, bit-identical (max\|d\|=0, ids identical), ABBA spread 0.03 % ≪ signal. MEASURE ONLY, no engine code, suite floor unchanged. Full row: the S41 durable row; `docs/2026-10-12-S41-dense-embedding-vram-RESULTS.md` | — | done |
 
 **S37 DECIDED 2026-10-12 by the USER:** all four candidate levers picked; after confirming, the USER took **the
 ordering-rule order (the session's recommendation)** — S38 Qwen3-Next census, S39 MiniMax silent-drop, S40 DeepSeek
@@ -411,19 +411,16 @@ re-prioritises with the USER.**
       `docs/2026-10-12-S40-deepseek-lc-vram-priority-RESULTS.md`. (Absolute note: 2.41 tok/s baseline ≠ S15's 1.78 — a
       different operating point; this row prices the delta, not S15's figure.)
 
-- [ ] **S41 — Dense M-6: free the embedding's VRAM for transformer layers on Llama-3.3-70B streamed.** The dense M-6 lead
-      (the "(M-6) Lead" item, now at **`todo.md:606`** — was cited as :519): Llama-3.3-70B pins **2.10 GB of embedding in
-      VRAM** (19 fully-pinned = 16 transformer + 3 shared); freeing it buys ~4 more resident transformer layers, ~5 % of the
-      ~37 GB/token read on the 70B streamed checkpoint (`archish9--Llama-3.3-70B-Instruct-exl3-4.5bpw`, confirmed on disk
-      2026-10-12). MEASURE the share first (per the backlog note at `todo-backlog.md:~8981`), then free it only if the
-      measure justifies the build. **The machinery already exists for MoE:** `_install_cpu_resident_embedding` (S14 E,
-      `vaayu/vaayu_base.py:4549`) + `vaayu/cpu_embedding.py` (`CpuResidentEmbedding`, `cpu_embedding_eligibility`); S41 is
-      applying/pricing "E for DENSE". Watch the measured E-everywhere cost (Qwen3-Next +1.14 %) — measure the dense crossover
-      before building. Dense is on the §0 roadmap (deferral lifted 2026-09-02). Baseline: Llama-3.3-70B O_DIRECT decode
-      1.961 s/token, TTFT 3.34 s (S29); dense gate `tests/test_dense_gate.py` (`DENSE_CKPT=`, confirmed present), run on BOTH
-      Llama checkpoints for any shared-infra change — keep MoE green. §8: per the build. **When S41 closes, the next fresh
-      session re-prioritises with the USER.** Cost: measure → build. *(S40 closed 2026-10-12; S39 merged `159ca6d`; HEAD
-      `0532397` + this session's docs/probe edits. S41 does its own anchor re-verify at its HEAD.)*
+- [x] **S41 — Dense M-6: free the embedding's VRAM for transformer layers on Llama-3.3-70B streamed — ✅ CLOSED 2026-10-12,
+      MEASURE ONLY, TRADE WORKS (+9.77 % decode, clears 5 % → build row warranted).** Embedding VRAM share measured at HEAD
+      `9457cc5`: **1.957 GiB** bf16 (the M-6 lead's "2.10 GB" was GB-vs-GiB); one transformer layer 0.4984 GiB; baseline pins
+      16/80 transformer layers + 3 shared (19), streams 64. Oracle (force CPU-resident embedding via the existing S14 E
+      `_install_cpu_resident_embedding`, minus its budget gate): **+4 resident transformer layers** (streamed 64 → 60 of 80,
+      +5.0 % of the per-token read removed), decode **3282.4 → 2961.7 ms/token (+9.77 %)**, bit-identical (max|d|=0, ids
+      identical), ABBA spread 0.03 % ≪ signal. Build (for the re-prioritise): "E for DENSE" in `_init_pinned_layers` phase 1,
+      gated on dense + CUDA + will-stream + embed ≥ one layer; must NOT fire when the budget holds the whole model (Llama-3.2-1B;
+      E-everywhere Qwen3-Next +1.14 %); verify dense gate on BOTH Llama + MoE green. Full row: `todo-backlog.md` "Closed after
+      the 2026-10-03 cleanup"; RESULTS `docs/2026-10-12-S41-dense-embedding-vram-RESULTS.md`.
 
 ---
 
