@@ -9958,3 +9958,27 @@ Row as it stood when it closed:
       ([[limit_run_and_stale_row_traps]]). §8: measure only, nothing banked, suite floor unchanged. RESULTS →
       `docs/2026-10-13-S44-deepseek-ld-mtp-RESULTS.md` (to be written). Full candidate-pool record: the post-S43
       re-prioritise block in the sequence section above.
+
+- [x] **S47 — MiniMax row-49 drive-idle gap: close with a number — MEASURE ONLY — CLOSED 2026-10-13 (USER-decided: close
+      now, no GPU run). Row 49 (MiniMax-M2.7 decode) is CLOSED; no build warranted; no engine code; suite floor unchanged
+      (4119 passed, 27 skipped).** HEAD `1dbcfaf`, tree clean. The brief's STOP-RULE measurement (step-1 decode split,
+      `h2d_pct`) was **already taken 2026-09-20** (backlog row 49, ~line 7462): `h2d` was 31.5 % of the token, H1 TRUE on
+      decode, and step 2A — the async-from-pinned-slab upload — **SHIPPED at +6.90 % decode**. That ship is live at HEAD,
+      re-verified this session: `moe_patch.py:1239` `_copy_async_ok(pinned_source, tensor, dtype)` (async iff page-locked
+      source AND no dtype cast), `:1253` `_inject_expert_weights(…, pinned_source=…)`, and `:1974` (the single module-list
+      decode/prefill call site) `pinned_source=_rd is not None` with `_rd = arena.slab_index_of(…)` + `arena.record_read`.
+      S36-item-5's MiniMax H2D census (2026-10-12, backlog #9) corroborates: pageable EXPERT H2D is GONE on MiniMax — all
+      129.2 GB of EXL3 expert uploads pinned/async, only residual pageable is `_pair_gpu` 0.016 GB. So the big removable
+      slice was ATTACKED AND WON, not shrunk out; the STOP RULE's purpose (is H2D worth attacking?) is moot.
+      **Drive-idle gap (the row's last open lever) — no realizable form clears row 35's ≥ +15 % N=1 re-open bar:** the
+      ≥ +31 % headline came from the "token collapses onto disk-busy time" arithmetic, which the read-shape arm FALSIFIED
+      (−66.7 % reads/token, rate 6.07 → 6.50 GB/s → −0.40 % decode, 2026-09-21); the only built gap-fill `VAAYU_LOOKAHEAD`
+      is +2.5 % MiniMax N=1 (−3.7 % N=3; server runs N=1), +18.0 % bytes/token, arithmetic ceiling ~+11 % on a 76 %-busy
+      drive; a fresh cross-layer prefetch (S11-L7) is already REFUTED on device (+5.56 %, S25, SETTLED). **CPU-hybrid half
+      CLOSED FOR GOOD:** +6.8 % Qwen3-235B arm unverifiable forever (model deleted); dead on Qwen3-Next (disk 0.4 %/token);
+      prize MiniMax-only (§5 asymmetry); +22.0 % an unexecuted arithmetic ceiling; EXL3 has no CPU kernel → re-quantise +
+      kernels + loader + dispatch = weeks. §8: measure-only, nothing built/banked; the one server-reachable lever
+      (`VAAYU_LOOKAHEAD`, N=1) is below the bar and stays hard-blocked at `check_lookahead_flag_safe`. **Re-open row 49 ONLY
+      on a measured ≥ +15 % on MiniMax at N=1 on a current build** (row 35's condition). RESULTS →
+      `docs/2026-10-13-S47-minimax-row49-drive-idle-RESULTS.md`; brief `docs/2026-09-20-row49-minimax-h2d-BRIEF.md`;
+      reference row `todo.md` "## 49".
