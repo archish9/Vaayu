@@ -92,7 +92,7 @@ closed accumulates in this file again.
 
 ---
 
-# ▶▶▶ THE SEQUENCE — S21…S43 (S21–S24 set 2026-10-03; S25–S26 set by the USER at S24, 2026-10-05; S27–S30 set by the USER at S26, 2026-10-06; S31 set by S26's rule when S30 closed, 2026-10-07; S32–S36 set by the USER at S31, 2026-10-07; S38–S41 set by the USER at S37, 2026-10-12; S42–S43 set by the USER at the post-S41 re-prioritise, 2026-10-12). One per fresh session, in order. **S21…S43 CLOSED (S43 MERGED `e457aea`). NEXT = re-prioritise with the USER** (its own fresh session — all sequenced rows S21…S43 are now closed). The post-S41 re-prioritise HAPPENED 2026-10-12: the USER picked "both, S40 first" → **S42 = S40 build (DeepSeek L-c residency-first, +15.04 % decode measured, DONE), S43 = S41 build (Dense M-6, free the embedding's VRAM, +9.77 % decode, DONE)**. ◀◀◀
+# ▶▶▶ THE SEQUENCE — S21…S43 (S21–S24 set 2026-10-03; S25–S26 set by the USER at S24, 2026-10-05; S27–S30 set by the USER at S26, 2026-10-06; S31 set by S26's rule when S30 closed, 2026-10-07; S32–S36 set by the USER at S31, 2026-10-07; S38–S41 set by the USER at S37, 2026-10-12; S42–S43 set by the USER at the post-S41 re-prioritise, 2026-10-12). One per fresh session, in order. **S21…S43 CLOSED (S43 MERGED `e457aea`). POST-S43 RE-PRIORITISE HAPPENED 2026-10-13: the USER picked "Spike DeepSeek L-d (MTP)" → S44 = price DeepSeek-V4's built-in MTP draft (measure-only). NEXT = S44, in its own fresh session.** The post-S41 re-prioritise HAPPENED 2026-10-12: the USER picked "both, S40 first" → **S42 = S40 build (DeepSeek L-c residency-first, +15.04 % decode measured, DONE), S43 = S41 build (Dense M-6, free the embedding's VRAM, +9.77 % decode, DONE)**. ◀◀◀
 
 **HOW A FRESH SESSION PICKS — no judgement needed:** take the **first row of the table that is not ✅**. Its durable
 row below IS the brief (write a handoff in `docs/superpowers/specs/` first only if the row needs more than it
@@ -194,6 +194,9 @@ the clean 0.45–0.56 ms/token before any build.
 | **S41** ✅ | ~~Dense M-6 — measure the embedding's VRAM share on Llama-3.3-70B streamed, then free it~~ — **CLOSED 2026-10-12: TRADE WORKS, +9.77 % decode, CLEARS 5 % → warrants a build row (sequence at post-S41 re-prioritise).** Embedding VRAM share measured at HEAD: **1.957 GiB** bf16 (row's "2.10 GB" was GB-vs-GiB); one transformer layer 0.4984 GiB; baseline pins 16/80 transformer layers + 3 shared (19), streams 64. Oracle (force CPU-resident embedding, exactly the S14 E branch minus its budget gate): **+4 resident transformer layers** (streamed 64 → 60 of 80, +5.0 % of the per-token read removed), decode **3282.4 → 2961.7 ms/token (+9.77 %)**, bit-identical (max\|d\|=0, ids identical), ABBA spread 0.03 % ≪ signal. MEASURE ONLY, no engine code, suite floor unchanged. Full row: the S41 durable row; `docs/2026-10-12-S41-dense-embedding-vram-RESULTS.md` | — | done |
 | **S42** ✅ | ~~Build S40's lever — DeepSeek L-c residency-first VRAM priority~~ — **CLOSED 2026-10-13: BUILT, MEASURED, VERIFIED, MERGED `51ca780` 2026-10-13 on the USER's word.** DeepSeek-V4 decode **+15.04 %** (420.2 → 357.0 ms/token, 2.38 → 2.80 tok/s), **bit-identical** (ids identical, max\|d\|=0), matching S40's oracle (43/43 pinned, tier 1.73 → 1.16 GB / 138 → 93). Lever: `residency_first_allows_pin` (pure, 6 unit tests) + `_resident_streamed_nonexpert_layers`, run at the expert-cache-creation free-VRAM snapshot (pin-time free over-states the tier ~2.9 GB). Model-agnostic (§5): working set = derived geometry, per-layer size read from the checkpoint, nothing hardcoded. No-op where non-expert layers already fit (MiniMax smoke 62/62, no-op; Qwen3-Next) or tier healthy; byte-identical dense (gate 5/5 both Llama). §8: no knob, N=1 server default, reaches server on load — SHIPPED, merged `51ca780`. Suite 4112. Full row: the S42 durable row; `docs/2026-10-13-S42-residency-first-pin-RESULTS.md` | *(b)* +15.04 % N=1 | done |
 | **S43** ✅ | ~~Build S41's lever — Dense M-6, free the embedding's VRAM~~ — **CLOSED 2026-10-13: BUILT, VERIFIED, MERGED `e457aea` 2026-10-13 on the USER's word.** `dense_embedding_frees_vram` (pure, `vram_plan.py`, 7 unit tests) + a gated branch in `_init_pinned_layers` phase 1 (`vaayu_base.py`) routes a streamed dense model's embedding to the existing S14 E `_install_cpu_resident_embedding`. **On-device dense gate 6/6 both Llama:** 70B fires → embed CPU-resident (2.10 GB, 0 VRAM), transformer pinned 16 → **20 (+4)**, streamed 64 → **60**, ppl 8.85, causality max\|d\|=0, greedy ×2 identical (= S41 oracle → the measured +9.77 % decode); 1B declines → embed VRAM-pinned, 16/16, 0 streamed (fits whole). MoE byte-identical (`not self.is_moe` + CUDA gate). Suite **4119 passed, 27 skipped**. §8: no knob (strict improvement under the gate), reaches server on load — SHIPPED. Full row: the S43 durable row; `docs/2026-10-13-S43-dense-embedding-vram-RESULTS.md` | *(b)* +9.77 % N=1 | done |
+| **S44** [ ] | **Spike DeepSeek L-d — price the built-in MTP draft (MEASURE ONLY).** DeepSeek-V4's token is now 72 % per-FORWARD bytes (S6), so a built-in MTP drafter could amortise that share like dense spec-decode (S42's residency makes the verify cheaper in bytes). The MTP module ships in the checkpoint but is DROPPED at load (`vaayu/model_code/deepseek_v4/checkpoint.py:28`; weights on disk `models/deepseek-v4-mtp-shards/`, `n_mtp_layers: 3`). Spec-decode machinery EXISTS — do not rebuild: `spec_decode_fits` (`vaayu/vaayu_base.py:215`), `AdaptiveSpecGate` (`vaayu/speculative/adaptive_gate.py:138`, `should_draft`/`_decide_acceptance`/`spec_breakeven_acceptance`), `_build_spec_gate` (`vaayu_base.py:6772`, wired in `speculative_generate` `:6861`). DeepSeek is module-list (NOT hybrid) → row-42b's hybrid closure and rows 41/42 (recurrent-state snapshot) do NOT apply. **Measure three things:** (1) MTP per-token **acceptance** at k (bar ≥ 0.87 @ k=5 for +10 %, `wall_breakeven_acceptance`); (2) **cold verify-forward cost** vs t_dec — the M>1 packed kernel is PREFILL-only, so a verify forward is classified as decode (`compute_prefill_pass`) and takes the slow per-slot loop (bar ≤ ~2× t_dec); (3) the **byte gate** — does `AdaptiveSpecGate` admit a drafting round at DeepSeek's budget (verify union vs budget; with experts resident post-S42 the extra positions cost ~0 disk bytes). **STOP RULE: acceptance < 0.87 AND cold verify > ~2× t_dec → L-d closes SETTLED.** Either bar met → warrants a BUILD row (sequenced at the next re-prioritise). §8: measure only, no engine code, throwaway probes; if built later it reaches the server via `USE_PROMPT_LOOKUP`/`DRAFT_TOKENS`/`DRAFTER_MODEL_PATH` (already plumbed, N=1). Durable brief below. | *(b)* unpriced N=1 | pending |
+
+**POST-S43 RE-PRIORITISE DECIDED 2026-10-13 by the USER** (its own fresh session; all sequenced rows S21…S43 closed, S42/S43 shipped the two clear N=1 wins). The re-prioritise session presented the candidate pool: **(a) Qwen3-Next (agent's model) is EMPTY of priced levers** — S38 confirmed GPU decode compute is the largest block and needs an algorithmic lever; prefetch REFUTED (S25), host tapped (S27/28/33), prefix+packed kernel shipped, budget maxed. **(b)** DeepSeek L-d MTP (unpriced, recorded gated), MiniMax row-49 drive-idle gap (headline +31 % IN DOUBT, read-shape arm refuted the rate assumption), mixed-bpw by hotness (row 38, likely closes on arithmetic). **(c)** gpt-oss eager-attention at long context (unpriced), gpt-oss stage-3 (parked ship, backlog #41). **(d)** G4 uniform-attention guard; current-CUDA-device (unreachable, single-GPU). Four options offered (spike L-d / spike gpt-oss eager-attention / ship gpt-oss stage-3 / pause the perf grind). **The USER picked "Spike DeepSeek L-d (MTP)" → S44.** The reason, by the ordering rule: tier *(a)* has no priced idea, so the biggest potential *(b)* N=1 win left is DeepSeek's dense-like per-forward amortise; a cheap measure-only spike decides a build either way. OUT of this round: a Qwen3-Next GPU-compute lever (no priced idea), MiniMax row 49 (headline in doubt), mixed-bpw (likely close-on-arithmetic), gpt-oss stage-3 (a ship, the USER previously parked), the bugs. **S44 runs in its OWN fresh session** (`fresh_session_per_row`); it closes its row, measures, updates this table, and STOPS. **When S44 closes, the next fresh session re-prioritises with the USER.**
 
 **S37 DECIDED 2026-10-12 by the USER:** all four candidate levers picked; after confirming, the USER took **the
 ordering-rule order (the session's recommendation)** — S38 Qwen3-Next census, S39 MiniMax silent-drop, S40 DeepSeek
@@ -217,7 +220,7 @@ re-verified at HEAD `046c9d3`: S40 → `plan_vram` (`vram_plan.py:759`, `pinning
 `_install_cpu_resident_embedding` (`vaayu_base.py:4564` on `main` after the S42 merge `51ca780`), wired in
 `_init_pinned_layers` (`:4631`, `:4662`). **S43 builds on S42 (now merged to `main`); re-verify these anchors at HEAD.**
 **Each row runs in its OWN fresh session** (`fresh_session_per_row`); a session closes its row, updates this table, pre-gathers the
-next row's inputs, and STOPS. **When S43 closes, the next fresh session re-prioritises with the USER.**
+next row's inputs, and STOPS. **S43 CLOSED 2026-10-13; the post-S43 re-prioritise HAPPENED (2026-10-13, above): S44 = DeepSeek L-d MTP spike. When S44 closes, the next fresh session re-prioritises with the USER.**
 
 ## Durable rows (the briefs)
 
@@ -458,6 +461,55 @@ next row's inputs, and STOPS. **When S43 closes, the next fresh session re-prior
       MoE byte-identical. Suite 4119 passed, 27 skipped. §8: no knob, reaches server on load. Full row:
       `todo-backlog.md` "Closed after the 2026-10-03 cleanup"; RESULTS `docs/2026-10-13-S43-dense-embedding-vram-RESULTS.md`.
 
+- [ ] **S44 — Spike DeepSeek L-d: price the built-in MTP draft on DeepSeek-V4 (MEASURE ONLY).** Picked by the USER at
+      the post-S43 re-prioritise (2026-10-13), tier *(b)*: the agent-model tier *(a)* has no priced lever (S38), and
+      DeepSeek's token is now **72 % per-FORWARD bytes** (S6) — dense-like — so a built-in MTP drafter could amortise
+      that share the way speculative decoding does on dense (row 12's 5.57× precedent). S42's residency-first pin makes
+      a verify cheaper in bytes (experts resident → extra draft positions cost ~0 extra disk bytes, the dominant
+      break-even term per backlog #28).
+
+      **Why this is open (not the refuted/closed spec-decode work):** DeepSeek-V4 is **module-list, NOT hybrid**, so
+      row 42(b)'s "CLOSED FOR HYBRIDS" and rows 41/42 (the recurrent-state snapshot a hybrid draft needs) **do not
+      apply**. The SETTLED latching/regime-detection questions (row 24, P7) are untouched by this. What is in question is
+      the **byte premise** and the **acceptance/verify cost** on DeepSeek, none of which has been measured.
+
+      **State at HEAD (re-verified 2026-10-13, `e457aea`):**
+      - The MTP module **ships in the checkpoint but is DROPPED at load**: `vaayu/model_code/deepseek_v4/checkpoint.py:28`
+        (`if key.startswith("mtp."): … return None`, "MTP draft module is excluded (user, 2026-09-23)"); the modeling runs
+        "without the MTP half" (`modeling_deepseek_v4.py:1561`). Weights are on disk: `models/deepseek-v4-mtp-shards/`
+        (shards 46–48 of 48, `mtp_weight_map.json`); config `n_mtp_layers: 3` (`mtp.0/1/2`), and `num_nextn_predict_layers`
+        in `config.json` is WRONG (says 1 — do not derive the skip from it; `configuration_deepseek_v4.py:99-102`).
+      - **Spec-decode machinery EXISTS — do NOT rebuild union-based sizing:** `spec_decode_fits(geometry, draft_tokens,
+        budget_bytes)` (`vaayu/vaayu_base.py:215`, the byte gate), `AdaptiveSpecGate` (`vaayu/speculative/adaptive_gate.py:138`:
+        `should_draft`, `observe`, `record_round`, `_decide_acceptance`, `spec_breakeven_acceptance` `:63`,
+        `wall_breakeven_acceptance` `:79`, `measured_acceptance` `:406`), `_build_spec_gate()` (`vaayu_base.py:6772`,
+        returns `AdaptiveSpecGate(geo, draft_tokens, cache.budget_bytes)`), wired in `speculative_generate` at `:6861`,
+        `should_draft()` checked at `:7015`. Knobs `USE_PROMPT_LOOKUP` / `DRAFT_TOKENS` / `DRAFTER_MODEL_PATH` are plumbed.
+      - DeepSeek serves from a plain download (S5); `vaayu/vaayu_deepseek_v4.py` registers it. Decode 1.78 tok/s (S15),
+        +15.04 % since S42. **Nothing may be written into its model dir** (§5 rule); the MTP shards are a SEPARATE dir.
+
+      **Measure three things (measure-only — a reference/library run is fine; snapshot the prompt per [[ttft_probe_ab_traps]]):**
+      1. **MTP per-token acceptance** at k (load the MTP module from the shards; run it as the drafter against the target's
+         own next tokens on a representative agent-like prompt). Bar: **≥ 0.87 at k=5** for +10 % (`wall_breakeven_acceptance`).
+         This is the dominant unknown and the cheapest to get — it can kill or green-light the row before any verify timing.
+      2. **Cold verify-forward cost vs t_dec.** The S20 M>1 packed kernel is **PREFILL-only**; a speculative verify forward
+         is classified as decode (`compute_prefill_pass`) and takes the **slow per-slot loop** (backlog #28, 2026-10-03). On
+         module-list DeepSeek a w=k+1 verify is w serial expert-read passes unless the resident-byte argument saves it. Bar:
+         **cold verify ≤ ~2× t_dec**.
+      3. **The byte gate.** Does `AdaptiveSpecGate`/`spec_decode_fits` admit a drafting round at DeepSeek's server budget
+         (observed verify union vs budget)? With experts resident post-S42, confirm the extra-position disk cost really is
+         ~0 (the break-even premise).
+
+      **STOP RULE: acceptance < 0.87 AND cold verify > ~2× t_dec → close L-d SETTLED** (record the numbers; it joins the
+      SETTLED list). **Either bar met → the trade warrants a BUILD row**, sequenced at the next re-prioritise (the build
+      would un-drop the MTP module at load behind a gate, wire it as the drafter, and the server reaches it via the
+      already-plumbed knobs). **Traps:** decode-ppl/acceptance is bit-sensitive — several draws ([[decode_ppl_bit_sensitive]]);
+      probe GC must freeze or say "library mode" ([[probe_gc_freeze_server_mode]]); ABBA / discard-a-warm-arm for in-process
+      multi-phase ([[abba_ordering_disk_bound_ab]]); server clamps `max_tokens`, so library-only refusals don't reach it
+      ([[limit_run_and_stale_row_traps]]). §8: measure only, nothing banked, suite floor unchanged. RESULTS →
+      `docs/2026-10-13-S44-deepseek-ld-mtp-RESULTS.md` (to be written). Full candidate-pool record: the post-S43
+      re-prioritise block in the sequence section above.
+
 ---
 
 # OPEN — not sequenced (re-rank at the re-prioritise row after S36; items taken by S32–S36 are tagged)
@@ -557,8 +609,11 @@ at HEAD before acting.
       baseline pins 40/43 non-expert layers, streams 3; expert VRAM tier 1.73 GB / 138 experts / 24 % hit. Pinning all 43
       (+0.667 GiB, tier → 1.16 GB / 93 / 23 %) gives 414.4 → 351.5 ms/token, bit-identical. Build = module-list planner
       rule (non-expert residency before the expert tier; model-agnostic). `docs/2026-10-12-S40-deepseek-lc-vram-priority-RESULTS.md`.
-- [ ] **L-d — DeepSeek's token is now 72 % per-FORWARD bytes**, like dense, so its built-in MTP draft would
-      amortise that share (row 37's re-gate).
+- [~] **L-d — DeepSeek's token is now 72 % per-FORWARD bytes**, like dense, so its built-in MTP draft would
+      amortise that share (row 37's re-gate). **= S44 (SEQUENCED 2026-10-13 by the USER at the post-S43 re-prioritise,
+      MEASURE ONLY): price MTP acceptance (≥ 0.87 @ k=5), cold verify (≤ ~2× t_dec) and the byte gate; stop rule and
+      anchors in the S44 durable brief.** DeepSeek is module-list (not hybrid) so row-42b does not block it; the MTP
+      module is on disk (`models/deepseek-v4-mtp-shards/`) but DROPPED at load (`deepseek_v4/checkpoint.py:28`).
 - [ ] (S34 STEP 0) DeepSeek prefill re-reads its experts once per chunk (6.7× at 4.3k; price a RAM-arena hold with a real-cache replay) — **moved to `todo-backlog.md` #42** 2026-10-12
 
 - [x] **= S34. DeepSeek-V4 has NO cross-turn prefix cache — ✅ CLOSED 2026-10-08 by S34** (appending turns served from the pool: 1k 10.26 s vs 51.08 s TTFT, 4k 11.33 s vs 165.00 s (one turn); branch `s34-deepseek-prefix-cache`, awaiting the merge). Full text: `todo-backlog.md` "Closed after the 2026-10-03 cleanup".
