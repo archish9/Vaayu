@@ -706,6 +706,36 @@ _VRAM_RESERVE_FLOOR_BYTES = int(3.5 * 1024 ** 3)
 _RESIDENCY_FIRST_PIN_MARGIN_BYTES = int(0.20 * 1024 ** 3)
 
 
+# S50 stage 3: a windowed load whose context is left to derive larger (parity
+# dropped, no static-tier protection) is derived against the reserve floor MINUS
+# this margin. plan_vram maximizes the context until its predicted peak equals the
+# reserve, which leaves nothing at admission: free-with-the-tier-emptied sits below
+# the load-time reserve by the allocator's reserved-but-noncontiguous slack and by
+# any permanent foreign GPU process (this box carries ~0.14 GiB), so the raw-derived
+# max_seq_len is advertised but REFUSED at its own full window (S50 limit run
+# 2026-10-13: predicted peak 11.09 GiB vs 11.05 GiB free with the tier emptied, a
+# 0.04 GiB shortfall on top of the 0.14 GiB foreign tax). Backing the derivation off
+# by this margin keeps the full-window request admissible. Hardware headroom, not a
+# model number (CLAUDE.md §5): 0.30 GiB covers the observed gap plus the foreign tax
+# with ~0.20 GiB to spare. Only the DERIVED context uses it; a user-set MAX_SEQ_LEN
+# is validated against s_max as before.
+_STAGE3_ADMISSION_MARGIN_BYTES = int(0.30 * 1024 ** 3)
+
+
+def stage3_derive_floor(*, reserve_floor: int, base_floor: int, raised: bool,
+                        requested_max_seq_len: int | None, margin: int) -> int:
+    """The reserve floor plan_vram should DERIVE the stage-3 context against.
+
+    On an elastic load whose context was raised (`raised`) and is being derived
+    (`requested_max_seq_len is None`), subtract `margin` so the full-window request
+    stays admissible once the elastic tier is emptied (see _STAGE3_ADMISSION_MARGIN_BYTES).
+    Never below `base_floor`, which is itself measured. Every other case -- a
+    user-requested length, or a non-raised load -- returns the floor unchanged."""
+    if raised and requested_max_seq_len is None:
+        return max(int(base_floor), int(reserve_floor) - int(margin))
+    return int(reserve_floor)
+
+
 # Hardware constant: RAM to leave for the OS + io_uring pools + post-sizing
 # host allocations when sizing the prefix-cache pool. Property of the 32 GB
 # box, NOT the model. Prefix caching borrows only what's comfortably free.
@@ -783,6 +813,37 @@ def compute_prefix_cache_budget(free_ram_bytes: int) -> int:
     """RAM bytes the cross-turn prefix-cache pool may hold (A1). Derived from
     free system memory minus a hardware headroom reserve. Model-agnostic."""
     return max(0, int(free_ram_bytes) - _PREFIX_CACHE_RAM_RESERVE)
+
+
+def stage3_parity_kv(*, kv_constant_bytes: int, score_elem_bytes: float,
+                     pooled_kv_per_token: int) -> int | None:
+    """The per-token KV cost at which the reserve floor prices flash-attention
+    parity, or None to search parity at the shape's own (cheaper, windowed) cost.
+
+    S35 held a windowed-cache load's parity at the full-length (pooled) KV cost so
+    the context stayed at its flash-derived operating point and the saving went to
+    a large static expert VRAM tier -- a choice made before an elastic tier existed.
+
+    S50 stage 3: a windowed load under a score-materializing kernel (eager/sdpa,
+    `score_elem_bytes > 0`) is ELASTIC. Windowed layers make decode graphs refuse
+    for the whole process (`decode_graphs.py`), so `build_elastic_tier`
+    (`elastic_tier.py`) builds a tier that lends the reserve up for shorter
+    requests. So the context is left to DERIVE larger (~40,442, +22 % on gpt-oss)
+    by returning None, instead of being held to protect a static tier.
+
+    Model-agnostic -- every input is derived (CLAUDE.md §5). A non-windowed load
+    (`kv_constant_bytes <= 0`) has no ring to price and returns None, as before.
+    A windowed load under flash (`score_elem_bytes <= 0`) keeps the pooled value;
+    `reserve_floor_bytes` ignores parity under flash, so this is the pre-S50 value
+    unchanged. The one theoretical elastic-INELIGIBLE windowed load -- a speculator
+    or a KV cache preallocated at max_seq_len, neither known at plan time and
+    neither present today -- is flagged loudly by the post-load WARN after
+    `_build_elastic_tier`, not handled here."""
+    if int(kv_constant_bytes) <= 0:
+        return None
+    if float(score_elem_bytes) > 0:
+        return None
+    return int(pooled_kv_per_token)
 
 
 def batch_union_per_layer(geometry: dict, n_streams: int) -> int:
@@ -2848,7 +2909,15 @@ class VaayuBaseModel(GenerationMixin):
             # every other load: the old path, byte for byte. The rule applies under a
             # score-materializing kernel (eager / sdpa); on flash the reserve is the
             # base floor and the saving goes to context.
-            _parity_kv = self.pooled_kv_bytes_per_token() if _kv_constant else None
+            # S50 stage 3: an elastic load (windowed layers under a score-
+            # materializing kernel -- gpt-oss today) leaves its context to derive
+            # larger instead of protecting a static tier at the full-length KV cost;
+            # the elastic tier lends the reserve up for shorter requests. See
+            # stage3_parity_kv and the post-load WARN after _build_elastic_tier.
+            _parity_kv = stage3_parity_kv(
+                kv_constant_bytes=_kv_constant, score_elem_bytes=_score_per_elem,
+                pooled_kv_per_token=self.pooled_kv_bytes_per_token() if _kv_constant else 0)
+            self._stage3_context_raised = bool(_kv_constant) and _score_per_elem > 0
             if _parity_kv is not None and _score_per_elem > 0:
                 print(f"[Vaayu-VRAM] context target priced at the full-length KV cost "
                       f"({_parity_kv / 1024:.1f} KiB/token); "
@@ -2859,6 +2928,13 @@ class VaayuBaseModel(GenerationMixin):
                 layer_slack=_layer_slack, protected_bytes=_protected,
                 requested_max_seq_len=max_seq_len,
                 parity_kv_per_token=_parity_kv)
+            # S50: when stage 3 raised the context (parity dropped), derive it with
+            # admission headroom so the full window is serviceable, not just the
+            # largest context that fits the reserve (see _STAGE3_ADMISSION_MARGIN_BYTES).
+            _derive_floor = stage3_derive_floor(
+                reserve_floor=_reserve_floor, base_floor=_VRAM_RESERVE_FLOOR_BYTES,
+                raised=self._stage3_context_raised, requested_max_seq_len=max_seq_len,
+                margin=_STAGE3_ADMISSION_MARGIN_BYTES)
             self._vram_plan = plan_vram(
                 free_vram=_free_vram, shape=_shape,
                 min_resident=_min_resident,
@@ -2866,7 +2942,7 @@ class VaayuBaseModel(GenerationMixin):
                 position_limit=getattr(self.config, "max_position_embeddings",
                                        2 ** 31 - 1),
                 layer_slack=_layer_slack,
-                reserve_floor=_reserve_floor)
+                reserve_floor=_derive_floor)
             self._vram_shape = _shape      # Task 8's predicate re-uses it at N>1
             self.max_seq_len = self._vram_plan.max_seq_len
             # expert_vram_budget_for at this same free-VRAM snapshot -- the
@@ -3673,19 +3749,32 @@ class VaayuBaseModel(GenerationMixin):
         if (tier is None or plan is None or shape is None
                 or not torch.cuda.is_available()
                 or not str(self.device).startswith("cuda")):
-            return None
-        from .elastic_tier import build_elastic_tier
-        return build_elastic_tier(
-            tier=tier, plan=plan, shape=shape, base_floor=_VRAM_RESERVE_FLOOR_BYTES,
-            expert_bytes=self._moe_geometry["expert_bytes"],
-            decode_graphs=getattr(self, "_decode_graphs", None) is not None,
-            speculator=getattr(self, "speculator", None) is not None,
-            kv_preallocated=self.kv_cache_preallocated(),
-            driver_free=lambda: torch.cuda.mem_get_info()[0],
-            empty_cache=torch.cuda.empty_cache,
-            allocated=torch.cuda.memory_allocated,
-            on_budget=lambda budget: set_tier_layer_range(self, budget),
-            prefill_chunk_size=self.prefill_chunk_size)
+            elastic_tier = None
+        else:
+            from .elastic_tier import build_elastic_tier
+            elastic_tier = build_elastic_tier(
+                tier=tier, plan=plan, shape=shape, base_floor=_VRAM_RESERVE_FLOOR_BYTES,
+                expert_bytes=self._moe_geometry["expert_bytes"],
+                decode_graphs=getattr(self, "_decode_graphs", None) is not None,
+                speculator=getattr(self, "speculator", None) is not None,
+                kv_preallocated=self.kv_cache_preallocated(),
+                driver_free=lambda: torch.cuda.mem_get_info()[0],
+                empty_cache=torch.cuda.empty_cache,
+                allocated=torch.cuda.memory_allocated,
+                on_budget=lambda budget: set_tier_layer_range(self, budget),
+                prefill_chunk_size=self.prefill_chunk_size)
+        # S50 stage 3: the plan left a windowed + score-materializing load's context to
+        # derive larger, on the premise that an elastic tier would lend the raised
+        # reserve back for shorter requests. If none was built -- the one theoretical
+        # elastic-ineligible windowed load (a speculator, or a KV cache preallocated at
+        # max_seq_len) -- the reserve sits unlent and the tier is stuck at its small
+        # static base, so say so loudly rather than degrade silently (CLAUDE.md §5).
+        if getattr(self, "_stage3_context_raised", False) and elastic_tier is None:
+            print(f"[Vaayu-VRAM] WARNING: context was derived to {self.max_seq_len} tokens "
+                  f"for a windowed load expecting an elastic expert tier, but no elastic "
+                  f"tier was built, so the expert VRAM tier stays at its small static base "
+                  f"and short-context decode is slower. Set MAX_SEQ_LEN to cap the context.")
+        return elastic_tier
 
     # if derived class needs to create generation config differently, like Mistrial, this function can be overridden
     def get_generation_config(self):
