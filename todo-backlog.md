@@ -48,7 +48,7 @@ Status keys, as in `todo.md`: `[ ]` pending · `[~]` in progress · `[!]` blocke
 | 32 | The fused forward's twin cast (`_expert_dense_weights` casts streamed tensors) — `[!]` | A5.7c record | BLOCKED 2026-09-25, decided out of scope by the USER; unreachable by any model on disk (gpt-oss takes the whole-layer / routed forward) | per-expert MXFP4 streaming goes through `_make_fused_sparse_forward` (row 47's A6), or a model that needs the cast lands on that forward |
 | 33 | P10 batching — the sentinel-only cancel test `[bug]` and the known-open batching minors | Carried out of row 15 | N>1 only: the server runs `MAX_BATCH_SIZE = 1` (CLAUDE.md §8) | `batched_generate` is wired into the server |
 | 34 | gpt-oss's FIRST session in a process is not run-to-run deterministic | S14 3c record | greedy ids equal; logits differ run to run on the first session only; later sessions are bit-identical | determinism of the first request matters (its own text) |
-| 35 | Row 47 A6 remainder — drop the Hub kernel dependency (`triton_kernels_hub` is fetched from the Hub on first run) | row 47 program table | A6's substance (move only the routed experts, 1.27 GB/token instead of 10.17 GB) was delivered by S8's routed delivery; only the network dependency at first load remains | an offline install is required, or the Hub dependency breaks a load |
+| 35 | Row 47 A6 remainder — drop the Hub kernel dependency (`triton_kernels_hub` is fetched from the Hub on first run) — **UN-PARKED → `todo.md` S51 2026-10-13** | row 47 program table | A6's substance (move only the routed experts, 1.27 GB/token instead of 10.17 GB) was delivered by S8's routed delivery; only the network dependency at first load remains | **UN-PARKED 2026-10-13 by the USER ("sequence #35 and ship it") → sequenced as `todo.md` S51** |
 | 36 | S29 lead — the 40 % "cacheable" rule does not fit a cyclic per-token stream | S29 (added 2026-10-07) | seen only in configs no default load reaches today: with the dense layer cache OFF (`RAM_CACHE_BUDGET_GB=0`, non-default) Llama-3.3-70B goes buffered at "50 %" and the page cache served ~5.5 %; not measured against O_DIRECT there | a default load prints `Sufficient RAM` for a model that streams per token and does not fit the page cache whole, or a user runs a streamed dense model with `RAM_CACHE_BUDGET_GB=0` |
 | 37 | S30 — batching design: make N>1 reachable through the server | S30 row (PARKED by the USER 2026-10-07) | N>1 only: the server runs `MAX_BATCH_SIZE = 1`, and no client sends Vaayu concurrent requests (RudraAnvil has no Vaayu reference and runs its subagents one at a time) — worth 0 % to users today (CLAUDE.md §8) | a client that sends concurrent requests targets Vaayu (Rudra depends on Vaayu and fans out), or the USER asks |
 | 38 | I4-b — batched store-back stores a ragged entry after an error | I4 final review (added 2026-10-08) | N>1 only: `batched_generate` runs only with `MAX_BATCH_SIZE >= 2` + sdpa (not the default); worth 0 % to users today (CLAUDE.md §8) | `batched_generate` is wired into the server, i.e. with #37 |
@@ -999,9 +999,11 @@ Full original text, as it stood in `todo.md`:
 
 ## 35. Row 47 A6 remainder — drop the Hub kernel dependency (`triton_kernels_hub` is fetched from the Hub on first run)
 
+**→ UN-PARKED 2026-10-13 by the USER ("sequence #35 and ship it in fresh session"); now the sequenced row S51 in `todo.md` — this section is the pointer to where it came from.**
+
 *Moved from `todo.md` (row 47 program table) 2026-10-03, in the USER-requested cleanup (todo.md now holds only pending work).*
 **Why here:** A6's substance (move only the routed experts, 1.27 GB/token instead of 10.17 GB) was delivered by S8's routed delivery; only the network dependency at first load remains.
-**Re-open when:** an offline install is required, or the Hub dependency breaks a load.
+**Re-open when:** an offline install is required, or the Hub dependency breaks a load. **(DONE — un-parked → S51.)**
 
 Full original text, as it stood in `todo.md`:
 
