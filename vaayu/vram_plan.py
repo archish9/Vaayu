@@ -900,6 +900,40 @@ def expert_vram_budget_for(plan: VramPlan, free_vram_now: int) -> int:
     return max(0, int(free_vram_now) - plan.reserve_bytes)
 
 
+def residency_first_allows_pin(*, used: int, size: int, budget: int,
+                               free_vram: int, reserve: int,
+                               working_set_bytes: int, margin: int) -> bool:
+    """Whether to pin ONE MORE non-expert transformer layer into VRAM (S42).
+
+    Builds S40's lever: a non-expert transformer layer streams on EVERY decode
+    token (100 % read), so per byte it weakly dominates an expert slot (read at
+    most 100 % of the time). Making it VRAM-resident, at the expense of
+    expert-VRAM-tier capacity, is therefore never worse on steady-state H2D --
+    EXCEPT for the LRU cliff: shrinking a tier that still holds one routed
+    working set below that set collapses its hit rate super-linearly. So:
+
+      * `fits_b0` -- the layer fits under the original pinning_budget: ALWAYS
+        pin. This is today's behaviour, byte-for-byte. A model whose non-expert
+        layers already all fit never leaves this branch (no-op).
+      * past the budget, pin only while the expert tier is ALREADY BELOW one
+        working set (`thrashing`: its marginal experts re-stream from disk
+        regardless) AND the pin keeps `margin` free above the reserve
+        (`fits_vram`). A tier at or above one working set is a real cache and is
+        left at its floor.
+
+    `used` is bytes pinned so far; `size` the next layer's bytes; `free_vram`
+    the device free bytes snapshotted before pinning; `reserve` the plan's
+    reserve. Pure and model-agnostic (CLAUDE.md §5): every number is derived by
+    the caller, none hardcoded here. The expert VRAM cache, funded later from
+    the post-pinning physical free VRAM, shrinks by exactly what this pins.
+    """
+    fits_b0 = used + size <= budget
+    tier_now = free_vram - used - reserve            # expert tier BEFORE this layer
+    thrashing = tier_now < working_set_bytes
+    fits_vram = free_vram - (used + size) - reserve >= margin
+    return fits_b0 or (thrashing and fits_vram)
+
+
 def peak_envelope_bytes(shape: VramShape, S: int) -> int:
     """Largest predicted peak over EVERY context length up to S, in bytes.
 

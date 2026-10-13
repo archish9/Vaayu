@@ -698,6 +698,13 @@ def slab_arena_exhausted_warning(err: Exception) -> str:
 # regardless of how short the context is.
 _VRAM_RESERVE_FLOOR_BYTES = int(3.5 * 1024 ** 3)
 
+# S42 (residency-first pinning): VRAM kept free above the reserve when the
+# pin phase extends PAST pinning_budget to resident the last streamed
+# non-expert layers. A hardware safety margin against the expert-cache-creation
+# and first-prefill transients that allocate just after pinning. 0.20 GiB is the
+# margin S40's oracle used, which ran bit-identical with no OOM on DeepSeek-V4.
+_RESIDENCY_FIRST_PIN_MARGIN_BYTES = int(0.20 * 1024 ** 3)
+
 
 # Hardware constant: RAM to leave for the OS + io_uring pools + post-sizing
 # host allocations when sizing the prefix-cache pool. Property of the 32 GB
@@ -3392,6 +3399,14 @@ class VaayuBaseModel(GenerationMixin):
             if torch.cuda.is_available() and str(self.device).startswith("cuda"):
                 from .vram_plan import expert_vram_budget_for
                 _free_vram, _ = torch.cuda.mem_get_info()
+                # S42 residency-first: a non-expert transformer layer streams every
+                # token (100 % read) and so dominates, per byte, an expert slot it
+                # would displace -- UNLESS that displaces a tier still holding one
+                # routed working set. Resident any still-streamed non-expert layers
+                # here, at the SAME free-VRAM snapshot the tier is sized from, so the
+                # thrash gate sees the tier's real size and the budget below shrinks
+                # by exactly what this pins.
+                _free_vram = self._resident_streamed_nonexpert_layers(_free_vram)
                 _vram_budget = expert_vram_budget_for(self._vram_plan, _free_vram)
                 if _vram_budget >= self._moe_geometry["expert_bytes"]:
                     self._expert_vram_cache = ExpertVRAMCache(
@@ -4770,6 +4785,76 @@ class VaayuBaseModel(GenerationMixin):
             f"{non_expert_xformer} non-expert-pinned transformer, "
             f"{used / 1e9:.2f} GB reserved"
         )
+
+    def _resident_streamed_nonexpert_layers(self, free_now: int) -> int:
+        """S42 — resident any still-streamed non-expert transformer layers while the
+        expert VRAM tier is thrashing, returning the updated free VRAM.
+
+        Builds S40's measured lever (+15.18 % on DeepSeek-V4). Runs at the
+        expert-cache-creation free-VRAM snapshot — the SAME basis the tier is sized
+        from — because the tier's real size is only known here, after the pin phase
+        and all other post-pin allocations (pin-time free over-states it by a few GB).
+        Each pin shrinks the tier by exactly its bytes, so `expert_vram_budget_for`
+        below sizes the cache from the reduced free.
+
+        Decision per layer: `residency_first_allows_pin` with budget=0 (phase 2 has
+        already spent pinning_budget). It pins only while the tier (free−reserve) is
+        below one routed working set AND a VRAM safety margin is kept above the
+        reserve — so a model whose tier still holds one working set is left untouched,
+        and a model whose non-expert layers already all fit never reaches here.
+        Model-agnostic (§5): working set is derived geometry, per-layer size is read
+        from the checkpoint; nothing hardcoded. Compute is unchanged → decode stays
+        bit-identical.
+        """
+        if not (self.is_moe and getattr(self, "_expert_offset_index", None) is not None):
+            return free_now
+        if self._vram_plan is None:
+            return free_now
+        layer_prefix = self.layer_names_dict["layer_prefix"]
+        model_attr = self.model
+        for attr_name in layer_prefix.split("."):
+            model_attr = getattr(model_attr, attr_name)
+        total_layers = len(model_attr)
+        resident = self.pinned_layer_names | self.non_expert_pinned_layer_names
+        streamed = [f"{layer_prefix}.{i}" for i in range(total_layers)
+                    if f"{layer_prefix}.{i}" not in resident]
+        if not streamed:
+            return free_now
+        reserve = int(self._vram_plan.reserve_bytes)
+        working_set = int(self._moe_geometry["working_set_bytes"])
+        from .vram_plan import residency_first_allows_pin
+        pinned_now = 0
+        for layer_name in streamed:
+            try:
+                tensors = self._load_non_expert_strategy(layer_name)
+                size = sum(t.nbytes for t in tensors.values())
+            except Exception as e:
+                print(f"[Vaayu-Pin] residency-first skip {layer_name}: {e}")
+                continue
+            if not residency_first_allows_pin(
+                    used=0, size=size, budget=0,
+                    free_vram=int(free_now), reserve=reserve,
+                    working_set_bytes=working_set,
+                    margin=_RESIDENCY_FIRST_PIN_MARGIN_BYTES):
+                break
+            try:
+                self.loader_strategy.inject_to_gpu(
+                    self.model, layer_name, tensors,
+                    self.running_device, self.running_dtype,
+                    self.hf_quantizer, getattr(self, "_path_remappings", {}),
+                )
+            except Exception as e:
+                print(f"[Vaayu-Pin] residency-first inject failed {layer_name}: {e}")
+                break
+            self.non_expert_pinned_layer_names.add(layer_name)
+            pinned_now += 1
+            free_now, _ = torch.cuda.mem_get_info()
+        if pinned_now:
+            print(f"[Vaayu-MoE] residency-first: pinned {pinned_now} streamed "
+                  f"non-expert layer(s) ahead of the expert tier "
+                  f"(tier below one {working_set / 1e9:.2f} GB working set); "
+                  f"free now {free_now / 1e9:.2f} GB")
+        return free_now
 
     def _prepopulate_ram_cache(self) -> None:
         """Load cacheable layers from NVMe into RAM before the first inference token.
