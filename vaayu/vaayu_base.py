@@ -4614,6 +4614,35 @@ class VaayuBaseModel(GenerationMixin):
               f"RAM, 0 VRAM (the pinning budget cannot hold it)")
         return True
 
+    def _dense_transformer_layer_size(self) -> tuple[int, int]:
+        """(bytes of one transformer layer, total transformer layers) for the S43
+        embedding-free decision.
+
+        Sizes layer 0 by loading then dropping it -- dense transformer layers are
+        homogeneous (the phase-2 comment: "break on budget miss (homogeneous
+        size)"), so one layer stands for all. Returns (0, 0) when it cannot size,
+        which makes `dense_embedding_frees_vram` decline, so the embedding pins
+        exactly as before. The ~0.5 GB read is one-off at load; phase 2 reloads
+        layer 0 anyway.
+        """
+        layer_prefix = self.layer_names_dict["layer_prefix"]
+        model_attr = self.model
+        for attr_name in layer_prefix.split("."):
+            model_attr = getattr(model_attr, attr_name)
+        total_layers = len(model_attr)
+        if total_layers <= 0:
+            return 0, 0
+        try:
+            tensors = self.loader_strategy.load_from_disk(
+                f"{layer_prefix}.0", self.checkpoint_path)
+            size = sum(int(t.nbytes) for t in tensors.values())
+            del tensors
+            return size, total_layers
+        except Exception as e:
+            print(f"[Vaayu-Pin] S43: could not size a transformer layer ({e!r}); "
+                  f"the embedding pins normally")
+            return 0, total_layers
+
     def _init_pinned_layers(self) -> None:
         """
         Pre-load layers into VRAM using two-phase asymmetric pinning.
@@ -4654,6 +4683,24 @@ class VaayuBaseModel(GenerationMixin):
                           f"(CLAUDE.md §5: warn, never silently degrade).")
                     continue
                 size = sum(t.nbytes for t in tensors.values())
+                # S43 (M-6): on a streamed dense CUDA load, hold the embedding on
+                # the CPU so its VRAM funds MORE resident transformer layers (S41:
+                # Llama-3.3-70B decode +9.77 %, bit-identical; freeing 1.957 GiB
+                # bought +4 layers). Decided HERE, before the embedding is pinned,
+                # because its would-be VRAM is exactly what phase 2 then spends on
+                # layers. Gated so a model the budget holds whole (Llama-3.2-1B)
+                # keeps the embedding VRAM-pinned (no streaming -> no gain), and MoE
+                # is untouched (E-everywhere cost Qwen3-Next +1.14 %).
+                if (layer_name == self.layer_names_dict["embed"]
+                        and not self.is_moe
+                        and str(self.running_device).startswith("cuda")):
+                    from .vram_plan import dense_embedding_frees_vram
+                    _per_layer, _total = self._dense_transformer_layer_size()
+                    if dense_embedding_frees_vram(
+                            embed_bytes=size, per_layer_bytes=_per_layer,
+                            total_layers=_total, budget=budget) \
+                            and self._install_cpu_resident_embedding(tensors):
+                        continue
                 if used + size > budget:
                     # S14 E: an embedding the budget cannot hold would stream
                     # every token; hold it on the CPU instead.

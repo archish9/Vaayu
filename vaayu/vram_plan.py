@@ -934,6 +934,43 @@ def residency_first_allows_pin(*, used: int, size: int, budget: int,
     return fits_b0 or (thrashing and fits_vram)
 
 
+def dense_embedding_frees_vram(*, embed_bytes: int, per_layer_bytes: int,
+                               total_layers: int, budget: int,
+                               shared_other_bytes: int = 0) -> bool:
+    """Whether to hold a DENSE model's embedding on the CPU to free its VRAM (S43).
+
+    Builds S41's lever (M-6): on a streamed dense CUDA load the pin phase
+    VRAM-pins the embedding (one row served per token), then phase 2 fills the
+    budget with transformer layers and the rest STREAM (~37 GB read/token on
+    Llama-3.3-70B). Held on the CPU (S14 E, `CpuResidentEmbedding`) the
+    embedding costs 0 VRAM and only one row crosses PCIe, so its bytes convert
+    to MORE resident transformer layers. S41 measured decode +9.77 %
+    (3282.4 -> 2961.7 ms/token, bit-identical) by freeing 1.957 GiB for +4
+    layers (streamed 64 -> 60 of 80).
+
+    Fire ONLY when both hold:
+      * the pinning budget cannot hold the whole model
+        (`embed + shared_other + total_layers * per_layer > budget`) -- so
+        phase 2 STREAMS >= 1 transformer layer anyway and the freed bytes become
+        resident layers. A model the budget holds whole (Llama-3.2-1B) keeps the
+        embedding VRAM-pinned exactly as before: no streaming, no gain.
+      * the embedding is at least one transformer layer in size
+        (`embed_bytes >= per_layer_bytes`) -- so freeing it buys >= 1 layer.
+
+    Pure and model-agnostic (CLAUDE.md §5): every number is derived by the caller
+    (embed/shared sizes from their tensors, per-layer size loaded from the
+    checkpoint, `total_layers` from the module tree, `budget` from the plan);
+    none is hardcoded. `shared_other_bytes` (norm + lm_head) is optional and only
+    ever tightens the fit -- omitting it is conservative (leans toward "fits", no
+    fire). The caller also gates on dense + CUDA before calling this.
+    """
+    if per_layer_bytes <= 0 or total_layers <= 0 or budget <= 0:
+        return False
+    whole_model = embed_bytes + shared_other_bytes + total_layers * per_layer_bytes
+    will_stream = whole_model > budget
+    return will_stream and embed_bytes >= per_layer_bytes
+
+
 def peak_envelope_bytes(shape: VramShape, S: int) -> int:
     """Largest predicted peak over EVERY context length up to S, in bytes.
 

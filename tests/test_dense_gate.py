@@ -125,6 +125,42 @@ def test_load_is_dense(client):
     assert model._moe_geometry is None, "a dense load built an MoE geometry"
 
 
+def test_embedding_cpu_residency_matches_streaming(client):
+    """S43 (M-6): on a streamed dense CUDA load the embedding is CPU-resident; on
+    a model the budget holds whole it stays VRAM-pinned.
+
+    The gate's observable contract, per-checkpoint: freeing the embedding only
+    helps when phase 2 streams transformer layers (the freed VRAM becomes
+    resident layers). So on CUDA dense,
+        embedding CPU-resident  <==>  at least one transformer layer streams.
+    Llama-3.2-1B fits whole (0 streamed -> VRAM-pinned); Llama-3.3-70B-exl3
+    streams (64/80 before S43 -> CPU-resident, +4 layers, S41). Seen to fail on
+    the 70B before S43 wired this (embedding VRAM-pinned while 64 layers stream).
+    """
+    model = client.app.state.engine.model
+    prefix = model.layer_names_dict["layer_prefix"]
+    model_attr = model.model
+    for a in prefix.split("."):
+        model_attr = getattr(model_attr, a)
+    total = len(model_attr)
+    pinned = set(model.pinned_layer_names)
+    pinned_transformer = [i for i in range(total) if f"{prefix}.{i}" in pinned]
+    streamed = [i for i in range(total) if f"{prefix}.{i}" not in pinned]
+    embed_cpu = type(model.layers[0]).__name__ == "CpuResidentEmbedding"
+    running_cuda = str(model.running_device).startswith("cuda")
+
+    print(f"\n[dense-gate] residency: cuda={running_cuda}, "
+          f"transformer pinned={len(pinned_transformer)}/{total}, "
+          f"streamed={len(streamed)}, embed_cpu_resident={embed_cpu}")
+
+    if not running_cuda:
+        pytest.skip("S43 embedding-free gate is CUDA-only")
+    assert embed_cpu == (len(streamed) > 0), (
+        f"S43 gate: embed_cpu_resident={embed_cpu} but {len(streamed)} transformer "
+        f"layers stream. On CUDA dense the two must agree: a streamed model frees "
+        f"the embedding (more resident layers); a model that fits keeps it pinned.")
+
+
 def test_teacher_forced_perplexity_under_ceiling(client):
     """Coherence: the dense forward scores plain English like a language model."""
     import torch

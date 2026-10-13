@@ -59,6 +59,14 @@ class _Model:
     def _install_cpu_resident_embedding(self, tensors=None):
         return VaayuBaseModel._install_cpu_resident_embedding(self, tensors)
 
+    def _dense_transformer_layer_size(self):
+        # S43: this double carries NO transformer layers (max_pinned_layers=0,
+        # phase 2 never runs), so there is nothing to size. (0, 0) makes the S43
+        # `dense_embedding_frees_vram` predicate decline, which is correct here --
+        # these tests exercise the S14 E phase-1 paths (over-budget / zero-budget /
+        # fits), all unchanged by S43.
+        return 0, 0
+
 
 def _src(dtype=torch.float32):
     return torch.arange(ROWS * 4, dtype=torch.float32).reshape(ROWS, 4).to(dtype)
