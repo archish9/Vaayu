@@ -214,7 +214,9 @@ rankable N=1 lever — its GPU decode compute is now the largest block and needs
 round (unchanged from S37): a Qwen3-Next GPU-compute lever (no priced idea), DeepSeek L-d MTP draft (blocked on backlog
 #2), gpt-oss stage-3 (backlog #41), the MiniMax row-49 gap (headline in doubt), the minors. Build-candidate anchors
 re-verified at HEAD `046c9d3`: S40 → `plan_vram` (`vram_plan.py:759`, `pinning_budget` at `:805`); S41 →
-`_install_cpu_resident_embedding` (`vaayu_base.py:4549`), wired in `_init_pinned_layers` (`:4616`, `:4647`). **Each row
+`_install_cpu_resident_embedding` (`vaayu_base.py:4549` on `main`; `:4564` on the S42 branch `e0e4068`, +15 from the
+S42 constant + method), wired in `_init_pinned_layers` (`main` `:4616`/`:4647`; branch `:4631`/`:4662`). **S43 builds on
+S42 — start it from the S42 branch (or from `main` once S42 merges); re-verify these anchors at that HEAD.** **Each row
 runs in its OWN fresh session** (`fresh_session_per_row`); a session closes its row, updates this table, pre-gathers the
 next row's inputs, and STOPS. **When S43 closes, the next fresh session re-prioritises with the USER.**
 
