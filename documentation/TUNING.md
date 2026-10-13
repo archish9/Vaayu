@@ -231,21 +231,21 @@ attention implementation:
   requested `max_seq_len` below flash parity caps that parity, so the floor falls and the
   difference goes back to pinning and the expert cache (since S15 L-b, 2026-10-01). Above
   flash parity the floor does not move; a longer request (up to `S_max`) is still planned
-  and its larger reserve comes out of pinning and the expert cache. On gpt-oss-20b: `None`
-  → 33,213 tokens, 184 experts in the VRAM tier, 8k decode 60.1 ms/token; a 40,442-token
-  plan → 3 experts, 85.6 ms/token. (Those are the tier's STATIC sizes — what it holds while
-  a request runs at the full window. Since 2026-10-10 the tier on such a load is sized to
-  the running request and an 8k request decodes faster than that; see "The expert VRAM tier
-  follows the running request" below.) The floor is also never allowed to take the pin budget
-  an MoE load's non-expert weights need (`protected pin demand` in the load log).
-  gpt-oss is the eager example: its floor is the parity floor priced at the full-length KV
-  cost of its cache (8.77 GiB at the derived 33,213 tokens; the pinning budget is 5.59 GiB,
-  so the 3.35 GiB protected demand does not bind), so a shorter request returns VRAM, and a
-  LONGER one (up to `S_max`) is allowed and costs the expert tier: `None` gives a static
-  tier of 184 experts (8k decode 60.1 ms/token with the tier held at that size); a
-  40,442-token plan gives 3 (85.6 ms/token, measured at a derived 40,442-token plan) — static
-  sizes again: with the tier sized to the request, a 40,442-token plan decodes an 8k request at
-  45.0 ms/token (below). A MoE load whose
+  and its larger reserve comes out of pinning and the expert cache. The floor is also never
+  allowed to take the pin budget an MoE load's non-expert weights need (`protected pin demand`
+  in the load log).
+  gpt-oss is the eager example. Through 2026-10-10 its floor was priced at the full-length KV
+  cost of its cache, which held `None` at 33,213 tokens with a large static expert VRAM tier
+  (184 experts, 8k decode 60.1 ms/token). **Since S50 (2026-10-13) an elastic gpt-oss load
+  derives context instead of protecting that static tier:** the full-length-parity pricing is
+  dropped, so `None` derives **~39,420 tokens** (+19 %) with a small static base (~27 experts)
+  and the elastic tier lends the rest up for shorter requests — 8k decode **~45 ms/token**,
+  logits bit-identical to stock (64/64). The derived context is backed off from the raw
+  planner maximum (~40,956) by a 0.30 GiB admission margin so the full window stays serviceable
+  (without it the advertised context was refused at its own full window: predicted peak 11.09
+  GiB vs 11.05 GiB free with the tier emptied, plus a permanent foreign-GPU-process tax). A
+  longer `MAX_SEQ_LEN` (up to `S_max`) is still allowed and costs the static base further. A
+  MoE load whose
   floor is already held at the 3.50 GiB base by that protection gets **nothing** back from
   a shorter context: DeepSeek-V4 today (its 8.24 GiB protected demand exceeds the 7.82 GiB
   above the base floor; requests of None / 32,768 / 16,384 / 4,096 all plan floor 3.50,

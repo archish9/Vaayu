@@ -158,7 +158,7 @@ def test_parity_at_the_full_length_cost_keeps_the_context_and_lowers_the_reserve
     floor, plan = _gptoss_floor_and_plan(None, 49152)
     assert floor == 9_415_222_559
     assert (plan.max_seq_len, plan.reserve_bytes) == (33213, 9_415_222_559)
-    _floor_b, plan_b = _gptoss_floor_and_plan(None, None)          # today's rule = arm B
+    _floor_b, plan_b = _gptoss_floor_and_plan(None, None)          # S50 default = arm B (parity dropped)
     assert (plan_b.max_seq_len, plan_b.reserve_bytes) == (40443, 11_787_182_646)
 
 
@@ -167,6 +167,59 @@ def test_more_context_stays_one_knob_away():
     assert (plan.max_seq_len, plan.reserve_bytes) == (40442, 11_764_103_012)
     floor, _plan = _gptoss_floor_and_plan(16384, 49152)
     assert floor == 5_506_802_319
+
+
+# ── S50 stage 3: an elastic load derives the larger context (parity dropped) ──
+
+@pytest.mark.parametrize("kv_constant,score,pooled,expected", [
+    # gpt-oss-like: windowed rings under eager (score>0) is ELASTIC -> derive the
+    # larger context (None), do NOT hold parity at the full-length pooled cost.
+    (28_286_976, 6.03, 49152, None),
+    # a SECOND windowed+eager geometry (CLAUDE.md §5): a different ring size and
+    # kernel cost must reach the same decision.
+    (40_000_000, 10.9, 65_536, None),
+    # Qwen3-Next-like: no windowed layers, so there is nothing to price (None),
+    # exactly as before S50.
+    (0, 0.0, 24_576, None),
+    # Llama-3.3-70B-like dense/sdpa: no windowed layers -> None.
+    (0, 10.9, 327_680, None),
+], ids=["gptoss-windowed-eager", "second-windowed-eager", "qwen3next-flat", "llama70b-flat"])
+def test_stage3_an_elastic_load_prices_parity_at_its_own_cost(kv_constant, score, pooled, expected):
+    from vaayu.vaayu_base import stage3_parity_kv
+    assert stage3_parity_kv(kv_constant_bytes=kv_constant, score_elem_bytes=score,
+                            pooled_kv_per_token=pooled) == expected
+
+
+def test_stage3_derive_floor_leaves_admission_headroom_only_when_deriving():
+    """S50 limit run (2026-10-13): the raw-derived context is advertised but refused
+    at its own full window -- the plan maximizes context until the peak equals the
+    reserve, leaving nothing for the allocator slack and a permanent foreign GPU
+    process at admission. So a derived (requested is None) elastic context is derived
+    against the reserve floor MINUS a hardware margin. A user-requested length is
+    validated against s_max as before, untouched; a non-elastic load is untouched."""
+    from vaayu.vaayu_base import stage3_derive_floor
+    floor, base, margin = int(11.1 * GiB), int(3.5 * GiB), int(0.30 * GiB)
+    # elastic load, deriving: backed off by the margin
+    assert stage3_derive_floor(reserve_floor=floor, base_floor=base, raised=True,
+                               requested_max_seq_len=None, margin=margin) == floor - margin
+    # elastic load, user asked for a length: untouched (validated against s_max itself)
+    assert stage3_derive_floor(reserve_floor=floor, base_floor=base, raised=True,
+                               requested_max_seq_len=40442, margin=margin) == floor
+    # not an elastic (raised) load: untouched
+    assert stage3_derive_floor(reserve_floor=floor, base_floor=base, raised=False,
+                               requested_max_seq_len=None, margin=margin) == floor
+    # never drops below the measured base floor
+    assert stage3_derive_floor(reserve_floor=base + margin // 2, base_floor=base, raised=True,
+                               requested_max_seq_len=None, margin=margin) == base
+
+
+def test_stage3_a_windowed_flash_load_keeps_the_pooled_parity_cost():
+    """Windowed layers under a kernel that materializes no score buffer (flash,
+    score 0): reserve_floor_bytes ignores parity anyway, so the pre-S50 pooled
+    value is kept rather than silently changed."""
+    from vaayu.vaayu_base import stage3_parity_kv
+    assert stage3_parity_kv(kv_constant_bytes=28_286_976, score_elem_bytes=0.0,
+                            pooled_kv_per_token=49152) == 49152
 
 
 @pytest.mark.parametrize("kv,hidden,heads,vocab,head_bytes,score", [
@@ -201,11 +254,23 @@ def test_the_parity_cost_only_ever_lowers_the_floor_on_a_second_windowed_geometr
     assert int(3.5 * GiB) <= held < reserve_floor_bytes(**kw)
 
 
-def test_the_load_prices_parity_at_the_pooled_cost_only_with_a_ring_by_source():
+def test_the_load_decides_parity_through_stage3_and_passes_it_to_the_floor_by_source():
     from pathlib import Path
     src = (Path(__file__).resolve().parents[1] / "vaayu" / "vaayu_base.py").read_text()
-    assert "_parity_kv = self.pooled_kv_bytes_per_token() if _kv_constant else None" in src
+    assert "_parity_kv = stage3_parity_kv(" in src
     assert "parity_kv_per_token=_parity_kv" in src
+
+
+def test_the_load_warns_when_it_raised_the_context_but_built_no_elastic_tier_by_source():
+    """S50: raising the context relies on an elastic tier existing to lend the
+    reserve back; the load must flag loudly if that premise failed, not degrade
+    silently (CLAUDE.md §5). The WARN must sit AFTER the tier is built."""
+    from pathlib import Path
+    src = (Path(__file__).resolve().parents[1] / "vaayu" / "vaayu_base.py").read_text()
+    build = src.find("self._elastic_tier = self._build_elastic_tier()")
+    guard = src.find("_stage3_context_raised\", False) and elastic_tier is None")
+    assert build != -1 and guard != -1
+    assert build < guard, "the WARN must check the tier AFTER it is built"
 
 
 def test_the_parity_search_drops_the_ring_constant():
@@ -279,8 +344,9 @@ def test_the_load_prunes_windows_before_it_plans_by_source():
     from pathlib import Path
     src = (Path(__file__).resolve().parents[1] / "vaayu" / "vaayu_base.py").read_text()
     prune = src.find("windows_that_pay(self._kv_windows, self.prefill_chunk_size, _full_ctx)")
-    parity = src.find("_parity_kv = self.pooled_kv_bytes_per_token() if _kv_constant else None")
+    parity = src.find("_parity_kv = stage3_parity_kv(")
     assert prune != -1, "the load never checks that its rings pay"
+    assert parity != -1, "the load never decides the parity cost"
     assert prune < parity, "the prune must run before the parity price is taken"
 
 
