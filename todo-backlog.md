@@ -10010,3 +10010,43 @@ Row as it stood when it closed:
       decider would be a ppl A/B: flat-3.0 vs mixed vs flat-5.0). USER chose SETTLE. Added to SETTLED — DO NOT RE-OPEN.
       Measure-only, no engine code, suite floor unchanged (4119). RESULTS `docs/2026-10-13-S48-mixed-bpw-hotness-RESULTS.md`;
       reference row `todo.md` "## 38".
+
+- [x] **S50 — gpt-oss stage-3: default advertised context on an elastic load. ✅ MERGED `c84dde6` 2026-10-13
+      (branch `s50-gptoss-stage3`: `a48ee9a` code+tests+docs, `ddb7cdd` ledger).** Un-parked from backlog #41 by
+      the USER 2026-10-13 (the S35-E "stage 3" open item). USER decided the target "derive ~40,442 (not S_max)"; the
+      limit gate then forced "derive-with-admission-margin".
+      **What shipped:** on a windowed + score-materializing load (gpt-oss, eager — the only one today) the plan drops
+      S35's full-length-parity pricing (`stage3_parity_kv` returns None), so `reserve_floor_bytes` searches flash
+      parity at the cache's own windowed KV cost and the plan DERIVES a larger context instead of protecting a static
+      expert tier. The S35-E elastic tier lends the raised reserve up for shorter requests. Derived from geometry, no
+      literal (CLAUDE.md §5). No-op on Qwen3-Next / MiniMax / DeepSeek-V4 (no windowed layers → `_kv_constant` 0 →
+      parity already None → `_stage3_context_raised` False) and dense (not MoE).
+      **The admission-margin bug the limit gate caught:** the raw-derived default was **40,956**, but a full-window
+      request was REFUSED (VramPlanError) — `plan_vram` maximizes context until the predicted peak equals the reserve,
+      leaving zero admission headroom, and `admission_headroom` gives `free-with-the-tier-emptied`, which sits BELOW
+      the load-time reserve by allocator reserved-but-noncontiguous slack and by a permanent 0.14 GiB foreign GPU
+      process (this box runs rustdesk, pid 5106): peak 11.09 GiB vs 11.05 GiB free, −0.04 GiB. FIX = `stage3_derive_floor`
+      subtracts `_STAGE3_ADMISSION_MARGIN_BYTES` (0.30 GiB, a hardware headroom constant) from the reserve floor ONLY
+      when deriving (requested max_seq_len is None) → derived **39,420** (+19 % over 33,213), full window served with
+      the known-safe 0.11 GiB floor. A user-set `MAX_SEQ_LEN` is validated against s_max as before, untouched. A
+      post-load WARN after `_build_elastic_tier()` fires if the context was raised but no elastic tier was built (the
+      one theoretical elastic-ineligible windowed load — a speculator / preallocated KV — none today).
+      **On device (gpt-oss-20b, server default `MAX_SEQ_LEN`):** `s35e_load.py` → max_seq_len 39,420, reserve 10.80
+      GiB, elastic ON (lends 7.30 GiB), static base 27 experts, no WARN. `s35e_run.py SCEN=limit ARM=ON`: FILL 2k ok
+      decode 37.0 ms min free 3.70 GiB; **LONG 39,353→39,420 full window ok, NO OOM, min free 0.11 GiB**, TTFT 111.0 s,
+      decode 115.4 ms, tier emptied 583→21; SHORT 2k after ok decode 36.4 ms, tier lent back 21→569. Stock bitwise
+      (`s35_stock_check.py`): TF vs stock DEFAULT cache 64/64 max|d| 0, G ids == stock, 12 windowed layers `[0,2,…,22]`
+      unchanged (TF vs full-length 5/64 = expected S35 control).
+      **No-op gates:** dense Llama-3.2-1B 6/6, Llama-3.3-70B streamed 6/6; Qwen3-Next on device no-op (no windowed KV,
+      reserve 3.50 GiB, max_seq_len 65536, elastic False, no WARN); MiniMax / DeepSeek NOT re-run — provable no-op (not
+      windowed; stage-3 branch cannot fire), suite-covered over their geometries. Full suite **4125 passed, 27
+      skipped** (252.47 s, FOREGROUND, `main` `c84dde6`).
+      **§8:** no new knob (default change; noted in `documentation/TUNING.md` §3c, `documentation/server.md`,
+      `vaayu/server/README.md`); reachable at N=1 on the server default; N>1 unchanged (batch path suspends the lend).
+      **Outcome:** derived 39,420, not the USER-target 40,442 — the 0.30 GiB serviceability margin costs ~1,500 tokens;
+      the USER chose to keep it over tuning the margin thinner (smaller margin → closer to 40,442 but thinner OOM
+      safety; 0.30 lands exactly on `main`'s proven-safe 0.11 GiB floor). Files: `vaayu/vaayu_base.py`,
+      `tests/test_windowed_kv_plan.py`, `documentation/TUNING.md`, `documentation/server.md`, `vaayu/server/README.md`.
+      RESULTS `docs/2026-10-13-S50-gptoss-stage3-RESULTS.md`; spec addendum
+      `docs/superpowers/specs/2026-10-10-S35-E-elastic-tier-design.md` §12 (+ §12.5 results). Backlog #41's OTHER 23
+      leads stay parked (only the stage-3 item was un-parked). See memory `s50_gptoss_stage3`.
