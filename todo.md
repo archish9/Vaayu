@@ -19,7 +19,7 @@ of the next session before changing anything.
 
 ---
 
-# ▶▶▶ THE ONLY OPEN ITEM — S52: retest N>1 batching with real Rudra traffic ◀◀◀
+# ▶▶▶ N>1 BATCHING SWEEP — S52 closed #37 (Qwen3-Next); OPEN item is now S55 (remaining models, bottom) ◀◀◀
 
 **Context that changed.** Earlier, N>1 batching was parked (old backlog #37) because no client sent Vaayu concurrent
 requests: Rudra had no Vaayu dependency and ran its subagents serially. **That is now fixed on the Rudra side** — Rudra
@@ -87,3 +87,86 @@ user-facing; (5) #37 explicitly closed/parked here with its re-open condition. E
 **Verification:** suite stays at or above the floor; dense gate 6/6; any batching change re-runs
 `tests/test_server_scheduler.py` (the N=1-serial guard) and `tests/test_dense_gate.py` (shared infra). The ingress fix
 (item 1) adds its own `tests/test_server_schemas.py` cases.
+
+---
+
+# S53 — MiniMax-M2.7 batching THROUGH THE SERVER (follow-on to S52 item 5)
+
+## [x] S53 — measure MiniMax EXL3 batching via the server (CLOSED 2026-10-14; MEASURE ONLY, no code change)
+
+**Why:** S52 closed #37 DEAD for Qwen3-Next but left MiniMax (EXL3, non-recurrent) as a live unmeasured
+batching case. Only prior number was engine-level +1.606× (prefix OFF, 2026-09-08); CLAUDE.md §8 says that does
+not discharge the claim. RESULTS: `docs/2026-10-14-S53-minimax-server-batching-RESULTS.md`.
+
+**Result — batching is NET-NEGATIVE through the server.** Harness `plans/probes/p10e_server_ab.py`, 2 concurrent
+clients, 4.15k prompt, cold turn, prefix cache ON (default), sdpa, derived `max_seq_len=8192`:
+- serial (`MAX_BATCH_SIZE=1`, clients queue): **aggregate 119.5 s** (warm control 121.9 s), `batches_run=0`.
+- batched (`MAX_BATCH_SIZE=2`): **aggregate 199.9 s**, `batches_run=1` (real width-2 batch, confirmed).
+- **0.60× = 1.67× SLOWER.** Warm serial ≈ cold serial, so page cache does not explain it; batched arm was
+  itself warm and still lost.
+
+**Root cause:** MiniMax prefill is disk-bound on streamed experts; batched chunked prefill re-reads the expert
+set per chunk (`vaayu_base.py:7507-7511`) and moves the 2-stream **routing union** per layer → more NVMe bytes
+than two serial prefills. Different cause than Qwen3-Next's (not recurrent, not VRAM), same verdict: batching is
+the wrong lever; single-stream + prefix cache wins.
+
+**Not measured:** one prompt size / one width / cold turn only (a warm turn-2 would be ≈ neutral, not a reversal);
+smaller contexts with high decode:prefill ratio; gpt-oss / DeepSeek / dense. No code changed; user `config_local.py`
+restored. #37 stays DEAD on this hardware for both measured MoE forwards.
+
+---
+
+# S54 — dense (Llama-3.3-70B EXL3) batching THROUGH THE SERVER
+
+## [x] S54 — measure dense batching via the server (CLOSED 2026-10-14; MEASURE ONLY, no code change)
+
+**Why:** S53 found MoE batching loses to the routing union. Dense has NO routing — all lanes share identical
+weights — so a streamed-dense batch should read each layer once and serve both lanes. Predicted a WIN; measured it.
+RESULTS: `docs/2026-10-14-S54-dense-server-batching-RESULTS.md`.
+
+**Result — batching WINS on dense (sign flips vs MoE).** Harness `p10e_server_ab.py`, Llama-3.3-70B EXL3, 2
+concurrent clients, 1.5k prompt, cold, prefix ON, sdpa, derived `max_seq_len=8272`:
+- serial (`MAX_BATCH_SIZE=1`): **216.7 s** (warm control 211.6 s), `batches_run=0`.
+- batched (`MAX_BATCH_SIZE=2`): **171.8 s**, `batches_run=1` (real width-2 ✓).
+- **1.25× FASTER.** Warm≈cold serial, so not an ordering artifact (and the 39 GB model can't fully cache in 32 GB).
+
+**Rule established:** batching helps when lanes SHARE the bytes streamed off disk (dense → one weight read serves
+both lanes, prefill+decode), hurts when they DIVERGE (MoE routing union ~2×). So batching is NOT dead engine-wide:
+DEAD for the two on-disk MoE forwards (S52 Qwen3-Next recurrent+VRAM, S53 MiniMax disk-union), LIVE for dense.
+
+**Perspective:** modest win; streamed-dense decode ~2.7 s/token regardless. The bigger dense lever is speculative
+decoding (5.57×, row 12); batching is minor + complementary, and needs N>1 offered load. Reachable via
+`MAX_BATCH_SIZE>=2` + sdpa. **Not measured:** one prompt/width/cold; larger-context width-2 VRAM admission (dense KV
+is big — may hit Qwen's ceiling); Llama-3.2-1B (VRAM-resident, compute-bound — different regime). No code changed;
+user `config_local.py` restored.
+
+---
+
+# ▶▶▶ OPEN — S55: finish the per-model batching sweep ◀◀◀
+
+## [ ] S55 — measure N>1 batching through the server on the REMAINING on-disk models
+
+**Why kept open (USER, 2026-10-14):** the sweep so far (S52 Qwen3-Next, S53 MiniMax, S54 dense Llama-70B)
+established the rule — **batching helps when lanes SHARE the bytes streamed off disk (dense: 1.25×), hurts when
+they DIVERGE (MoE routing union: MiniMax 0.60×; Qwen3-Next also dead on recurrent+VRAM).** The user wants the
+remaining models measured before any engine-wide verdict. Each is a prediction to confirm, same harness
+(`plans/probes/p10e_server_ab.py`), same method (boot MBS=1 vs MBS=2, sdpa, prefix ON, 2 concurrent clients,
+`batches_run` must be >0 to count; warm-serial control to kill ordering; restore `config_local.py` after).
+
+Remaining on-disk models and the prediction for each:
+- [ ] **gpt-oss-20b** (MXFP4, whole-layer fused-3D, routed delivery). MoE with routed experts → expect the
+  routing-union penalty like MiniMax → **predict SLOWER**. BUT it fits in VRAM (stock 13.79 GB) and Vaayu runs it
+  with the expert VRAM tier / elastic tier — so it may NOT be disk-bound the way MiniMax is; the union penalty
+  could be cheap if experts are resident. Genuinely uncertain — measure. Check width-2 VRAM admission first.
+- [ ] **DeepSeek-V4-Flash** (module-list, I8+E8M0 routed experts + F8 shared/attn, 256 experts top-6, MLA). MoE,
+  streamed, routing union → **predict SLOWER** (same family as MiniMax). Confirm. Slow decode (1.78 tok/s) → use a
+  small prompt/max_tokens to keep it feasible. Nothing may be written into its model dir.
+- [ ] **Llama-3.2-1B** (dense, unquantized, VRAM-resident). Dense → lanes share weights, BUT it is compute-bound,
+  not disk-bound (fits in VRAM, no streaming to amortize) → batching tests GEMM batching efficiency, a DIFFERENT
+  regime from streamed dense. **Predict a small win or neutral** (compute batching, not disk sharing). Fast to run
+  (seconds). Good control for "is the dense win about disk sharing or batched GEMM?"
+
+**Done-criteria:** each model a measured serial-vs-batched number with `batches_run>0` (or a VRAM-refusal note if
+width-2 won't admit), a warm control, RESULTS in `docs/`, and a row here. THEN write the engine-wide batching
+verdict (which forwards benefit, which don't, and the SHARE-vs-DIVERGE rule) into `documentation/server.md` and
+close S55. MEASURE ONLY unless a finding warrants a code change.
