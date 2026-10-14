@@ -197,6 +197,15 @@ INFO:     Uvicorn running on http://127.0.0.1:9999
 
 ---
 
+## Offline loads
+
+Every on-device model loads with the network cut, **including gpt-oss-20b**. gpt-oss
+needs the MXFP4 `triton_kernels`, which stock transformers fetches from the HF Hub on
+first load; Vaayu ships a vendored copy (`vaayu/vendor/gpt_oss_triton_kernels`) and
+points the loader at it automatically, so a first load — or any load after the HF cache
+is cleared — needs no network. **No knob.** The other models (Qwen3-Next, MiniMax-M2.7,
+DeepSeek-V4, dense Llama) never touched this kernel and are unaffected.
+
 ## Which knob for which workload
 
 [`documentation/TUNING.md`](../../documentation/TUNING.md) says what to turn on for

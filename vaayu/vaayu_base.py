@@ -4068,6 +4068,11 @@ class VaayuBaseModel(GenerationMixin):
                 # down. Applied unconditionally until 2026-09-21 (A3 task 4).
                 if isinstance(self.hf_quantizer, FineGrainedFP8HfQuantizer):
                     self._patch_fp8_quantizer_compat(self.hf_quantizer.quantization_config)
+                # MXFP4 preprocess fetches the gpt-oss triton kernels from the HF
+                # Hub; point it at the repo-vendored copy so the load works offline.
+                if quant_method == "mxfp4":
+                    from .offline_kernels import ensure_gpt_oss_kernel_offline
+                    ensure_gpt_oss_kernel_offline()
                 self.hf_quantizer.preprocess_model(model = self.model, device_map = device_map)
 
         self.model.eval()

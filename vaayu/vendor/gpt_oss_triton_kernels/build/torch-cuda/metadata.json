@@ -1,0 +1,10 @@
+{
+  "name": "gpt-oss-triton-kernels",
+  "id": "_gpt_oss_triton_kernels_cuda_bbc946d",
+  "version": 1,
+  "license": "MIT",
+  "python-depends": [],
+  "backend": {
+    "type": "cuda"
+  }
+}
