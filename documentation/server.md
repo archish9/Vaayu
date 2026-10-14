@@ -646,6 +646,33 @@ is `BATCH_WAIT_MS` wide (default 50 ms). Two consequences for a client:
   long-running request does not "absorb" a later arrival — that arrival waits
   for the next formation.
 
+**On a recurrent / linear-attention model (`qwen3_next` and similar), batching is
+the wrong lever — do not build client-side parallel dispatch for it on a 16 GiB
+card** (measured end-to-end by an agent client 2026-10-14; engine re-verified
+S52):
+
+* **Batched decode gives up the cross-turn prefix cache.** A batch on such a
+  model prints `[Vaayu-Prefix] WARNING: batched_generate does not support the
+  cross-turn prefix cache on a model with recurrent (linear-attention) state` and
+  every stream prefills in full. The prefix cache is the dominant agent-workload
+  lever (~82 % of prompt tokens saved single-stream), so on these models batching
+  trades the large win for a small one. This is a **design limit**, not a bug:
+  the recurrent state is batch-1 and keyed to one history, and nothing broadcasts
+  or splices it per lane yet.
+* **VRAM admission caps the context at which a batch can form.** On a 16 GiB card
+  a width-2 batch admits only up to `max_seq_len≈33k` right after load and
+  `≈18k` under concurrent load; at 32–64k every width-2 batch is refused
+  (`VramPlanError`, naming the largest context that fits now) and the request
+  falls back to serial. That ceiling is **below** where a tool-using agent
+  actually runs. Batching is therefore aimed at larger cards; on this hardware,
+  keep `MAX_BATCH_SIZE = 1` for a recurrent model and rely on the prefix cache.
+* Engine batched decode itself is **correct** on these models — per-lane output
+  is bitwise-identical to serial (S52), including a left-padded lane. The verdict
+  above is about the workload economics, not a correctness defect.
+
+This verdict is specific to the linear-attention family. Batching on the
+non-recurrent checkpoints is a separate, unmeasured question.
+
 ### 6.4 Context is the binding constraint, not speed
 
 Check `/v1/models` at startup and budget against the real number:

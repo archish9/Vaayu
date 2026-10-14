@@ -33,52 +33,51 @@ batching fails the gate for three independent reasons, so Rudra will NOT build c
 model/hardware. This row is Vaayu's job: **re-verify each claim from the engine side at HEAD, decide whether #37 is
 dead, closable, or has a real path, and act on the two issues Rudra surfaced.**
 
-## [ ] S52 — retest #37 and work the Rudra findings
+## [x] S52 — retest #37 and work the Rudra findings (CLOSED 2026-10-14; one low-pri thread spun out → (2-open))
 
 Pick this row in a fresh session. Read `CLAUDE.md`, this file, and the two docs above. Re-establish the suite floor.
 Then, in order:
 
-- [ ] **(1) Array-of-parts content ingress fix — verify it is present and kept.** Rudra reported that Vaayu returned
-  **HTTP 422** on valid OpenAI `content: [{type:"text",…}]` message content (the default shape `langchain_openai`
-  sends), because `vaayu/server/schemas.py` declared `ChatMessage.content: str | None`, and that they applied a
-  `before` validator flattening text parts (findings §2, with the patch and the tests). **Confirm whether that change
-  is actually in Vaayu's tree** (git status at this session's start was clean; the fix may live only in Rudra's
-  worktree). If absent, apply the equivalent in `vaayu/server/schemas.py` + `tests/test_server_schemas.py` (array
-  flattens in order, string passes through, `None` stays `None`, non-text part raises loudly). §8: request ingress on
-  `/v1/chat/completions`, no knob — state it SHIPPED. This is a real server bug independent of the batching verdict.
+- [x] **(1) Array-of-parts content ingress fix — DONE/confirmed present** (`645da6a`). Validator
+  `ChatMessage._flatten_content` at `vaayu/server/schemas.py:44-74` (array→ordered concat, str passthrough,
+  None→None, non-text part raises). Test `tests/test_server_schemas.py:121`. No knob, request ingress → SHIPPED.
 
-- [ ] **(2) [bug?] Tool-call output corruption under batched decode on a recurrent model — reproduce and triage.**
-  Rudra saw the planner's tool call returned as **raw text** (`<tool_call>{...}`) instead of a structured call in the
-  one config where batches actually formed (`MAX_SEQ_LEN=16384`, width 2), on **2/2** concurrent Qwen3-Next sessions;
-  never in serial/single-stream. Hypothesis: two `qwen3_next` sequences' recurrent (linear-attention) state interfere
-  across batch lanes. **Reproduce on device with a minimal 2-stream batched decode (not the full agent), compare
-  per-stream logits/ids against two serial runs.** If state is shared or mis-separated per lane this is a
-  **correctness bug**, not a perf tradeoff — the most important part of this row. Note Vaayu already restricts the
-  recurrent path: `batched_generate` requires sdpa and refuses recurrent prefix reuse (item 3); check whether it
-  should also refuse recurrent *decode batching* outright until lane isolation is proven. See the hybrid multi-token
-  state note (HF hybrid mixers continue state only at `seq_len==1`; chunked prefill + spec verify lost context on Qwen,
-  fixed rows 41/43 — in the git history).
+**S52 CLOSED 2026-10-14.** RESULTS: `docs/2026-10-14-S52-batching-retest-RESULTS.md`. Items 1–5 settled below;
+#37 is **DEAD for Qwen3-Next on 16 GiB** (re-open conditions in item 5). One OPEN thread spun out: the
+`[bug?]` tool-call-text symptom could not be reproduced or located as a defect — see the OPEN item at the end.
 
-- [ ] **(3) Batched decode skips the cross-turn prefix cache on recurrent models — confirm: permanent limit or
-  closable gap.** Rudra logged `[Vaayu-Prefix] WARNING: batched_generate does not support the cross-turn prefix cache
-  on a model with recurrent (linear-attention) state`. The prefix cache is the dominant agent-workload lever (Rudra
-  measured **82 % of prompt tokens saved** single-stream, findings §4). Decide whether supporting it under batched
-  recurrent decode is feasible or a design limit, and record the verdict. This is what makes batching net-negative for
-  this model even when it fits.
+- [x] **(2) tool-call corruption under batched decode — ENGINE CORRUPTION REFUTED (bitwise).** On-device repro
+  (Qwen3-Next-80B-AWQ, sdpa, prefix cache OFF, max_seq_len=16384, greedy) — `batched_generate` N=2 per-lane output
+  **bit-identical** to the N=1 serial reference: first-divergence `None` for the long pad-free lane, the short
+  **left-padded** lane, and the equal-length control. No cross-lane bleed, no left-pad recurrent corruption. Repro
+  + log: `scratchpad/s52_item2_repro.py`, `scratchpad/s52_repro.log`. The raw-`<tool_call>`-text symptom is NOT a
+  located code defect — batched finalize parses tool calls identically to serial (`engine.py:1085`≡`:805/:632`) and
+  app.py streaming suppression (`:941-962`,`:1015-1044`) applies uniformly to batched deltas; most likely degraded
+  generation under the forced truncated/prefix-off config, or `tools` absent on the call. Spun out as the OPEN item
+  below (no `[bug]` filed — no defect found). `_cache_holds_recurrent_state=False` in the repro is benign: probed
+  only when the prefix cache is ON (`vaayu_base.py:4569`); the gated-delta mixers still ran the padded batch forward.
 
-- [ ] **(4) VRAM admission ceiling at realistic context — characterize and document.** On the 16 GiB card, width-2
-  batches only fit below `max_seq_len ≈ 18k` (live-VRAM dependent; ~33k right after load, ~18k under concurrent load);
-  at 32–64k every batch is `VramPlanError`-refused before the model runs (findings §5 runs 1–2). Confirm the ceiling
-  from the VRAM planner, and state plainly (in `documentation/` where a client can see it) that batched decode needs a
-  larger card to reach agent-realistic context — the `_note_if_never_admitting` log line is a start.
+- [x] **(3) prefix cache + batched recurrent decode — PERMANENT DESIGN LIMIT.** `vaayu_base.py:7362-7379`:
+  `broadcast_cache_rows` widens only KV buffers (recurrent state stays batch-1), and `slice_cache_row_unpadded` has
+  no per-row recurrent slice. Closing it = per-row recurrent broadcast + slice, numerically verified vs serial — real
+  work, not scheduled. Verdict folded into `documentation/server.md` §6.3.
 
-- [ ] **(5) #37 verdict.** Given (2)–(4): decide whether #37 is **DEAD for this model/hardware** (Rudra's conclusion —
-  then close it with that verdict and the conditions that would re-open it: a larger card AND recurrent-prefix support
-  in `batched_generate`), **PARKED** with a narrower re-open trigger, or has a worthwhile path on a NON-recurrent model
-  on disk (gpt-oss / MiniMax / DeepSeek / dense — batching was only ever measured on retired Qwen3-235B and now on
-  Qwen3-Next; the other forwards are unmeasured). **Do not conclude #37 is dead for ALL models from a recurrent-model
-  result** — the engine is model-agnostic (CLAUDE.md §5); the prefix-cache conflict and the recurrent-state suspicion
-  are specific to the linear-attention family.
+- [x] **(4) VRAM admission ceiling — CONFIRMED + documented.** Planner's own refusal (Rudra §5 run 1): width-2 admits
+  ≤`max_seq_len≈33k` right after load, ≈18k under concurrent load; 32–64k refused (`VramPlanError`). Below agent-
+  realistic context on a 16 GiB card. `batched_generate._assert_context_fits(N=N)` re-evaluates at real width
+  (`vaayu_base.py:7305`). Folded into `documentation/server.md` §6.3.
+
+- [x] **(5) #37 verdict — DEAD for Qwen3-Next on 16 GiB.** Gives up the 82 %-token prefix cache (item 3), VRAM-
+  unreachable at realistic context (item 4), pays ~4 % sdpa tax for a net loss. Engine batched decode is CORRECT
+  (item 2) — a workload/hardware verdict, not a defect. **Re-open (both required):** a larger card AND recurrent-
+  prefix support in `batched_generate`. **Model-agnostic caveat (CLAUDE.md §5):** verdict is specific to the linear-
+  attention family; batching on gpt-oss / MiniMax / DeepSeek / dense is UNMEASURED and not covered.
+
+- [ ] **(2-open) [bug?] server tool-call-as-raw-text under batched streaming — unreproduced, no defect located.**
+  Needs a SERVER-level repro, not engine: start server `MAX_BATCH_SIZE>=2`, `ATTN_IMPLEMENTATION=sdpa`; two concurrent
+  `/v1/chat/completions` with `tools` set + `stream=true` at `max_seq_len<=16k` (so width-2 admits); check whether
+  streamed `content` ever leaks `<tool_call>` when batches form, vs serial. Close it (confirm-or-refute) or file a real
+  `[bug]`. Low priority: #37 is DEAD regardless, and code analysis found no batched-vs-serial tool-call gap.
 
 **Done-criteria for the row:** (1) shipped or confirmed present; (2) reproduced-or-refuted with a bitwise per-lane
 comparison and a `[bug]` filed if real; (3) and (4) each a written verdict folded into `documentation/` where
