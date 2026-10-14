@@ -48,7 +48,7 @@ Status keys, as in `todo.md`: `[ ]` pending · `[~]` in progress · `[!]` blocke
 | 32 | The fused forward's twin cast (`_expert_dense_weights` casts streamed tensors) — `[!]` | A5.7c record | BLOCKED 2026-09-25, decided out of scope by the USER; unreachable by any model on disk (gpt-oss takes the whole-layer / routed forward) | per-expert MXFP4 streaming goes through `_make_fused_sparse_forward` (row 47's A6), or a model that needs the cast lands on that forward |
 | 33 | P10 batching — the sentinel-only cancel test `[bug]` and the known-open batching minors | Carried out of row 15 | N>1 only: the server runs `MAX_BATCH_SIZE = 1` (CLAUDE.md §8) | `batched_generate` is wired into the server |
 | 34 | gpt-oss's FIRST session in a process is not run-to-run deterministic | S14 3c record | greedy ids equal; logits differ run to run on the first session only; later sessions are bit-identical | determinism of the first request matters (its own text) |
-| 35 | Row 47 A6 remainder — drop the Hub kernel dependency (`triton_kernels_hub` is fetched from the Hub on first run) — **UN-PARKED → `todo.md` S51 2026-10-13** | row 47 program table | A6's substance (move only the routed experts, 1.27 GB/token instead of 10.17 GB) was delivered by S8's routed delivery; only the network dependency at first load remains | **UN-PARKED 2026-10-13 by the USER ("sequence #35 and ship it") → sequenced as `todo.md` S51** |
+| 35 | Row 47 A6 remainder — drop the Hub kernel dependency (`triton_kernels_hub` is fetched from the Hub on first run) — **✅ SHIPPED as S51, MERGED `893cb5a` 2026-10-14** | row 47 program table | A6's substance (move only the routed experts, 1.27 GB/token instead of 10.17 GB) was delivered by S8's routed delivery; only the network dependency at first load remained — now gone | **SHIPPED 2026-10-14: gpt-oss loads OFFLINE (vendored MXFP4 triton kernel + `LOCAL_KERNELS`). See the S51 row in "Closed after the 2026-10-03 cleanup"** |
 | 36 | S29 lead — the 40 % "cacheable" rule does not fit a cyclic per-token stream | S29 (added 2026-10-07) | seen only in configs no default load reaches today: with the dense layer cache OFF (`RAM_CACHE_BUDGET_GB=0`, non-default) Llama-3.3-70B goes buffered at "50 %" and the page cache served ~5.5 %; not measured against O_DIRECT there | a default load prints `Sufficient RAM` for a model that streams per token and does not fit the page cache whole, or a user runs a streamed dense model with `RAM_CACHE_BUDGET_GB=0` |
 | 37 | S30 — batching design: make N>1 reachable through the server | S30 row (PARKED by the USER 2026-10-07) | N>1 only: the server runs `MAX_BATCH_SIZE = 1`, and no client sends Vaayu concurrent requests (RudraAnvil has no Vaayu reference and runs its subagents one at a time) — worth 0 % to users today (CLAUDE.md §8) | a client that sends concurrent requests targets Vaayu (Rudra depends on Vaayu and fans out), or the USER asks |
 | 38 | I4-b — batched store-back stores a ragged entry after an error | I4 final review (added 2026-10-08) | N>1 only: `batched_generate` runs only with `MAX_BATCH_SIZE >= 2` + sdpa (not the default); worth 0 % to users today (CLAUDE.md §8) | `batched_generate` is wired into the server, i.e. with #37 |
@@ -10050,3 +10050,44 @@ Row as it stood when it closed:
       RESULTS `docs/2026-10-13-S50-gptoss-stage3-RESULTS.md`; spec addendum
       `docs/superpowers/specs/2026-10-10-S35-E-elastic-tier-design.md` §12 (+ §12.5 results). Backlog #41's OTHER 23
       leads stay parked (only the stage-3 item was un-parked). See memory `s50_gptoss_stage3`.
+
+- [x] **S51 — ✅ CLOSED 2026-10-14, MERGED `893cb5a`. SHIP #35: drop the Hub kernel dependency so gpt-oss's first load works OFFLINE (un-parked from backlog
+      #35 by the USER 2026-10-13). BUILT + GATED on branch `s51-offline-gptoss-kernel` (`3b9964d`), AWAITING USER MERGE
+      WORD 2026-10-14.** Vendored the one `torch-cuda` MXFP4 triton build variant into
+      `vaayu/vendor/gpt_oss_triton_kernels` (42 files, 392K) + new `vaayu/offline_kernels.py` points the `kernels` lib
+      at it via its `LOCAL_KERNELS` override (checked before any network call), wired in `vaayu_base.py` before
+      `preprocess_model` gated on `quant_method == "mxfp4"`. No knob; no perf change; no-op on the other four + dense
+      (lazy import behind the mxfp4 guard). **Gated:** offline load through Vaayu (kernel cache absent +
+      `HF_HUB_OFFLINE=1`) exit 0, `max_seq_len=39420`; negative control without the fix fails `OfflineModeIsEnabled`;
+      stock bitwise 64/64 (max|d| 0, matches S50); suite on branch **4132 passed, 27 skipped** (+6 =
+      `tests/test_offline_kernels.py`, baseline-without-file 4126); dense gate 6/6 both Llama (1B 5.8 s, 70B streamed
+      90 s). RESULTS `docs/2026-10-14-S51-offline-gptoss-kernel-RESULTS.md`. **On merge: set suite floor 4132, move this
+      row's full text to `todo-backlog.md`, then the next fresh session re-prioritises with the USER.** gpt-oss-20b (MXFP4, `_make_whole_layer_sparse_forward`) is the ONLY on-device model
+      that needs the `triton_kernels` MXFP4 kernels; transformers fetches them from the HF Hub on first load
+      (CLAUDE.md §0: "The first run needs the network"), so a first load — or any load after the HF cache is cleared —
+      needs the network and fails offline or during a Hub outage. Make gpt-oss load without the network. **No perf
+      change; robustness / production-grade only.** NO-OP on Qwen3-Next, MiniMax-M2.7, DeepSeek-V4, dense (they never
+      touch this kernel).
+      **ANCHORS (pre-gathered 2026-10-13, HEAD `61d9f1c`, re-verify before editing):**
+      • THE fetch: `venv/.../transformers/integrations/mxfp4.py:687-690` — `from .hub_kernels import get_kernel;
+      triton_kernels_hub = get_kernel("kernels-community/gpt-oss-triton-kernels")`. transformers is VENDORED (not
+      Vaayu's to edit), so the fix is Vaayu-side.
+      • the `kernels` lib (installed, v0.13.0) exposes `get_kernel` (`utils.py:236`), `get_local_kernel`
+      (`utils.py:288`), `load_kernel` (`:369`), and honours `HF_HUB_OFFLINE`.
+      • the kernel caches to `~/.cache/huggingface/hub/models--kernels-community--gpt-oss-triton-kernels` (present on
+      this box from earlier runs).
+      • Vaayu's gpt-oss load path: `vaayu/routed_fused3d.py` (routed delivery) + the whole-layer forward in
+      `vaayu/moe_patch.py` (`_make_whole_layer_sparse_forward`, `dispatches_whole_layer`); the loader is
+      `vaayu/persist/safetensor_model_persister.py`.
+      **DECIDE in the fresh session (pick the least machinery, §2):** (a) vendor the kernel repo into the Vaayu tree and
+      point the load at it via `get_local_kernel` / a seeded `HF_HOME`; (b) a loader warmup that fetches once into a
+      repo-local HF cache, then pins `HF_HUB_OFFLINE=1` for the gpt-oss load; (c) document a one-time offline-warmup
+      step. Keep CLAUDE.md §5 (no model/arch literals baked in — the repo id string is the model's own, acceptable, but
+      detect the gpt-oss/MXFP4 path by the checkpoint, not an arch name).
+      **VERIFY:** a gpt-oss load with the network cut (`HF_HUB_OFFLINE=1`, and separately with the kernel cache absent if
+      option (a)/(b) vendors it) must SUCCEED and stay **bit-identical to stock** (gpt-oss server gate 9/9, stock check
+      64/64, logits). No regression on the other four models + dense (they must not start depending on the kernel or on
+      any offline flag Vaayu sets). **§8:** state the knob answer — likely none, or ONE documented one-time warmup in
+      `vaayu/server/README.md`; reaches the server because gpt-oss loads through it. **Gates:** gpt-oss server gate +
+      stock 64/64; dense (`DENSE_CKPT=`) + accumulator unaffected; suite floor currently 4119. Backlog #35's re-open
+      conditions ("offline install required / Hub breaks a load") are exactly this ship.
