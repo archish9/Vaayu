@@ -2,171 +2,87 @@
 
 **CLEARED 2026-10-14 at the USER's request.** Everything prior — all closed rows, the sequences S1…S51, the
 numbered backlog, the ARCHIVE and the **SETTLED — DO NOT RE-OPEN** list — was removed from this file and from
-`todo-backlog.md` on the same date. **None of it was lost:** both files are git-tracked, so the full prior history is
-in `git log -p -- todo.md todo-backlog.md` (the last pre-clear state is `main` at `07b5279`, 2026-10-14). The old
-backlog's SETTLED list of refuted perf ideas lives there too — read it from git before proposing perf work.
+`todo-backlog.md` on that date. **None of it was lost:** both files are git-tracked, so the full prior history is in
+`git log -p -- todo.md todo-backlog.md` (last pre-clear state is `main` at `07b5279`, 2026-10-14). The old backlog's
+SETTLED list of refuted perf ideas lives there too — read it from git before proposing perf work.
 
-The USER has narrowed all active work to ONE item: **N>1 batching (old backlog #37)** — see the single row below.
+## What we are working on (read this first)
+
+The live thread is the **N>1 batching sweep through the server** and acting on what it found. N>1 batching = the
+server fusing several *concurrent* client requests into one batch (`MAX_BATCH_SIZE>=2`, sdpa only). The client
+(Rudra — a local-first autonomous coding agent, provider-agnostic, talks OpenAI-wire to Vaayu; its brief is
+`docs/rudra-batching-findings-2026-10-14.md`) controls whether it fans out concurrent calls at all.
+
+**The rule the sweep established (its key output):** on a streaming engine, batching **HELPS when the lanes SHARE
+the bytes streamed off disk** (dense — all lanes use identical weights, one read serves both, prefill+decode) and
+**HURTS when they DIVERGE** (MoE — two lanes route to different experts → the batch streams the routing UNION,
+~2× expert bytes, per chunk). So batching is NOT dead engine-wide: dead for the on-disk MoE forwards, live for dense.
+
+Measured so far (all CLOSED, full text + numbers in `todo-backlog.md` ARCHIVE):
+- **S52** Qwen3-Next-80B (MoE, non-EXL3, recurrent): #37 **DEAD** on 16 GiB (recurrent prefix-cache conflict + VRAM
+  ceiling); engine decode proven correct; array-of-parts ingress fix shipped (`645da6a`).
+- **S53** MiniMax-M2.7 (MoE EXL3, streamed): batching **0.60× (1.67× SLOWER)** — routing union per chunk.
+- **S54** Llama-3.3-70B (dense EXL3, streamed): batching **1.25× FASTER** — shared weights, no union.
 
 Status keys: `[ ]` pending · `[~]` in progress · `[!]` blocked · `[bug]` open bug/regression.
-Protocol: `CLAUDE.md` §6 (this ledger), §7 (all plans / RESULTS go in `docs/`, which is gitignored — so every row
-here carries its own numbers), §8 (every change must reach the server; say if it is banked).
+Protocol: `CLAUDE.md` §6 (this ledger), §7 (all plans / RESULTS go in `docs/`, gitignored — so every row carries its
+own numbers), §8 (every change must reach the server; say if it is banked).
 
 **Suite floor (last known, `main` at `893cb5a`, 2026-10-14):** `4132 passed, 27 skipped, 538 warnings` (294.01 s,
-FOREGROUND; dense gate 6/6 both Llama). `cargo test` in `vaayu_rust/`: `38 passed, 0 failed, 1 ignored`. The suite
-needs a current `vaayu_rust` build (`maturin develop --release` in `vaayu_rust/`). Re-establish this floor at the top
-of the next session before changing anything.
+FOREGROUND; dense gate 6/6 both Llama). `cargo test` in `vaayu_rust/`: `38 passed, 0 failed, 1 ignored`. Needs a
+current `vaayu_rust` build (`maturin develop --release` in `vaayu_rust/`, needs `VIRTUAL_ENV` set). Re-establish this
+floor at the top of the next session before changing CODE (the sweep so far changed no code, so the floor stands).
+
+**Server batching measurement recipe (for S55):** harness `plans/probes/p10e_server_ab.py`. Point
+`vaayu/server/config_local.py` at the model + `ATTN_IMPLEMENTATION="sdpa"`; boot once at `MAX_BATCH_SIZE=1` (serial:
+2 concurrent clients queue) and once at `=2` (batched). Run `--clients 2 --turns 1`, small prompt/`max_tokens` if the
+model is slow. `aggregate_timed_wall` = max of the 2 walls; speedup = serial ÷ batched. `batches_run>0` from
+`/health` MUST hold or the number is not batched decode. Add a warm-serial control (reboot MBS=1 after the batched
+arm) to kill page-cache/ordering confounds. Back up and RESTORE the user's `config_local.py` after; leave no server
+running. Boot/kill a background server with the Bash tool; `pkill -9 -f "python -m vaayu.server"`.
 
 ---
 
-# ▶▶▶ N>1 BATCHING SWEEP — S52 closed #37 (Qwen3-Next); OPEN item is now S55 (remaining models, bottom) ◀◀◀
+# OPEN
 
-**Context that changed.** Earlier, N>1 batching was parked (old backlog #37) because no client sent Vaayu concurrent
-requests: Rudra had no Vaayu dependency and ran its subagents serially. **That is now fixed on the Rudra side** — Rudra
-connects to Vaayu, sends a stable `session_id` per conversation, and can dispatch concurrent calls. Rudra ran the
-batching evaluation end-to-end from its side and wrote a self-contained findings report for the Vaayu team:
-**`docs/rudra-batching-findings-2026-10-14.md`** (read it first — it is the brief for this row).
-Integration design: `docs/2026-10-14-rudra-vaayu-integration-plan.md`.
+## [ ] S55 — next batching test: a model NOT currently on disk
 
-**Rudra's headline verdict (from the findings doc):** for **Qwen3-Next-80B-A3B-AWQ on a 16 GiB RTX 5060 Ti**, N>1
-batching fails the gate for three independent reasons, so Rudra will NOT build client-side parallel dispatch for this
-model/hardware. This row is Vaayu's job: **re-verify each claim from the engine side at HEAD, decide whether #37 is
-dead, closable, or has a real path, and act on the two issues Rudra surfaced.**
+The user wants the sweep continued on a model that is **not on disk yet** (the on-disk set — Qwen3-Next, MiniMax,
+Llama-70B/1B, gpt-oss, DeepSeek-V4 — is already measured or predicted). **At the start of S55, ASK THE USER which
+model** — do not assume or pick one. Then: download/stage it (its own new empty dir; nothing written into a model
+dir that forbids it), confirm its layout (dense vs MoE, streamed vs VRAM-resident, recurrent?), PREDICT the batching
+sign from the SHARE-vs-DIVERGE rule above, then measure with the recipe above (serial vs batched, `batches_run>0`,
+warm control, RESULTS doc in `docs/`, a row here).
 
-## [x] S52 — retest #37 and work the Rudra findings (CLOSED 2026-10-14; one low-pri thread spun out → (2-open))
+Open question the rule has NOT settled and S55 may answer: a **VRAM-resident MoE** (experts not streamed off disk)
+might not pay the union penalty, so `is_moe` alone may not predict the sign — the share-vs-diverge property does.
+This matters for S56's hint.
 
-Pick this row in a fresh session. Read `CLAUDE.md`, this file, and the two docs above. Re-establish the suite floor.
-Then, in order:
+## [ ] S56 — build the server batching-hint (option 1) + a self-contained Rudra spec
 
-- [x] **(1) Array-of-parts content ingress fix — DONE/confirmed present** (`645da6a`). Validator
-  `ChatMessage._flatten_content` at `vaayu/server/schemas.py:44-74` (array→ordered concat, str passthrough,
-  None→None, non-text part raises). Test `tests/test_server_schemas.py:121`. No knob, request ingress → SHIPPED.
+USER approved option 1 (2026-10-14): the **server advertises whether client fan-out (→ N>1 batching) is worth it**,
+because the benefit is load-determined and only the server knows the model. The decision is static per load (a model
+property), not per request — no runtime A/B needed. Two deliverables:
 
-**S52 CLOSED 2026-10-14.** RESULTS: `docs/2026-10-14-S52-batching-retest-RESULTS.md`. Items 1–5 settled below;
-#37 is **DEAD for Qwen3-Next on 16 GiB** (re-open conditions in item 5). One OPEN thread spun out: the
-`[bug?]` tool-call-text symptom could not be reproduced or located as a defect — see the OPEN item at the end.
+- [ ] **Vaayu side.** At load, derive `batching_helps` and expose it to the client — a field on `/health` and/or
+  `/v1/models`, plus a recommended client concurrency (1 ⇒ don't fan out). Rule:
+  `batching_helps = SHARE-not-DIVERGE AND (not recurrent) AND width-2 admits at the configured max_seq_len`.
+  **Do NOT hardcode `is_moe` as the whole test** until S55 settles whether a VRAM-resident MoE benefits — derive
+  from the share-vs-diverge property (streamed + per-lane-divergent experts → no) rather than the label. Dry-run the
+  width-2 admission on the same path `batched_generate._assert_context_fits(N=2)` uses. §8: server field, no knob,
+  reaches the client → state SHIPPED when wired. Add a test. (S55 should land first so the rule is final.)
+- [ ] **Rudra side — hand-off doc.** Write a SELF-CONTAINED spec `docs/2026-MM-DD-vaayu-batching-hint-for-rudra.md`
+  (Rudra has no Vaayu internals context — self-contained like `docs/rudra-batching-findings-2026-10-14.md`):
+  which field the server exposes and where, its exact meaning, the client logic (read ONCE at startup; set fan-out
+  concurrency = the recommended value; 1 ⇒ send model calls serially), the fallback when the field is absent (assume
+  1 = serial), and the note that the server still auto-serializes any batch that can't admit, so over-fanning is
+  capped but wasteful. Rudra implements its parallel-dispatch gate from this doc alone.
 
-- [x] **(2) tool-call corruption under batched decode — ENGINE CORRUPTION REFUTED (bitwise).** On-device repro
-  (Qwen3-Next-80B-AWQ, sdpa, prefix cache OFF, max_seq_len=16384, greedy) — `batched_generate` N=2 per-lane output
-  **bit-identical** to the N=1 serial reference: first-divergence `None` for the long pad-free lane, the short
-  **left-padded** lane, and the equal-length control. No cross-lane bleed, no left-pad recurrent corruption. Repro
-  + log: `scratchpad/s52_item2_repro.py`, `scratchpad/s52_repro.log`. The raw-`<tool_call>`-text symptom is NOT a
-  located code defect — batched finalize parses tool calls identically to serial (`engine.py:1085`≡`:805/:632`) and
-  app.py streaming suppression (`:941-962`,`:1015-1044`) applies uniformly to batched deltas; most likely degraded
-  generation under the forced truncated/prefix-off config, or `tools` absent on the call. Spun out as the OPEN item
-  below (no `[bug]` filed — no defect found). `_cache_holds_recurrent_state=False` in the repro is benign: probed
-  only when the prefix cache is ON (`vaayu_base.py:4569`); the gated-delta mixers still ran the padded batch forward.
+## [ ] (2-open) [bug?] server tool-call-as-raw-text under batched streaming — unreproduced, no defect located
 
-- [x] **(3) prefix cache + batched recurrent decode — PERMANENT DESIGN LIMIT.** `vaayu_base.py:7362-7379`:
-  `broadcast_cache_rows` widens only KV buffers (recurrent state stays batch-1), and `slice_cache_row_unpadded` has
-  no per-row recurrent slice. Closing it = per-row recurrent broadcast + slice, numerically verified vs serial — real
-  work, not scheduled. Verdict folded into `documentation/server.md` §6.3.
-
-- [x] **(4) VRAM admission ceiling — CONFIRMED + documented.** Planner's own refusal (Rudra §5 run 1): width-2 admits
-  ≤`max_seq_len≈33k` right after load, ≈18k under concurrent load; 32–64k refused (`VramPlanError`). Below agent-
-  realistic context on a 16 GiB card. `batched_generate._assert_context_fits(N=N)` re-evaluates at real width
-  (`vaayu_base.py:7305`). Folded into `documentation/server.md` §6.3.
-
-- [x] **(5) #37 verdict — DEAD for Qwen3-Next on 16 GiB.** Gives up the 82 %-token prefix cache (item 3), VRAM-
-  unreachable at realistic context (item 4), pays ~4 % sdpa tax for a net loss. Engine batched decode is CORRECT
-  (item 2) — a workload/hardware verdict, not a defect. **Re-open (both required):** a larger card AND recurrent-
-  prefix support in `batched_generate`. **Model-agnostic caveat (CLAUDE.md §5):** verdict is specific to the linear-
-  attention family; batching on gpt-oss / MiniMax / DeepSeek / dense is UNMEASURED and not covered.
-
-- [ ] **(2-open) [bug?] server tool-call-as-raw-text under batched streaming — unreproduced, no defect located.**
-  Needs a SERVER-level repro, not engine: start server `MAX_BATCH_SIZE>=2`, `ATTN_IMPLEMENTATION=sdpa`; two concurrent
-  `/v1/chat/completions` with `tools` set + `stream=true` at `max_seq_len<=16k` (so width-2 admits); check whether
-  streamed `content` ever leaks `<tool_call>` when batches form, vs serial. Close it (confirm-or-refute) or file a real
-  `[bug]`. Low priority: #37 is DEAD regardless, and code analysis found no batched-vs-serial tool-call gap.
-
-**Done-criteria for the row:** (1) shipped or confirmed present; (2) reproduced-or-refuted with a bitwise per-lane
-comparison and a `[bug]` filed if real; (3) and (4) each a written verdict folded into `documentation/` where
-user-facing; (5) #37 explicitly closed/parked here with its re-open condition. Evidence per §4 (RESULTS doc in
-`docs/`), reach per §8.
-
-**Verification:** suite stays at or above the floor; dense gate 6/6; any batching change re-runs
-`tests/test_server_scheduler.py` (the N=1-serial guard) and `tests/test_dense_gate.py` (shared infra). The ingress fix
-(item 1) adds its own `tests/test_server_schemas.py` cases.
-
----
-
-# S53 — MiniMax-M2.7 batching THROUGH THE SERVER (follow-on to S52 item 5)
-
-## [x] S53 — measure MiniMax EXL3 batching via the server (CLOSED 2026-10-14; MEASURE ONLY, no code change)
-
-**Why:** S52 closed #37 DEAD for Qwen3-Next but left MiniMax (EXL3, non-recurrent) as a live unmeasured
-batching case. Only prior number was engine-level +1.606× (prefix OFF, 2026-09-08); CLAUDE.md §8 says that does
-not discharge the claim. RESULTS: `docs/2026-10-14-S53-minimax-server-batching-RESULTS.md`.
-
-**Result — batching is NET-NEGATIVE through the server.** Harness `plans/probes/p10e_server_ab.py`, 2 concurrent
-clients, 4.15k prompt, cold turn, prefix cache ON (default), sdpa, derived `max_seq_len=8192`:
-- serial (`MAX_BATCH_SIZE=1`, clients queue): **aggregate 119.5 s** (warm control 121.9 s), `batches_run=0`.
-- batched (`MAX_BATCH_SIZE=2`): **aggregate 199.9 s**, `batches_run=1` (real width-2 batch, confirmed).
-- **0.60× = 1.67× SLOWER.** Warm serial ≈ cold serial, so page cache does not explain it; batched arm was
-  itself warm and still lost.
-
-**Root cause:** MiniMax prefill is disk-bound on streamed experts; batched chunked prefill re-reads the expert
-set per chunk (`vaayu_base.py:7507-7511`) and moves the 2-stream **routing union** per layer → more NVMe bytes
-than two serial prefills. Different cause than Qwen3-Next's (not recurrent, not VRAM), same verdict: batching is
-the wrong lever; single-stream + prefix cache wins.
-
-**Not measured:** one prompt size / one width / cold turn only (a warm turn-2 would be ≈ neutral, not a reversal);
-smaller contexts with high decode:prefill ratio; gpt-oss / DeepSeek / dense. No code changed; user `config_local.py`
-restored. #37 stays DEAD on this hardware for both measured MoE forwards.
-
----
-
-# S54 — dense (Llama-3.3-70B EXL3) batching THROUGH THE SERVER
-
-## [x] S54 — measure dense batching via the server (CLOSED 2026-10-14; MEASURE ONLY, no code change)
-
-**Why:** S53 found MoE batching loses to the routing union. Dense has NO routing — all lanes share identical
-weights — so a streamed-dense batch should read each layer once and serve both lanes. Predicted a WIN; measured it.
-RESULTS: `docs/2026-10-14-S54-dense-server-batching-RESULTS.md`.
-
-**Result — batching WINS on dense (sign flips vs MoE).** Harness `p10e_server_ab.py`, Llama-3.3-70B EXL3, 2
-concurrent clients, 1.5k prompt, cold, prefix ON, sdpa, derived `max_seq_len=8272`:
-- serial (`MAX_BATCH_SIZE=1`): **216.7 s** (warm control 211.6 s), `batches_run=0`.
-- batched (`MAX_BATCH_SIZE=2`): **171.8 s**, `batches_run=1` (real width-2 ✓).
-- **1.25× FASTER.** Warm≈cold serial, so not an ordering artifact (and the 39 GB model can't fully cache in 32 GB).
-
-**Rule established:** batching helps when lanes SHARE the bytes streamed off disk (dense → one weight read serves
-both lanes, prefill+decode), hurts when they DIVERGE (MoE routing union ~2×). So batching is NOT dead engine-wide:
-DEAD for the two on-disk MoE forwards (S52 Qwen3-Next recurrent+VRAM, S53 MiniMax disk-union), LIVE for dense.
-
-**Perspective:** modest win; streamed-dense decode ~2.7 s/token regardless. The bigger dense lever is speculative
-decoding (5.57×, row 12); batching is minor + complementary, and needs N>1 offered load. Reachable via
-`MAX_BATCH_SIZE>=2` + sdpa. **Not measured:** one prompt/width/cold; larger-context width-2 VRAM admission (dense KV
-is big — may hit Qwen's ceiling); Llama-3.2-1B (VRAM-resident, compute-bound — different regime). No code changed;
-user `config_local.py` restored.
-
----
-
-# ▶▶▶ OPEN — S55: finish the per-model batching sweep ◀◀◀
-
-## [ ] S55 — measure N>1 batching through the server on the REMAINING on-disk models
-
-**Why kept open (USER, 2026-10-14):** the sweep so far (S52 Qwen3-Next, S53 MiniMax, S54 dense Llama-70B)
-established the rule — **batching helps when lanes SHARE the bytes streamed off disk (dense: 1.25×), hurts when
-they DIVERGE (MoE routing union: MiniMax 0.60×; Qwen3-Next also dead on recurrent+VRAM).** The user wants the
-remaining models measured before any engine-wide verdict. Each is a prediction to confirm, same harness
-(`plans/probes/p10e_server_ab.py`), same method (boot MBS=1 vs MBS=2, sdpa, prefix ON, 2 concurrent clients,
-`batches_run` must be >0 to count; warm-serial control to kill ordering; restore `config_local.py` after).
-
-Remaining on-disk models and the prediction for each:
-- [ ] **gpt-oss-20b** (MXFP4, whole-layer fused-3D, routed delivery). MoE with routed experts → expect the
-  routing-union penalty like MiniMax → **predict SLOWER**. BUT it fits in VRAM (stock 13.79 GB) and Vaayu runs it
-  with the expert VRAM tier / elastic tier — so it may NOT be disk-bound the way MiniMax is; the union penalty
-  could be cheap if experts are resident. Genuinely uncertain — measure. Check width-2 VRAM admission first.
-- [ ] **DeepSeek-V4-Flash** (module-list, I8+E8M0 routed experts + F8 shared/attn, 256 experts top-6, MLA). MoE,
-  streamed, routing union → **predict SLOWER** (same family as MiniMax). Confirm. Slow decode (1.78 tok/s) → use a
-  small prompt/max_tokens to keep it feasible. Nothing may be written into its model dir.
-- [ ] **Llama-3.2-1B** (dense, unquantized, VRAM-resident). Dense → lanes share weights, BUT it is compute-bound,
-  not disk-bound (fits in VRAM, no streaming to amortize) → batching tests GEMM batching efficiency, a DIFFERENT
-  regime from streamed dense. **Predict a small win or neutral** (compute batching, not disk sharing). Fast to run
-  (seconds). Good control for "is the dense win about disk sharing or batched GEMM?"
-
-**Done-criteria:** each model a measured serial-vs-batched number with `batches_run>0` (or a VRAM-refusal note if
-width-2 won't admit), a warm control, RESULTS in `docs/`, and a row here. THEN write the engine-wide batching
-verdict (which forwards benefit, which don't, and the SHARE-vs-DIVERGE rule) into `documentation/server.md` and
-close S55. MEASURE ONLY unless a finding warrants a code change.
+(From S52.) Rudra saw a planner tool call returned as raw `<tool_call>` text under batched decode (2/2), never
+serial. Engine corruption was REFUTED bitwise (S52) and code review found no batched-vs-serial tool-call gap (batched
+finalize parses tool calls like serial; app.py streaming suppression is uniform). To close: a SERVER-level repro —
+`MAX_BATCH_SIZE>=2` + sdpa, two concurrent `/v1/chat/completions` with `tools` + `stream=true` at `max_seq_len<=16k`;
+check whether streamed `content` ever leaks `<tool_call>` when batches form, vs serial. Then confirm-or-refute, or
+file a real `[bug]`. **Low priority** — #37 is DEAD regardless.
