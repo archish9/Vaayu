@@ -41,6 +41,38 @@ class ChatMessage(BaseModel):
     tool_calls: list[ToolCall] | None = None
     tool_call_id: str | None = None
 
+    @field_validator("content", mode="before")
+    @classmethod
+    def _flatten_content(cls, v):
+        """Accept OpenAI's array-of-parts content, not only a bare string.
+
+        The OpenAI wire format allows `content` to be a string OR a list of
+        parts (`[{"type": "text", "text": "..."}]`); langchain_openai and
+        other clients emit the list form when one message is assembled from
+        several blocks (a system prompt plus a memory block, say). A text-only
+        server still renders ONE string through the chat template, so the text
+        parts are concatenated in order -- exactly the string the bare form
+        would have carried. A non-text part (image, audio) is refused with a
+        422 that names the part, not silently dropped: this server is text.
+        """
+        if v is None or isinstance(v, str):
+            return v
+        if isinstance(v, list):
+            parts: list[str] = []
+            for part in v:
+                if isinstance(part, str):
+                    parts.append(part)
+                elif (isinstance(part, dict) and part.get("type") == "text"
+                      and isinstance(part.get("text"), str)):
+                    parts.append(part["text"])
+                else:
+                    kind = part.get("type") if isinstance(part, dict) else type(part).__name__
+                    raise ValueError(
+                        "message content parts must be text; this server does "
+                        f"not accept a {kind!r} part")
+            return "".join(parts)
+        return v
+
 
 class FunctionDef(BaseModel):
     model_config = ConfigDict(extra="ignore")

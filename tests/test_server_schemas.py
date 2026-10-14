@@ -116,3 +116,32 @@ def test_an_explicit_session_id_wins_over_user():
 def test_session_key_is_none_when_neither_is_sent_so_auto_match_runs():
     assert _req().session_key is None
     assert _req(user="").session_key is None, "an empty user is not a session"
+
+
+def test_content_array_of_text_parts_is_flattened_to_a_string():
+    # OpenAI wire allows content as a list of parts; langchain_openai emits it
+    # when a message is assembled from several blocks (system prompt + memory).
+    # A text-only server renders one string, so the parts concatenate in order.
+    r = _req(messages=[{"role": "system", "content": [
+        {"type": "text", "text": "block one\n"},
+        {"type": "text", "text": "\nblock two"},
+    ]}])
+    assert r.messages[0].content == "block one\n\nblock two"
+
+
+def test_content_plain_string_still_passes_through():
+    r = _req(messages=[{"role": "user", "content": "hi"}])
+    assert r.messages[0].content == "hi"
+
+
+def test_content_none_still_allowed_for_a_tool_call_message():
+    r = _req(messages=[{"role": "assistant", "content": None}])
+    assert r.messages[0].content is None
+
+
+def test_non_text_content_part_is_refused_not_silently_dropped():
+    # This server is text-only; an image part must fail loudly, naming it.
+    with pytest.raises(ValidationError, match="image_url"):
+        _req(messages=[{"role": "user", "content": [
+            {"type": "image_url", "image_url": {"url": "http://x/y.png"}},
+        ]}])
