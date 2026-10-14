@@ -5,6 +5,10 @@ airllm.egg-info
 build
 dist
 __pycache__
+# S51: the vendored gpt-oss MXFP4 triton kernel ships a build/ dir; keep it
+# tracked so gpt-oss loads offline on a fresh clone (overrides the `build` rule).
+!vaayu/vendor/**
+vaayu/vendor/**/__pycache__/
 airllm-original
 venv
 vaayu_rust/target
