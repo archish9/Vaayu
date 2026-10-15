@@ -45,18 +45,83 @@ running. Boot/kill a background server with the Bash tool; `pkill -9 -f "python 
 
 # OPEN
 
-## [ ] S55 — next batching test: a model NOT currently on disk
+**Priority order (set 2026-10-15, user approved — each item its own FRESH session, CLAUDE.md §6):**
+1. **S55-B** DELETE_ORIGINAL guard — cheapest, prevents data loss (already cost a 111 GB download).
+2. **EXL3-UP** exllamav3 0.0.34→1.6.2 upgrade — strategic/foundational; brainstorm install strategy first.
+3. **EXL3-K** half-integer-K fix — cheap correctness (3.5-bpw EXL3 quants); can ride EXL3-UP's re-gate.
+4. **S55-A** EXL3 DeepSeek-V4 modeling port — big, low value; do last or drop.
+S55 / S55' / S56 (the batching sweep) resume after. These four are the live thread now.
 
-The user wants the sweep continued on a model that is **not on disk yet** (the on-disk set — Qwen3-Next, MiniMax,
-Llama-70B/1B, gpt-oss, DeepSeek-V4 — is already measured or predicted). **At the start of S55, ASK THE USER which
-model** — do not assume or pick one. Then: download/stage it (its own new empty dir; nothing written into a model
-dir that forbids it), confirm its layout (dense vs MoE, streamed vs VRAM-resident, recurrent?), PREDICT the batching
-sign from the SHARE-vs-DIVERGE rule above, then measure with the recipe above (serial vs batched, `batches_run>0`,
-warm control, RESULTS doc in `docs/`, a row here).
+## [ ] EXL3-UP — upgrade exllamav3 0.0.34 → 1.6.2 (own task, independent of all others)
 
-Open question the rule has NOT settled and S55 may answer: a **VRAM-resident MoE** (experts not streamed off disk)
-might not pay the union penalty, so `is_moe` alone may not predict the sign — the share-vs-diverge property does.
-This matters for S56's hint.
+Full self-contained spec: `docs/2026-10-15-exllamav3-upgrade-0.0.34-to-1.6.2-TASK.md`. **Verified safe at the API
+level** (S55 session): `BC_LinearEXL3` ctor unchanged (8 args; `K` int→float, coercion-safe), `g_tensor_cache.get`
+identical; 1.6.2 needs `torch>=2.6` and engine has `torch 2.11.0+cu130` → **no torch bump**. **Does NOT** add
+architectures to Vaayu (it uses only exllamav3 kernels, not its models) and **does NOT** fix S55-A — keep separate.
+**Real friction:** no `cu130` prebuilt wheel (only cu128/cu132 for torch2.11/cp312); `nvcc` not on PATH → install
+strategy is source-build vs cu132-wheel vs torch-CUDA-build-switch (brainstorm). **Mandatory validation:** bit-for-bit
+EXL3 re-gate (MiniMax + Llama-70B `test_dense_gate.py`), full suite floor `4132 passed`, `cargo test`, `maturin`
+rebuild — kernel numerics are NOT statically verifiable. Do in a worktree/isolated venv (0.0.34 stays the fallback).
+§8: no knob, reaches server on install; done = re-gates green.
+
+## [bug] EXL3-K — Vaayu computes trellis K with int floor; wrong for half-integer-bpw EXL3
+
+`loader_strategy.py:405` (`K = trellis.shape[-1] // 16`) and `moe_patch.py:968` (same). exllamav3's own
+`modules/quant/exl3.py` uses `K = trellis.shape[-1] / 16; int(K) if is_integer() else K` — half-integer K (3.5 bpw,
+tile width `16*K+8`, `mul1` only). Vaayu's `//16` floor-truncates → wrong K / miscompute on any half-integer-bpw EXL3
+checkpoint. No such checkpoint on disk today (all current EXL3 are integer bpw), so latent — but it's a correctness
+bug independent of the exllamav3 version. **Fix:** match exllamav3's formula at both sites; test with a synthetic
+half-integer trellis shape. Cheap. Best validated on the upgraded lib (ride EXL3-UP's re-gate).
+
+## [!] S55 — batching test on DeepSeek-V4-Flash EXL3 — BLOCKED: model does not load
+
+User picked (2026-10-15): `amanwalksdownthestreet--DeepSeek-V4-Flash-0731-exl3` (EXL3 3.0bpw, 43L, 256 experts top-6,
+MLA, non-recurrent, 111 GB → streamed MoE/module-list). **PREDICTION: batching HURTS ~0.6×** (streamed MoE, routing
+union/chunk — same bucket as S53 MiniMax). Would add a clean non-recurrent streamed-MoE point; does NOT settle the
+VRAM-resident-MoE open question (firmly streamed). **NOT MEASURED** — load fails. Full text:
+`docs/2026-10-15-S55-deepseek-v4-exl3-load-FAILED-RESULTS.md`.
+
+**Blocked on [bug] S55-A below.** Unblocks when the EXL3 DeepSeek-V4 loader gap is fixed; then run the recipe
+(serial vs batched, `batches_run>0`, warm control). Open VRAM-resident-MoE question still unanswered — may need a
+different model.
+
+## [!] S55-A — EXL3 DeepSeek-V4 won't load: port the EXISTING modeling off the fp4+TileLang flow (SUBSTANTIAL)
+
+**Scope settled 2026-10-15 by a worktree spike (two earlier framings — "one-line guard" then "write arch from
+scratch" — were BOTH wrong).** The DeepSeek-V4 arch ALREADY exists in Vaayu (`vaayu/model_code/deepseek_v4/
+modeling_deepseek_v4.py`, 1740 lines: MLA, sparse indexer, MoE, custom cache) and its module tree MATCHES the EXL3
+checkpoint (same `attn.wq_a/wq_b/wkv/wo_b`, `compressor`, `indexer`, `experts.N`, `shared_experts`, `gate`, `hc_*`).
+So NOT a rewrite. Why it fails: (1) the generic EXL3 strategy (`loader_strategy.py:472` `setup_model`) swaps every
+`nn.Linear`→`ExLlamaV3Linear`, but this modeling is built from the custom `DeepseekV4Linear`, so nothing gets swapped;
+(2) `init_model` calls fp4-only `fp4_group_size_from_split` + loads TileLang kernels from `inference/` (absent in EXL3);
+(3) **the TileLang `kernels()` implement DeepSeek-V4's CORE compute, not just the weight GEMMs** — `sparse_attn`
+(MLA sparse-index attention, `modeling:1394`), `hc_split_sinkhorn`/`hc_head` (`:1479/:1606`), `act_quant` — and those
+are fused inline in the attn/compressor/indexer forwards and ship only with the fp4 checkpoint, not the EXL3 one.
+**Real work:** build `nn.Linear` at each quantized site when `is_exl3` (so the generic swap + module-list expert
+injection fill them with trellis QMatrix), rework the attn/compressor/indexer forwards from the fp4 `act_quant+gemm`
+pattern to EXL3-linear calls while KEEPING `sparse_attn`/`hc_*` (and SOURCE those TileLang kernels — weight-quant-
+independent, reusable, but the EXL3 download lacks them), handle `wo_a` as 8 slices (`wo_a.slice.0..7` in EXL3 vs one),
+skip fp4_group_size/TileLang-load when EXL3. **Days of surgical work, own spec+plan+tests.** Full evidence:
+`docs/2026-10-15-S55-deepseek-v4-exl3-load-FAILED-RESULTS.md`. **The EXL3-UP upgrade does NOT fix this** (1.6.2 adds
+DeepSeek-V4 to exllamav3's OWN model framework, which Vaayu doesn't use). Low value (predicted-redundant datapoint) —
+do last or drop. The 102 GB `splitted_model/` is the only copy left (S55-B); keep it only if pursuing this.
+
+## [bug] S55-B — DELETE_ORIGINAL default destroyed the fresh download
+
+`DELETE_ORIGINAL = True` (default, `vaayu/server/config.py:62`). First boot against the fresh 111 GB download split it
+into `splitted_model/` (102 GB, 43 layer files, present) then **deleted all 16 original `model-000NN-of-00016`
+shards** (`delete_original: reclaimed 110.9 GB ... the split copy is now the only copy`) — irreversible, recovery =
+re-download. The split copy does NOT load either (S55-A). CLAUDE.md's "DeepSeek serves from a plain download, nothing
+written to its dir" holds only for the non-EXL3 variant (in-process registration skips the splitter); the EXL3 variant
+took the normal split+delete path. **Guard:** set `DELETE_ORIGINAL = False` in `config_local.py` BEFORE the first load
+of any new/experimental checkpoint; consider defaulting it off for unrecognised dirs. User decision needed:
+re-download vs. fix S55-A and load the existing split.
+
+## [ ] S55' — (if DeepSeek-V4 EXL3 stays blocked) pick another not-on-disk model for the sweep
+
+The VRAM-resident-MoE open question (does `is_moe` alone mispredict the batching sign for a MoE whose experts fit in
+VRAM?) is still unanswered. If S55-A is not fixed, stage a different model to answer it — ideally a small MoE that is
+VRAM-resident, not streamed. ASK THE USER before staging.
 
 ## [ ] S56 — build the server batching-hint (option 1) + a self-contained Rudra spec
 
