@@ -82,8 +82,8 @@ def client(uncaptured_stdout):
     are cached rather than returned to the OS, and the second load is
     OOM-killed (exit 137) under a 22 GB cgroup cap.
 
-    delete_original=False because the server's default is True and running
-    this gate against a not-yet-split checkpoint DELETED its 2.3 GB source
+    delete_original=False because delete_original=True on this gate, run
+    against a not-yet-split checkpoint, DELETED its 2.3 GB source
     file (measured 2026-08-23 on Llama-3.2-1B); the loader then stopped
     recognising the directory as a local checkpoint and fell through to a
     HuggingFace download. A gate may not consume the thing it is testing.

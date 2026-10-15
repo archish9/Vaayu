@@ -104,16 +104,17 @@ class ServerConfig:
     # Delete the ORIGINAL downloaded shards once Vaayu's split copy is verified
     # complete, reclaiming 39-66 GB per checkpoint. IRREVERSIBLE: recovery is a
     # re-download, and the removal follows symlinks, so a shard linked into the
-    # shared HF cache takes the cached blob with it. On by default because a
-    # server holds one checkpoint for its whole life and the duplicate is pure
-    # waste; set False to keep the originals for other tools.
+    # shared HF cache takes the cached blob with it. OFF by default (S55-B):
+    # "complete" is not "loadable", so a split that passes the check yet will not
+    # load still triggered the delete and destroyed a fresh download on first
+    # boot. Set True once the checkpoint loads and serves, to reclaim the dup.
     # Where logs land. `server.log` gets EVERYTHING the process emits (fd-level,
     # so the vaayu_rust io_uring lines are in it too); sessions/<id>.log gets one
     # line per lifecycle event for that session.
     log_dir: str = "logs"
     capture_stdio: bool = True
     log_rotate_mb: int = 50
-    delete_original: bool = True
+    delete_original: bool = False
     # Refuse a request that names no session. Without one the prefix pool keys
     # on a hash of the prompt's first 64 tokens, so two agents sharing a system
     # prompt collide on a single entry and evict each other -- and concurrent

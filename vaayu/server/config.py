@@ -53,13 +53,22 @@ EXCLUSIVE_GPU_MIN_MIB = 256
 # Delete the ORIGINAL downloaded shards once Vaayu's own split copy is verified
 # complete (every layer has its .safetensors AND its .done marker), reclaiming
 # 39-66 GB per checkpoint. A server holds one checkpoint for its whole life, so
-# the duplicate is pure waste -- hence ON by default.
+# once the split is known good the duplicate is pure waste -- set True to reclaim
+# it.
 #
-# IRREVERSIBLE. Recovery is a re-download. The removal follows symlinks, so a
-# shard linked into the shared HuggingFace cache takes the cached blob with it,
-# which affects every other tool sharing that cache. Set False to keep the
-# originals -- for example if another framework reads the same checkpoint.
-DELETE_ORIGINAL = True
+# OFF by default (2026-10-15, S55-B): "complete" is NOT "loadable". The check
+# above passes for a split whose .done markers are all present yet which the
+# engine cannot actually load (an unsupported quant or architecture), and the
+# delete fires regardless -- so the first boot of a fresh download split it, then
+# DELETED the 111 GB of originals, leaving only a split copy that would not load.
+# Recovery was a re-download. Defaulting OFF means no first load ever deletes a
+# download before it has proven it can serve the model.
+#
+# IRREVERSIBLE when True. Recovery is a re-download. The removal follows
+# symlinks, so a shard linked into the shared HuggingFace cache takes the cached
+# blob with it, which affects every other tool sharing that cache. Turn True
+# once a checkpoint loads and serves, to reclaim the 39-66 GB duplicate.
+DELETE_ORIGINAL = False
 
 # Let the model emit a reasoning block before its answer. OFF by default: the
 # trace costs the same tok/s as the answer and the caller did not ask for it.

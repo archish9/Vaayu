@@ -46,8 +46,8 @@ running. Boot/kill a background server with the Bash tool; `pkill -9 -f "python 
 # OPEN
 
 **Priority order (set 2026-10-15, user approved — each item its own FRESH session, CLAUDE.md §6):**
-1. **S55-B** DELETE_ORIGINAL guard — cheapest, prevents data loss (already cost a 111 GB download).
-2. **EXL3-UP** exllamav3 0.0.34→1.6.2 upgrade — strategic/foundational; brainstorm install strategy first.
+1. **S55-B** ✅ **DONE 2026-10-15** — DELETE_ORIGINAL default flipped True→False (see closed row below).
+2. **EXL3-UP** exllamav3 0.0.34→1.6.2 upgrade — strategic/foundational; brainstorm install strategy first.  ← NEXT
 3. **EXL3-K** half-integer-K fix — cheap correctness (3.5-bpw EXL3 quants); can ride EXL3-UP's re-gate.
 4. **S55-A** EXL3 DeepSeek-V4 modeling port — big, low value; do last or drop.
 S55 / S55' / S56 (the batching sweep) resume after. These four are the live thread now.
@@ -106,16 +106,25 @@ skip fp4_group_size/TileLang-load when EXL3. **Days of surgical work, own spec+p
 DeepSeek-V4 to exllamav3's OWN model framework, which Vaayu doesn't use). Low value (predicted-redundant datapoint) —
 do last or drop. The 102 GB `splitted_model/` is the only copy left (S55-B); keep it only if pursuing this.
 
-## [bug] S55-B — DELETE_ORIGINAL default destroyed the fresh download
+## [x] S55-B — DELETE_ORIGINAL default flipped True→False (DONE 2026-10-15)
 
-`DELETE_ORIGINAL = True` (default, `vaayu/server/config.py:62`). First boot against the fresh 111 GB download split it
-into `splitted_model/` (102 GB, 43 layer files, present) then **deleted all 16 original `model-000NN-of-00016`
-shards** (`delete_original: reclaimed 110.9 GB ... the split copy is now the only copy`) — irreversible, recovery =
-re-download. The split copy does NOT load either (S55-A). CLAUDE.md's "DeepSeek serves from a plain download, nothing
-written to its dir" holds only for the non-EXL3 variant (in-process registration skips the splitter); the EXL3 variant
-took the normal split+delete path. **Guard:** set `DELETE_ORIGINAL = False` in `config_local.py` BEFORE the first load
-of any new/experimental checkpoint; consider defaulting it off for unrecognised dirs. User decision needed:
-re-download vs. fix S55-A and load the existing split.
+**Verdict:** the auto-delete footgun is removed at the root — the default no longer deletes any download. Flipped
+`DELETE_ORIGINAL` True→False at BOTH default sites (`config.py:62` = running server, `app.py:116` = ServerConfig
+dataclass default), with the comments, `server/README.md` and `tests/test_delete_original.py`
+(`..._is_off_by_default`, +2 tests that leaned on the ON default now pass `delete_original=True` explicitly) updated to
+match; 2 stale comments in `test_dense_gate.py`/`test_server_smoke.py` corrected. Targeted tests 30/30 incl.
+`test_engine_param_reachability`. Full suite `4073 passed, 1 failed` — the 1 failure is `test_max_batch_size_defaults_to_one`,
+caused by the user's machine-local `config_local.py` setting `MAX_BATCH_SIZE=3` (pre-existing batching-sweep state, not
+this change); proven 12/12 green with config_local absent. §8: already a knob, already plumbed — default flip ships on
+edit, no new wiring. Evidence: `docs/2026-10-15-S55-deepseek-v4-exl3-load-FAILED-RESULTS.md` §5.
+
+**NOT fixed (sidestepped), noted for a possible follow-up:** the delete gates on split *completeness* (all `.done`
+markers), not *loadability* — a complete-but-unloadable split (exactly S55-A) still triggers the delete when
+`DELETE_ORIGINAL=True`. The default flip makes that harmless for first loads, but anyone who turns it True inherits the
+gap. A stronger fix (gate the delete on one successful load/serve) is more code; deferred, user's call.
+
+**Still open (NOT part of S55-B):** the existing DeepSeek-V4 EXL3 dir already lost its originals; only `splitted_model/`
+remains and it does not load (S55-A). Re-download vs. fix S55-A is a user decision under S55/S55-A, unchanged here.
 
 ## [ ] S55' — (if DeepSeek-V4 EXL3 stays blocked) pick another not-on-disk model for the sweep
 

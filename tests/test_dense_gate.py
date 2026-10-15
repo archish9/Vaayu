@@ -77,7 +77,7 @@ PROMPT = "Write a Python function that reverses a string. Reply with code only."
 def client():
     """The real server app, booted once.
 
-    delete_original=False: the server's default would delete the checkpoint's
+    delete_original=False: delete_original=True would delete the checkpoint's
     source shards once the split is verified -- a gate may not consume its own
     input (B14). capture_stdio=False: nothing here reads server.log, and the
     fd-level tee would fight pytest's own capture. auto_prefix_match=False: a

@@ -33,12 +33,15 @@ def captured(monkeypatch):
     return seen
 
 
-def test_delete_original_is_on_by_default():
-    assert ServerConfig(model_path="/x").delete_original is True
+def test_delete_original_is_off_by_default():
+    # S55-B: defaulting ON deleted a fresh 111 GB download on first boot, before
+    # the split had proven it could load. "Complete" is not "loadable".
+    assert ServerConfig(model_path="/x").delete_original is False
 
 
 def test_it_reaches_the_loader(captured):
-    with TestClient(create_app(ServerConfig(model_path="/ckpt"))):
+    # The ON path is the irreversible one, so prove IT reaches the loader.
+    with TestClient(create_app(ServerConfig(model_path="/ckpt", delete_original=True))):
         pass
     assert captured["delete_original"] is True
 
@@ -50,8 +53,8 @@ def test_it_can_be_turned_off(captured):
     assert captured["delete_original"] is False
 
 
-def test_the_server_announces_an_irreversible_default_before_it_loads(captured, capsys):
-    with TestClient(create_app(ServerConfig(model_path="/ckpt"))):
+def test_the_server_announces_it_is_irreversible_before_it_loads_when_on(captured, capsys):
+    with TestClient(create_app(ServerConfig(model_path="/ckpt", delete_original=True))):
         pass
     out = capsys.readouterr().out
     assert "DELETE_ORIGINAL" in out
