@@ -45,12 +45,15 @@ running. Boot/kill a background server with the Bash tool; `pkill -9 -f "python 
 
 # OPEN
 
-**Priority order (set 2026-10-15, user approved — each item its own FRESH session, CLAUDE.md §6):**
+**Priority order (updated 2026-10-15 S57, user approved — each item its own FRESH session, CLAUDE.md §6):**
 1. **S55-B** ✅ **DONE 2026-10-15** — DELETE_ORIGINAL default flipped True→False (see closed row below).
 2. **EXL3-UP** ✅ **DONE 2026-10-15 (S57)** — exllamav3 0.0.34→1.6.2 SHIPPED (cu132 wheel on cu130; engine re-gate 6/6; benign drift). See row below.
-3. **EXL3-K** half-integer-K fix — cheap correctness (3.5-bpw EXL3 quants); can ride EXL3-UP's re-gate.
-4. **S55-A** EXL3 DeepSeek-V4 modeling port — big, low value; do last or drop.
-S55 / S55' / S56 (the batching sweep) resume after. These four are the live thread now.
+3. **EXL3-K** half-integer-K fix — cheap correctness (3.5-bpw EXL3 quants); rides EXL3-UP's re-gate (now on 1.6.2).  ← NEXT
+4. **S56** server batching-hint (option 1) + Rudra hand-off doc.
+5. **LOWEST / likely DROP — the DeepSeek-V4-exl3 thread:** **S55-A** (EXL3 modeling port) → **S55** (batching
+   test, blocked on it) → **S55'** (alt model if dropped). S55-A is a multi-day modeling port AND asset-blocked
+   (TileLang `inference/` + `encoding/` not on disk); its one consumer (S55) is a predicted-redundant datapoint.
+   Fresh session, brainstorm first. Self-contained TASK: `docs/2026-10-15-S55A-deepseek-v4-exl3-port-TASK.md`.
 
 ## [x] EXL3-UP — upgrade exllamav3 0.0.34 → 1.6.2 — DONE 2026-10-15 (S57), SHIPPED
 
@@ -108,6 +111,15 @@ VRAM-resident-MoE open question (firmly streamed). **NOT MEASURED** — load fai
 different model.
 
 ## [!] S55-A — EXL3 DeepSeek-V4 won't load: port the EXISTING modeling off the fp4+TileLang flow (SUBSTANTIAL)
+
+**LOWEST PRIORITY / likely DROP. FRESH SESSION, brainstorm first. Self-contained TASK doc (open this first):
+`docs/2026-10-15-S55A-deepseek-v4-exl3-port-TASK.md`.** Re-verified against HEAD 2026-10-15 (S57). **Also
+hard-BLOCKED on missing on-disk assets:** the EXL3 dir has NO `inference/` (the TileLang kernels `init_model`
+requires — they implement CORE compute, not GEMMs) and NO `encoding/` (the prompt renderer), and the original
+shards are gone (only the 102 GB `splitted_model/` remains). So the fresh session's FIRST step is re-sourcing
+`inference/`+`encoding/` (re-download with them, take them from a fp4 DeepSeek checkpoint, or reimplement
+`sparse_attn`/`hc_*`/`act_quant` in plain PyTorch) — not coding. EXL3-UP (1.6.2) is now shipped and does NOT
+fix this.
 
 **Scope settled 2026-10-15 by a worktree spike (two earlier framings — "one-line guard" then "write arch from
 scratch" — were BOTH wrong).** The DeepSeek-V4 arch ALREADY exists in Vaayu (`vaayu/model_code/deepseek_v4/
