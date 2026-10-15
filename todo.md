@@ -47,12 +47,34 @@ running. Boot/kill a background server with the Bash tool; `pkill -9 -f "python 
 
 **Priority order (set 2026-10-15, user approved — each item its own FRESH session, CLAUDE.md §6):**
 1. **S55-B** ✅ **DONE 2026-10-15** — DELETE_ORIGINAL default flipped True→False (see closed row below).
-2. **EXL3-UP** exllamav3 0.0.34→1.6.2 upgrade — strategic/foundational; brainstorm install strategy first.  ← NEXT
+2. **EXL3-UP** ✅ **DONE 2026-10-15 (S57)** — exllamav3 0.0.34→1.6.2 SHIPPED (cu132 wheel on cu130; engine re-gate 6/6; benign drift). See row below.
 3. **EXL3-K** half-integer-K fix — cheap correctness (3.5-bpw EXL3 quants); can ride EXL3-UP's re-gate.
 4. **S55-A** EXL3 DeepSeek-V4 modeling port — big, low value; do last or drop.
 S55 / S55' / S56 (the batching sweep) resume after. These four are the live thread now.
 
-## [ ] EXL3-UP — upgrade exllamav3 0.0.34 → 1.6.2 (own task, independent of all others)
+## [x] EXL3-UP — upgrade exllamav3 0.0.34 → 1.6.2 — DONE 2026-10-15 (S57), SHIPPED
+
+**S57 (2026-10-15) — SHIPPED (user go, option 1). Engine venv = 1.6.2, re-gated 6/6 on-device.**
+Full results: `docs/2026-10-15-S57-exllamav3-upgrade-0.0.34-to-1.6.2-RESULTS.md`.
+- **Install:** the **cu132 prebuilt wheel loads on the cu130 runtime** (ext `.so` dlopens, BC_LinearEXL3 +
+  g_tensor_cache OK) → no source build needed. (CORRECTION to TASK doc: nvcc + full CUDA 13.0 toolkit ARE
+  present at `/usr/local/cuda-13.0`, off PATH — source-build was viable but unused.)
+- **Isolation:** cloned the engine venv to `/home/a/code/ai-ml/Vaayu_venv_exl3up` (now 1.6.2); engine venv
+  stays 0.0.34. TRAP caught: a `cp -a` clone's console-script shebangs point at the ORIGINAL venv, so
+  `$CLONE/bin/pip` installs into the engine venv — use `$CLONE/bin/python -m pip`.
+- **§5 re-gate:** `cargo test` 38/38; full suite clone = engine control = `1 failed, 4073 passed, 89 skipped`
+  (the 1 failure is the pre-existing config_local `MAX_BATCH_SIZE=3` artifact, on BOTH venvs → suite-neutral);
+  Llama-3.2-1B gate 6/6; Llama-3.3-70B-exl3 gate 6/6 (ppl 8.87). EXL3 numerics bit-for-bit vs 0.0.34:
+  both forwards bit-deterministic within a version, so drift is kernel-only — **dense (Llama-70B) Δppl
+  +0.25 %, max|d| 0.633; module-list (MiniMax) Δppl −0.62 %, max|d| 2.688.** Small, deterministic, benign
+  (§5 "characterise any drift" branch), non-degrading. COVERAGE CAVEAT: fused-EXL3 forward has no checkpoint
+  → unverified.
+- **§8: SHIPPED.** Engine venv flipped to `1.6.2+cu132.torch2.11.0` (ext loads) and the Llama-70B dense gate
+  passed 6/6 ON the engine venv (ppl 8.87) — §6 "done" met. `requirements.txt` pinned `exllamav3==1.6.2`
+  (cu132 wheel URL + toolkit note in the comment). Rollback artifacts durable in
+  `/home/a/code/ai-ml/vaayu_exl3_artifacts/` (0.0.34 backup tgz + the 1.6.2 wheel). Isolation clone removed.
+- **Follow-ups unlocked:** EXL3-K (half-integer K, item 3) can now ride this re-gate; the fused-EXL3 forward
+  stays uncovered (no checkpoint) — note it when a fused-EXL3 model returns.
 
 Full self-contained spec: `docs/2026-10-15-exllamav3-upgrade-0.0.34-to-1.6.2-TASK.md`. **Verified safe at the API
 level** (S55 session): `BC_LinearEXL3` ctor unchanged (8 args; `K` int→float, coercion-safe), `g_tensor_cache.get`

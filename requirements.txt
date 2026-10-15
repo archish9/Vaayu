@@ -21,12 +21,23 @@ bitsandbytes>=0.43.0
 # tests/test_packed_expert_dequant.py).
 compressed-tensors>=0.18.0
 
-# EXL3 strategy: ExLlamaV3 4-bit quantized inference
-# Requires CUDA Toolkit 12.x and gcc/g++ build tools.
-# If compile fails due to memory: MAX_JOBS=4 pip install exllamav3
-# ninja is required for fast C++ extension compilation
+# EXL3 strategy: ExLlamaV3 provides the EXL3 quant KERNELS only. Vaayu imports
+# exllamav3.ext.BC_LinearEXL3 + exllamav3.util.tensor.g_tensor_cache; it does NOT
+# use exllamav3's own Model/loader/architectures (new-model support rides
+# transformers + checkpoint modeling). Pinned 1.6.2 (upgraded from 0.0.34, S57
+# 2026-10-15): EXL3 re-gate green on dense (Llama-70B) + module-list (MiniMax),
+# small benign deterministic numeric drift vs 0.0.34 characterised in
+# docs/2026-10-15-S57-exllamav3-upgrade-0.0.34-to-1.6.2-RESULTS.md.
+#
+# This box (torch 2.11.0+cu130, py3.12, sm_120) installs the PREBUILT cu132 wheel
+# from the v1.6.2 GitHub release — the PyPI dist is py3-none-any and builds the ext
+# from source (needs the CUDA 13 toolkit on PATH + ninja; nvcc lives at
+# /usr/local/cuda-13.0/bin, off PATH by default). The cu132 ext loads on the cu130
+# runtime (validated S57). Install on this box with:
+#   pip install --no-deps 'https://github.com/turboderp-org/exllamav3/releases/download/v1.6.2/exllamav3-1.6.2%2Bcu132.torch2.11.0-cp312-cp312-linux_x86_64.whl'
+# ninja is required for the source-build fallback / fast C++ extension compilation.
 ninja
-exllamav3>=0.0.18
+exllamav3==1.6.2
 
 # Optional attention backends (improves throughput on supported GPUs)
 # flash-attn>=2.7.4   # install separately: pip install flash-attn --no-build-isolation
