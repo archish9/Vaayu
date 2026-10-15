@@ -953,6 +953,8 @@ def _make_bc_linear_exl3(
     from exllamav3 import ext as exl3_ext
     from exllamav3.util.tensor import g_tensor_cache
 
+    from .persist.loader_strategy import exl3_trellis_k
+
     trellis = gpu_components.get("trellis")
     suh = gpu_components["suh"] if "suh" in gpu_components else gpu_components.get("su")
     svh = gpu_components["svh"] if "svh" in gpu_components else gpu_components.get("sv")
@@ -965,7 +967,7 @@ def _make_bc_linear_exl3(
             f"got: {list(gpu_components.keys())}"
         )
 
-    K = trellis.shape[-1] // 16
+    K = exl3_trellis_k(trellis)
     xh = g_tensor_cache.get(device, (1, in_features), torch.float16)
 
     return exl3_ext.exllamav3_ext.BC_LinearEXL3(

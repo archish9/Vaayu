@@ -48,8 +48,8 @@ running. Boot/kill a background server with the Bash tool; `pkill -9 -f "python 
 **Priority order (updated 2026-10-15 S57, user approved — each item its own FRESH session, CLAUDE.md §6):**
 1. **S55-B** ✅ **DONE 2026-10-15** — DELETE_ORIGINAL default flipped True→False (see closed row below).
 2. **EXL3-UP** ✅ **DONE 2026-10-15 (S57)** — exllamav3 0.0.34→1.6.2 SHIPPED (cu132 wheel on cu130; engine re-gate 6/6; benign drift). See row below.
-3. **EXL3-K** half-integer-K fix — cheap correctness (3.5-bpw EXL3 quants); rides EXL3-UP's re-gate (now on 1.6.2).  ← NEXT
-4. **S56** server batching-hint (option 1) + Rudra hand-off doc.
+3. **EXL3-K** ✅ **DONE 2026-10-15** — half-integer trellis-K floor fixed at both sites (see closed row below).
+4. **S56** server batching-hint (option 1) + Rudra hand-off doc.  ← NEXT
 5. **LOWEST / likely DROP — the DeepSeek-V4-exl3 thread:** **S55-A** (EXL3 modeling port) → **S55** (batching
    test, blocked on it) → **S55'** (alt model if dropped). S55-A is a multi-day modeling port AND asset-blocked
    (TileLang `inference/` + `encoding/` not on disk); its one consumer (S55) is a predicted-redundant datapoint.
@@ -89,14 +89,26 @@ EXL3 re-gate (MiniMax + Llama-70B `test_dense_gate.py`), full suite floor `4132 
 rebuild — kernel numerics are NOT statically verifiable. Do in a worktree/isolated venv (0.0.34 stays the fallback).
 §8: no knob, reaches server on install; done = re-gates green.
 
-## [bug] EXL3-K — Vaayu computes trellis K with int floor; wrong for half-integer-bpw EXL3
+## [x] EXL3-K — half-integer trellis-K floor fixed at both sites — DONE 2026-10-15
 
-`loader_strategy.py:405` (`K = trellis.shape[-1] // 16`) and `moe_patch.py:968` (same). exllamav3's own
-`modules/quant/exl3.py` uses `K = trellis.shape[-1] / 16; int(K) if is_integer() else K` — half-integer K (3.5 bpw,
-tile width `16*K+8`, `mul1` only). Vaayu's `//16` floor-truncates → wrong K / miscompute on any half-integer-bpw EXL3
-checkpoint. No such checkpoint on disk today (all current EXL3 are integer bpw), so latent — but it's a correctness
-bug independent of the exllamav3 version. **Fix:** match exllamav3's formula at both sites; test with a synthetic
-half-integer trellis shape. Cheap. Best validated on the upgraded lib (ride EXL3-UP's re-gate).
+**Verdict:** the `//16` floor that truncated a half-integer bitrate K (3.5 bpw, tile width `16*floor(K)+8` →
+`shape[-1]=56` → `56//16=3` WRONG vs `56/16=3.5`) is replaced at both sites by exllamav3's formula
+(`modules/quant/exl3.py:67-68`: `k = shape[-1]/16; int(k) if is_integer() else k`). One shared helper
+`exl3_trellis_k()` in `loader_strategy.py` (module-level, before `build_exl3_qmatrix`), called from
+`loader_strategy.py:405` (keeps its `trellis is not None else 0` guard) and `moe_patch.py:968`
+(`_make_bc_linear_exl3`, function-local import — matches moe_patch's existing pattern, avoids the circular import).
+**Bit-identical on every on-disk checkpoint** (all integer bpw; `x//16 == int(x/16)` for any multiple of 16, same
+`int` type), latent half-integer branch now correct. C++ `BC_LinearEXL3` ctor takes K 4th and accepts a float (S55
+API audit), so `3.5` is safe. TDD: `tests/test_exl3_trellis_k.py` RED (missing helper) → GREEN 3/3 (integer 48→3,
+64→4 int; half-integer 56→3.5, 40→2.5 float; parity over {48,56,64,40,72,88}). Full suite **4076 passed** (= S57
+baseline 4073 + 3 new), 89 skipped, **1 failed = the pre-existing machine-local `config_local.py MAX_BATCH_SIZE=3`
+artifact** (passes 1/1 with config_local absent — NOT this change). On-device EXL3 gate `test_dense_gate.py` on
+Llama-3.3-70B-exl3 **6/6, ppl 8.87** (= S57 figure), exercising the edited `build_exl3_qmatrix` through a real EXL3
+load. No Rust touched. §8: no knob, replaces inline compute at both live ctor sites, reaches the server on every EXL3
+load → **SHIPPED**. **Coverage caveat:** no half-integer-bpw checkpoint on disk to exercise the corrected branch
+end-to-end (unit test is its only coverage); site 2 (module-list MoE) not run on-device this session (identical
+helper, structurally covered by `test_moe_patch`); fused-EXL3 forward still uncovered (no checkpoint). Full detail:
+`docs/2026-10-15-EXL3-K-half-integer-trellis-K-RESULTS.md`.
 
 ## [!] S55 — batching test on DeepSeek-V4-Flash EXL3 — BLOCKED: model does not load
 

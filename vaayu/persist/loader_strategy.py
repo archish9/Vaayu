@@ -339,6 +339,19 @@ class ExLlamaV3Linear(nn.Module):
             raise RuntimeError("exllamav3 not installed. Cannot run ExLlamaV3Linear.forward().")
 
 
+def exl3_trellis_k(trellis: "torch.Tensor") -> "int | float":
+    """Bitrate K for the BC_LinearEXL3 kernel, read off the trellis tile width.
+
+    A tile stores 16*K uint16 for integer K and 16*floor(K)+8 for a half-integer
+    K (3.5 bpw, mul1 codebook), so K = trellis.shape[-1] / 16 and must keep the
+    fraction for the half-integer rates. Matches exllamav3's own LinearEXL3
+    (modules/quant/exl3.py); a //16 floor truncates 3.5 -> 3 and miscomputes
+    every half-integer-bpw EXL3 checkpoint.
+    """
+    k = trellis.shape[-1] / 16
+    return int(k) if float(k).is_integer() else k
+
+
 def build_exl3_qmatrix(
     mod: "ExLlamaV3Linear", tensors_by_base: dict, device: str, non_blocking: bool = True,
     timing: dict | None = None,
@@ -402,7 +415,7 @@ def build_exl3_qmatrix(
     if suh is None and "su" in gpu_tensors:
         raise NotImplementedError("su packed weight detected, please unpack to suh")
 
-    K = trellis.shape[-1] // 16 if trellis is not None else 0
+    K = exl3_trellis_k(trellis) if trellis is not None else 0
 
     bsz1_xh_args = (device, (1, mod.in_features), torch.float16)
     xh = g_tensor_cache.get(*bsz1_xh_args)
