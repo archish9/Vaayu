@@ -48,6 +48,23 @@ running. Boot/kill a background server with the Bash tool; `pkill -9 -f "python 
 
 # OPEN
 
+## [bug] fused-EXL3 chunk-major prefill crashes (prompt > prefill_chunk_size) — found 2026-10-16
+
+**`_make_fused_sparse_forward_exl3` uses a STALE `_prefill_staged` key scheme.** A prompt over
+`prefill_chunk_size` (512) → chunk-major prefill → `TypeError: 'int' object is not subscriptable`.
+Root cause: `_stage_prefill_expert` writes FLAT tuple keys `_prefill_staged[(layer_idx, eidx)]` (`moe_patch.py:2784`)
+and `_release_prefill_staged` sweeps them with `k[0]` (`:2811`, lambdas `:2943`/`:3494`), but the fused-EXL3 forward
+reads `_prefill_staged` as INT-keyed `.pop(layer_idx)/.get(layer_idx)` (`:3256/3258`, an older staging API with
+`_prefill_staged_slabs`/`_prefill_stage_sem`). Incompatible → crash. Short prompts (one chunk) avoid it; decode is fine.
+**Latent uncovered-path rot:** the non-EXL3 fused + module-list forwards were migrated to the flat scheme and are tested
+with long prompts; the fused-EXL3 forward was not, because Qwen3-235B (its only model) was retired 2026-09-20 and nothing
+ran a long prompt through it since — exactly the §0 "unverifiable without a fused-EXL3 checkpoint" risk.
+**Repro model (on disk):** `darkbit1001--Qwen3.6-35B-A3B-EXL3-6.00bpw-hb6` (fused-EXL3, loads, selects this forward).
+**Fix:** migrate the fused-EXL3 forward's prefill staging to the shared flat-tuple scheme (match `_make_fused_sparse_forward`),
+then re-run the smoke with a long prompt + teacher-forced ppl. Self-contained systematic-debugging + TDD task; needs the
+model loaded (~min/iteration). **Fixing this also RESTORES fused-EXL3 forward coverage** (the one forward with no model).
+Evidence: `docs/2026-10-16-qwen3_5_moe-fused-exl3-load-and-smoke-FINDINGS.md`.
+
 **Priority order (updated 2026-10-15 S57, user approved — each item its own FRESH session, CLAUDE.md §6):**
 1. **S55-B** ✅ **DONE 2026-10-15** — DELETE_ORIGINAL default flipped True→False (see closed row below).
 2. **EXL3-UP** ✅ **DONE 2026-10-15 (S57)** — exllamav3 0.0.34→1.6.2 SHIPPED (cu132 wheel on cu130; engine re-gate 6/6; benign drift). See row below.
