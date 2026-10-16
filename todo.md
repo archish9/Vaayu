@@ -28,10 +28,13 @@ Status keys: `[ ]` pending · `[~]` in progress · `[!]` blocked · `[bug]` open
 Protocol: `CLAUDE.md` §6 (this ledger), §7 (all plans / RESULTS go in `docs/`, gitignored — so every row carries its
 own numbers), §8 (every change must reach the server; say if it is banked).
 
-**Suite floor (last known, after S56, 2026-10-16):** `4092 passed, 89 skipped, 1 failed` (228.83 s, FOREGROUND).
+**Suite floor (last known, after FUSED-EXL3-GATE, 2026-10-16):** `4094 passed, 92 skipped, 1 failed` (230.23 s, FOREGROUND).
 The 1 failure is the pre-existing machine-local `config_local.py MAX_BATCH_SIZE=3` artifact
-(`test_max_batch_size_defaults_to_one`), not a code regression — passes with `config_local` absent. 4092 =
-EXL3-K baseline 4076 + S56's 16 new tests. (Prior floor `4132 passed` was `main` at `893cb5a` 2026-10-14, before
+(`test_max_batch_size_defaults_to_one`), not a code regression — passes with `config_local` absent. 4094 =
+S56 floor 4092 + 2 from `a0ba81c`'s `test_fused_exl3_prefill_staging.py`; the FUSED-EXL3-GATE adds +3 **skipped**
+(89→92) when `FUSED_EXL3_CKPT` is unset. Two on-device gates skip unless their env is set: `DENSE_CKPT=`
+(`test_dense_gate.py`) and `FUSED_EXL3_CKPT=` (`test_fused_exl3_gate.py`, model
+`darkbit1001--Qwen3.6-35B-A3B-EXL3-6.00bpw-hb6`, ppl 5.98). (Prior floor `4132 passed` was `main` at `893cb5a` 2026-10-14, before
 S57/EXL3-K/S56 and before the `config_local` batching-sweep leftover; dense gate 6/6 both Llama, ppl 8.87.) `cargo test` in `vaayu_rust/`: `38 passed, 0 failed, 1 ignored`. Needs a
 current `vaayu_rust` build (`maturin develop --release` in `vaayu_rust/`, needs `VIRTUAL_ENV` set). Re-establish this
 floor at the top of the next session before changing CODE (the sweep so far changed no code, so the floor stands).
@@ -70,29 +73,42 @@ ceiling 25) + coherent short and 661-tok generations. Bare `m.forward` ppl works
 recurrent + multimodal (vision tower dropped at load) + streamed, so it does NOT settle resident-MoE or add a batching
 bucket — its value was exposing + fixing this bug and restoring fused-EXL3 coverage.
 
-## [ ] FUSED-EXL3-GATE — standing on-device regression gate for the fused-EXL3 forward — NEXT (fresh session)
+## [x] FUSED-EXL3-GATE — standing on-device regression gate for the fused-EXL3 forward — DONE 2026-10-16, SHIPPED
 
-**User approved 2026-10-16; do in a FRESH session (fresh-session-per-row). Brainstorm (bounded) → TDD.**
-The fused-EXL3 forward had ZERO on-disk coverage after Qwen3-235B retired (2026-09-20), which let the prefill
-staging bug (fixed `a0ba81c`) sit latent until a user-found crash. Add a pytest gate (mirror `test_dense_gate.py`'s
-`DENSE_CKPT=` pattern) behind `FUSED_EXL3_CKPT=`, skipping when unset. Model on disk:
-`/home/a/code/ai-ml/models/darkbit1001--Qwen3.6-35B-A3B-EXL3-6.00bpw-hb6` (fused-EXL3, loads text-only, selects
-`_make_fused_sparse_forward_exl3`). Assert: (1) `forward_name == "_make_fused_sparse_forward_exl3"`; (2) teacher-forced
-ppl over `REFERENCE_TEXT` under a loose ceiling (measured **5.98**; set ~15–20); (3) **REQUIRED regression guard** — a
-prompt OVER `prefill_chunk_size` (512, e.g. ~661 tok) through `m.generate` must not crash and must emit coherent text
-(the stager-active condition that used to raise `TypeError: 'int' object is not subscriptable`). Gotchas: `m.tokenizer`
-is a multimodal PROCESSOR (pull `.input_ids` from the BatchEncoding); load `max_seq_len=4096`, `enable_prefix_cache=False`;
-run FOREGROUND (reaper), `VIRTUAL_ENV`+`PYTHONPATH` set. §8: a test, no knob; add it to the on-device gates section here.
-Coverage caveat: only fused-EXL3 checkpoint on disk, and it is multimodal + recurrent (not a plain fused-EXL3).
-**Self-contained spec:** `docs/2026-10-16-fused-exl3-gate-TASK.md`.
+**Verdict:** `tests/test_fused_exl3_gate.py` added, mirroring `test_dense_gate.py`'s gate pattern behind
+`FUSED_EXL3_CKPT=` (skips when unset). Restores on-device coverage of the fused-EXL3 forward
+(`_make_fused_sparse_forward_exl3`) — the one MoE forward §0 lists with no model since Qwen3-235B retired
+(2026-09-20), which let the `a0ba81c` prefill-staging bug sit latent. One module-scoped load through the REAL server
+app (`create_app(ServerConfig(..., max_seq_len=4096, enable_prefix_cache=False, attn_implementation="sdpa"))`). Three
+tests: (1) forward selection — all blocks `expert_style=="fused"` AND `forward_name=="_make_fused_sparse_forward_exl3"`;
+(2) teacher-forced ppl over `test_dense_gate.REFERENCE_TEXT` (imported) under a loose ceiling **20** (measured 5.98);
+(3) **regression guard for `a0ba81c`** — a ~700-tok prompt through `/v1/chat/completions` (user chose the server path
+over `m.generate`: real §8 path, no multimodal-processor gotcha) must return 200 with non-empty text, with the premise
+`usage.prompt_tokens > prefill_chunk_size` asserted so the over-chunk lookahead stager actually fired.
+
+**Run recipe (FOREGROUND — reaper; ~29 GB free RAM; load ~22 s, `splitted_model/` pre-written):**
+```
+FUSED_EXL3_CKPT=/home/a/code/ai-ml/models/darkbit1001--Qwen3.6-35B-A3B-EXL3-6.00bpw-hb6 \
+  VIRTUAL_ENV=$PWD/venv PYTHONPATH=$PWD \
+  systemd-run --user --scope -p MemoryMax=29G -p MemorySwapMax=0 \
+  ./venv/bin/python -m pytest tests/test_fused_exl3_gate.py -q -s
+```
+
+**On-device (verified 2026-10-16):** unset → `3 skipped`; set → `3 passed` (22.4 s) — forward
+`_make_fused_sparse_forward_exl3`/`fused`; ppl **5.98** over 79 tok (ceiling 20); long prompt `prompt_tokens=703 > 512`,
+200, 16 tok, coherent. Full suite (env unset) `1 failed, 4094 passed, 92 skipped` (gate adds +3 skipped only; the 1
+failure is the pre-existing `config_local MAX_BATCH_SIZE=3` artifact). `cargo test` untouched (no Rust). §8: a TEST, no
+knob. **Coverage caveat:** the only fused-EXL3 checkpoint on disk, multimodal (text-only load) + hybrid recurrent — not
+a plain fused-EXL3; covers selection + prefill (incl. the rotted over-chunk stager) + decode + ppl. Detail:
+`docs/2026-10-16-fused-exl3-gate-RESULTS.md`. Spec: `docs/2026-10-16-fused-exl3-gate-TASK.md`.
 
 **Priority order (updated 2026-10-16, user approved — each item its own FRESH session, CLAUDE.md §6):**
 1. **S55-B** ✅ **DONE 2026-10-15** — DELETE_ORIGINAL default flipped True→False (see closed row below).
 2. **EXL3-UP** ✅ **DONE 2026-10-15 (S57)** — exllamav3 0.0.34→1.6.2 SHIPPED (cu132 wheel on cu130; engine re-gate 6/6; benign drift). See row below.
 3. **EXL3-K** ✅ **DONE 2026-10-15** — half-integer trellis-K floor fixed at both sites (see closed row below).
 4. **S56** ✅ **DONE 2026-10-16** — server batching-hint + Rudra hand-off doc SHIPPED (see closed row below).
-5. **FUSED-EXL3-GATE** — add a standing on-device fused-EXL3 regression gate (below).  ← NEXT (fresh session)
-6. **LOWEST / likely DROP — the DeepSeek-V4-exl3 thread:** **S55-A** (EXL3 modeling port) → **S55** (batching
+5. **FUSED-EXL3-GATE** ✅ **DONE 2026-10-16** — `tests/test_fused_exl3_gate.py` behind `FUSED_EXL3_CKPT=`, 3/3 on-device (see closed row below).
+6. **LOWEST / likely DROP — the DeepSeek-V4-exl3 thread:**  ← NEXT (fresh session) **S55-A** (EXL3 modeling port) → **S55** (batching
    test, blocked on it) → **S55'** (alt model if dropped). S55-A is a multi-day modeling port AND asset-blocked
    (TileLang `inference/` + `encoding/` not on disk); its one consumer (S55) is a predicted-redundant datapoint.
    Fresh session, brainstorm first. Self-contained TASK: `docs/2026-10-15-S55A-deepseek-v4-exl3-port-TASK.md`.
