@@ -2739,13 +2739,23 @@ VRAM_RESIDENT_NO_RAW = object()
 _STAGING_WAIT_BACKSTOP_S = 5.0
 
 
-def _prefill_staged(vaayu_ref) -> dict:
+def _slab_staged(vaayu_ref) -> dict:
     """{(layer_idx, expert_idx): slab_idx} for prefill experts whose bytes are still
-    sitting in a staging slab the forward has not finished uploading."""
-    staged = getattr(vaayu_ref, "_prefill_staged", None)
+    sitting in a per-expert staging slab the forward has not finished uploading.
+
+    SEPARATE from `vaayu_ref._prefill_staged`, which the prefill LOOKAHEAD stager
+    (`_prefill_stage_worker`, fused-EXL3 only -- `moe_supports_prefill_stager`) fills
+    with INT-keyed layers `{layer_idx: {expert_idx: views}}`. The two must NOT share a
+    dict: this one is swept by `_release_prefill_staged` with `k[0]`, and an int key
+    there raises `TypeError: 'int' object is not subscriptable`. They shared the name
+    until 2026-10-16, which crashed every fused-EXL3 prefill over `prefill_chunk_size`
+    (the only path where the lookahead stager is active) -- latent since Qwen3-235B,
+    the only fused-EXL3 model, was retired.
+    """
+    staged = getattr(vaayu_ref, "_prefill_slab_staged", None)
     if staged is None:
         staged = {}
-        vaayu_ref._prefill_staged = staged
+        vaayu_ref._prefill_slab_staged = staged
     return staged
 
 
@@ -2781,7 +2791,7 @@ def _stage_prefill_expert(expert_cache, vaayu_ref, layer_idx, eidx, shard_file, 
         raise
     # Registered AFTER the read so a failed read cannot leave a phantom key, and
     # keyed by (layer, expert) so the consuming forward can return exactly this slab.
-    _prefill_staged(vaayu_ref)[(layer_idx, eidx)] = slab_idx
+    _slab_staged(vaayu_ref)[(layer_idx, eidx)] = slab_idx
     # Register BEFORE this check, never after: the layer's finally may be sweeping
     # right now (an exception mid-compute does not wait for in-flight loads). Either
     # the sweep sees the key and releases it, or this does -- both are idempotent, so
@@ -2805,7 +2815,9 @@ def _release_prefill_staged(expert_cache, vaayu_ref, pred) -> None:
     worker registered after its own layer had already swept.
     """
     arena = expert_cache.arena
-    staged = getattr(vaayu_ref, "_prefill_staged", None)
+    # The per-expert slab tracker (`_slab_staged`), NOT the lookahead stager's
+    # int-keyed `_prefill_staged`: the `k[0]` predicates below assume tuple keys.
+    staged = getattr(vaayu_ref, "_prefill_slab_staged", None)
     if arena is None or not staged:
         return
     for key in [k for k in list(staged) if pred(k)]:
