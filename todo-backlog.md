@@ -56,3 +56,31 @@ the on-disk MoE forwards, live for dense. This rule drives S56's `batching_helps
   serial ~214 s (cold 216.7 / warm 211.6) vs batched 171.8 s (`batches_run=1`, width-2) = **1.25× FASTER**. Cause:
   dense lanes share identical weights → one layer read serves both lanes → no union penalty. Sign flips vs MoE.
   Modest win; the bigger dense lever is speculative decoding (5.57×, old row 12).
+
+---
+
+## SETTLED — DO NOT RE-OPEN (since the 2026-10-14 clear)
+
+Refuted perf ideas with the number that killed each. Read before proposing MoE perf work (the old
+pre-clear SETTLED list is in `git log -p -- todo-backlog.md` at `07b5279`).
+
+- **MiniMax VRAM expert tier — grow/re-size it for decode. SETTLED 2026-10-16 (diagnostic session, MEASURE-ONLY,
+  no engine change).** Hypothesis: MiniMax decode is slow because its VRAM expert tier is unsized; sizing it bigger
+  clears row 35's **≥ +15 % at N=1** re-open bar. **REFUTED by arithmetic bounded on a measured MiniMax number.**
+  (1) The tier is **already built four ways over** and model-agnostic: `ExpertVRAMCache` + resident-experts-run-first
+  (`moe_patch.py:1836`), residency-first non-expert-vs-expert sizing (S42, `vram_plan.py:903`), request-sized reserve
+  lending (S35-E elastic tier — gates on CUDA/decode-graphs/speculator/preallocated-KV, **not model**), and
+  first-K-layer restriction when budget < working set (`compute_vram_layer_range`). So "unsized" is false.
+  (2) A VRAM-resident expert only removes **H2D**, which is **31.5 % of a MiniMax decode token** (row 49 step 1,
+  measured). The dominant slice is the **~76 %-busy drive** (disk reads) — the RAM expert cache's job, not the VRAM
+  tier's. VRAM tier = wrong slice. (3) Ceiling: realistic tier 1.7–5 GB → hit ~24–40 % (DeepSeek S40 proxy, same
+  256-expert family) → saves **~7.6–12.6 %**; even a 100 %-hit tier caps at 31.5 %. **~12 % < 15 % bar.** Same bucket
+  as lookahead (+2.5 %, ceiling +11 %) and S25 prefetch (+5.56 %). (4) The gpt-oss VRAM-freeing trick (windowed KV,
+  S35) **does not transfer** — MiniMax `attn_type_list` is all 1s (zero windowed layers, `windowed_kv.py:77`), and
+  S42 already keeps the per-byte-dominant non-expert weights resident. **Floor is physics:** 4.1 GiB/token, 131 GiB
+  expert pool vs 48 GB total memory. MiniMax decode is at its hardware floor; no built or proposed lever clears the
+  bar. The workload lever for MiniMax is TTFT (cross-turn prefix cache, already shipped, S17 HIT TTFT ~14.2 s), and
+  the model-choice lever is Qwen3-Next (~5× faster by geometry). **NOT re-measured on device:** the actual MiniMax
+  VRAM-tier size + decode hit rate were never printed to a doc (every number is DeepSeek/gpt-oss); a measure-only
+  load would read `Expert VRAM cache: X GB (~N experts)` + hit telemetry to replace the proxy, but the verdict is
+  bounded by the measured 31.5 % and does not change.
