@@ -70,12 +70,29 @@ ceiling 25) + coherent short and 661-tok generations. Bare `m.forward` ppl works
 recurrent + multimodal (vision tower dropped at load) + streamed, so it does NOT settle resident-MoE or add a batching
 bucket — its value was exposing + fixing this bug and restoring fused-EXL3 coverage.
 
-**Priority order (updated 2026-10-15 S57, user approved — each item its own FRESH session, CLAUDE.md §6):**
+## [ ] FUSED-EXL3-GATE — standing on-device regression gate for the fused-EXL3 forward — NEXT (fresh session)
+
+**User approved 2026-10-16; do in a FRESH session (fresh-session-per-row). Brainstorm (bounded) → TDD.**
+The fused-EXL3 forward had ZERO on-disk coverage after Qwen3-235B retired (2026-09-20), which let the prefill
+staging bug (fixed `a0ba81c`) sit latent until a user-found crash. Add a pytest gate (mirror `test_dense_gate.py`'s
+`DENSE_CKPT=` pattern) behind `FUSED_EXL3_CKPT=`, skipping when unset. Model on disk:
+`/home/a/code/ai-ml/models/darkbit1001--Qwen3.6-35B-A3B-EXL3-6.00bpw-hb6` (fused-EXL3, loads text-only, selects
+`_make_fused_sparse_forward_exl3`). Assert: (1) `forward_name == "_make_fused_sparse_forward_exl3"`; (2) teacher-forced
+ppl over `REFERENCE_TEXT` under a loose ceiling (measured **5.98**; set ~15–20); (3) **REQUIRED regression guard** — a
+prompt OVER `prefill_chunk_size` (512, e.g. ~661 tok) through `m.generate` must not crash and must emit coherent text
+(the stager-active condition that used to raise `TypeError: 'int' object is not subscriptable`). Gotchas: `m.tokenizer`
+is a multimodal PROCESSOR (pull `.input_ids` from the BatchEncoding); load `max_seq_len=4096`, `enable_prefix_cache=False`;
+run FOREGROUND (reaper), `VIRTUAL_ENV`+`PYTHONPATH` set. §8: a test, no knob; add it to the on-device gates section here.
+Coverage caveat: only fused-EXL3 checkpoint on disk, and it is multimodal + recurrent (not a plain fused-EXL3).
+**Self-contained spec:** `docs/2026-10-16-fused-exl3-gate-TASK.md`.
+
+**Priority order (updated 2026-10-16, user approved — each item its own FRESH session, CLAUDE.md §6):**
 1. **S55-B** ✅ **DONE 2026-10-15** — DELETE_ORIGINAL default flipped True→False (see closed row below).
 2. **EXL3-UP** ✅ **DONE 2026-10-15 (S57)** — exllamav3 0.0.34→1.6.2 SHIPPED (cu132 wheel on cu130; engine re-gate 6/6; benign drift). See row below.
 3. **EXL3-K** ✅ **DONE 2026-10-15** — half-integer trellis-K floor fixed at both sites (see closed row below).
 4. **S56** ✅ **DONE 2026-10-16** — server batching-hint + Rudra hand-off doc SHIPPED (see closed row below).
-5. **LOWEST / likely DROP — the DeepSeek-V4-exl3 thread:** **S55-A** (EXL3 modeling port) → **S55** (batching
+5. **FUSED-EXL3-GATE** — add a standing on-device fused-EXL3 regression gate (below).  ← NEXT (fresh session)
+6. **LOWEST / likely DROP — the DeepSeek-V4-exl3 thread:** **S55-A** (EXL3 modeling port) → **S55** (batching
    test, blocked on it) → **S55'** (alt model if dropped). S55-A is a multi-day modeling port AND asset-blocked
    (TileLang `inference/` + `encoding/` not on disk); its one consumer (S55) is a predicted-redundant datapoint.
    Fresh session, brainstorm first. Self-contained TASK: `docs/2026-10-15-S55A-deepseek-v4-exl3-port-TASK.md`.
