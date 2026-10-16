@@ -147,6 +147,35 @@ adaptive gate, from that model's own routing and acceptance.
 
 ---
 
+## Client fan-out hint (`/v1/models`, `/health`)
+
+The server alone knows the loaded model, so it tells a client whether fanning out
+concurrent requests into an N>1 batch is worth it. **Not a knob — an OUTPUT field**, on
+both endpoints: `/v1/models` → `data[0].batching`, `/health` → `batching_hint`.
+
+```json
+{"helps": true, "recommended_client_concurrency": 2,
+ "reason": "dense: all lanes share identical streamed weights"}
+```
+
+`helps` is a static model property derived once at load (the 2026-10 batching sweep's
+SHARE-vs-DIVERGE rule): **true for dense** (all batch lanes stream identical weights, one
+read serves the batch — measured +25 % on Llama-3.3-70B EXL3), **false for streamed MoE**
+(lanes route to different experts, so the batch streams the per-chunk routing UNION off
+disk — measured a net loss), and **false for a recurrent / windowed / one-length cache**
+(batched decode drops the cross-turn prefix cache there, the dominant lever for an agent
+workload). A MoE whose experts all fit VRAM would share, but that is unmeasured today, so
+it reports `false`.
+
+`recommended_client_concurrency` folds in whether THIS server is configured to batch at
+all (`MAX_BATCH_SIZE >= 2` **and** `ATTN_IMPLEMENTATION = "sdpa"`): **1 means send requests
+serially** — fanning out would only queue behind the one-at-a-time engine. A client reads
+it once at startup and sets its parallel-dispatch width to the number; absent (older
+server) ⇒ assume 1. The server still auto-serializes any batch that cannot admit, so
+over-fanning is capped but pays `sdpa`'s ~2–4 % tax for nothing. The `helps`/admission
+check is a best case taken at the post-load VRAM snapshot; under live concurrent load the
+width-2 reserve can be tighter.
+
 ## Reading the logs
 
 ```

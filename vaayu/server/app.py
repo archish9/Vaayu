@@ -378,6 +378,25 @@ def _served_name(app) -> str:
     return str(getattr(engine.model, "name_or_path", "vaayu"))
 
 
+def batching_hint_payload(model, scheduler) -> dict:
+    """The client-fan-out hint (S56): does an N>1 batch help this model, and how
+    many concurrent requests the client should send.
+
+    `helps` is the static model property (`batch.derive_batching_hint`, stored at
+    load by EngineHandle). `recommended_client_concurrency` also folds in whether
+    this server is configured to batch at all (`scheduler.batching_enabled` =
+    MAX_BATCH_SIZE>=2 + sdpa): 1 means send requests serially -- fanning out would
+    only queue behind the one-at-a-time engine. Total (never raises) so /health
+    keeps its contract: every read defaults, so a model or scheduler missing an
+    attribute yields the serial answer rather than a crash.
+    """
+    helps = bool(getattr(model, "_batching_helps", False))
+    reason = str(getattr(model, "_batching_reason", ""))
+    enabled = bool(getattr(scheduler, "batching_enabled", False))
+    rec = int(getattr(scheduler, "max_batch_size", 1)) if (helps and enabled) else 1
+    return {"helps": helps, "recommended_client_concurrency": rec, "reason": reason}
+
+
 def create_app(config: ServerConfig | None = None, engine=None) -> FastAPI:
     """`engine` is for tests: pass one and no model is loaded."""
 
@@ -580,6 +599,11 @@ def create_app(config: ServerConfig | None = None, engine=None) -> FastAPI:
                 "gate2_refused": s.gate2_refused,
                 "formation_attempts": s._formation_attempts,
             },
+            # S56: the static client-fan-out hint, next to the live counters a
+            # client already polls. Distinct from "batch" (that is this server's
+            # own batch formation; this is advice to the client on whether to
+            # fan out at all). Total, so it never breaks /health's contract.
+            "batching_hint": batching_hint_payload(e.model, s),
         }
         try:
             import torch
@@ -603,7 +627,13 @@ def create_app(config: ServerConfig | None = None, engine=None) -> FastAPI:
         return {"object": "list",
                 "data": [{"id": _served_name(app), "object": "model",
                           "owned_by": "vaayu", "max_seq_len": e.max_seq_len,
-                          "speculative": spec}]}
+                          "speculative": spec,
+                          # S56: the static model property (does an N>1 batch
+                          # help) plus the recommended client concurrency. A
+                          # client asking "what is this server" gets its
+                          # fan-out answer in the same window.
+                          "batching": batching_hint_payload(
+                              e.model, app.state.scheduler)}]}
 
     @app.post("/v1/chat/completions")
     async def chat_completions(req: ChatCompletionRequest, request: Request):

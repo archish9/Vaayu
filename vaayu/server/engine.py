@@ -201,6 +201,14 @@ class EngineHandle:
                   f"{self.max_seq_len}. Every request's default token cap is "
                   f"bounded by it. Load on CUDA for a derived window.")
 
+        # S56: derive once, here at load, whether client fan-out (-> N>1
+        # batching) is worth it for this model, and store it on the model for
+        # /health and /v1/models to read. Static per load (a model property),
+        # and total -- never fails the load. The width-2 admission dry-run it
+        # runs reads the post-load VRAM snapshot.
+        from ..batch import compute_and_store_batching_hint
+        compute_and_store_batching_hint(model)
+
     # ── properties read off the model, never cached ──────────────────────────
 
     @property

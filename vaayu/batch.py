@@ -438,6 +438,122 @@ def expert_giveback_bytes(model) -> int:
     return max(0, int(getattr(cache, "budget_bytes", 0)) - floor)
 
 
+def derive_batching_hint(*, is_moe: bool, total_expert_bytes: int,
+                         expert_vram_budget_bytes: int,
+                         prefix_lost_under_batch: bool,
+                         width2_admits: bool) -> tuple[bool, str]:
+    """Does fanning out concurrent requests into an N>1 batch help THIS model?
+
+    The 2026-10 server batching sweep (S52-S54) established the rule: an N>1
+    batch helps only when its lanes stream the SAME bytes per decode step, and
+    hurts when they DIVERGE.
+
+      * Dense: every lane uses identical weights -- one read serves the batch.
+        SHARE. Measured +25 % (S54, Llama-3.3-70B dense EXL3).
+      * Streamed MoE: two lanes route to different experts, so the batch streams
+        the per-chunk routing UNION off disk (~N x expert bytes). DIVERGE.
+        Measured a net LOSS (S53 MiniMax 0.60x; S52 Qwen3-Next dead).
+      * A MoE whose experts ALL fit the VRAM budget streams no per-chunk union,
+        so it would SHARE -- but no such model has been measured on this
+        hardware (the S55 datapoint is on hold), so we do NOT advertise a win we
+        have not seen. The resident branch below is the flip point: the day a
+        resident-MoE batch is measured to help, it returns True.
+
+    Derived from the share-vs-diverge MECHANISM, not the `is_moe` label
+    (CLAUDE.md §5): the resident-MoE case is a distinct branch, not folded into
+    "MoE => no".
+
+    Two further conditions, both necessary even when the model shares:
+      * `prefix_lost_under_batch`: batched decode drops the cross-turn prefix
+        cache on recurrent / one-length / windowed caches. For an agent workload
+        that cache is the dominant lever, so losing it outweighs a batch gain.
+      * `width2_admits`: a width-2 batch must actually fit in VRAM at the
+        configured max_seq_len. On a small card it often does not.
+
+    Returns (helps, reason).
+    """
+    if not is_moe:
+        shares = True
+        share_reason = "dense: all lanes share identical streamed weights"
+    elif total_expert_bytes > 0 and expert_vram_budget_bytes >= total_expert_bytes:
+        shares = False
+        share_reason = ("VRAM-resident MoE: a batch would stream no per-chunk "
+                        "routing union, so it would likely share -- but this is "
+                        "UNMEASURED (S55 on hold), so batching is not advertised")
+    else:
+        shares = False
+        share_reason = ("streamed MoE: a batch streams the per-chunk routing union "
+                        "off disk (~N x expert bytes); measured a net loss (S53)")
+
+    if not shares:
+        return False, share_reason
+    if prefix_lost_under_batch:
+        return False, ("batching drops the cross-turn prefix cache on this model's "
+                       "cache, which outweighs a batch gain for an agent workload")
+    if not width2_admits:
+        return False, ("a width-2 batch does not admit at this model's max_seq_len "
+                       "on this hardware")
+    return True, share_reason
+
+
+def _width2_admits(model) -> bool:
+    """True iff a width-2 batch admits at `model.max_seq_len` right now.
+
+    Dry-run through the real admission guard (`_assert_context_fits`, the same
+    path `batched_generate` uses). False when it refuses (VramPlanError), when
+    there is no plan to check (it returns None -- CPU / no CUDA, where a width-2
+    batch cannot be confirmed), or on any error.
+    """
+    fit = getattr(model, "_assert_context_fits", None)
+    if not callable(fit):
+        return False
+    from .vram_plan import VramPlanError
+    try:
+        need = fit(int(model.max_seq_len), N=2,
+                   expert_giveback_bytes=expert_giveback_bytes(model),
+                   batched_prefill=True)
+    except VramPlanError:
+        return False
+    except Exception:
+        return False
+    return need is not None
+
+
+def compute_and_store_batching_hint(model) -> dict:
+    """Derive the static batching hint for a loaded `model`, store it on it.
+
+    Called once per load (EngineHandle.__init__). Reads only load-time state:
+    `is_moe`, `_moe_geometry`, the expert VRAM budget, the prefix-cache flags,
+    and a width-2 admission dry-run at the post-load VRAM snapshot (a best case;
+    live concurrent load can be tighter -- stated in the Rudra hand-off doc).
+
+    Never raises: a hint that cannot be derived defaults to "does not help"
+    (CLAUDE.md §5 -- warn, do not degrade silently; D3 -- a diagnostic must not
+    itself be the crash). Returns the static part of the wire payload.
+    """
+    try:
+        is_moe = bool(getattr(model, "is_moe", False))
+        geo = getattr(model, "_moe_geometry", None)
+        total_expert_bytes = (int(geo.get("num_experts", 0))
+                              * int(geo.get("num_moe_layers", 0))
+                              * int(geo.get("expert_bytes", 0))) if geo else 0
+        vc = getattr(model, "_expert_vram_cache", None)
+        budget = int(getattr(vc, "budget_bytes", 0)) if vc is not None else 0
+        prefix_lost = (bool(getattr(model, "_cache_holds_recurrent_state", False))
+                       or bool(getattr(model, "_cache_is_one_length", False))
+                       or bool(getattr(model, "_cache_is_windowed", False)))
+        helps, reason = derive_batching_hint(
+            is_moe=is_moe, total_expert_bytes=total_expert_bytes,
+            expert_vram_budget_bytes=budget,
+            prefix_lost_under_batch=prefix_lost,
+            width2_admits=_width2_admits(model))
+    except Exception as e:   # never fail a load over a diagnostic hint
+        helps, reason = False, f"batching hint could not be derived ({type(e).__name__})"
+    model._batching_helps = bool(helps)
+    model._batching_reason = str(reason)
+    return {"helps": model._batching_helps, "reason": model._batching_reason}
+
+
 def reclaimable_vram_budget(model, reclaim: bool = False) -> int:
     """Free VRAM, plus — when `reclaim` is on — the part of the expert VRAM
     cache the decode loop can afford to give back.

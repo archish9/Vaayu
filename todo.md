@@ -28,8 +28,11 @@ Status keys: `[ ]` pending · `[~]` in progress · `[!]` blocked · `[bug]` open
 Protocol: `CLAUDE.md` §6 (this ledger), §7 (all plans / RESULTS go in `docs/`, gitignored — so every row carries its
 own numbers), §8 (every change must reach the server; say if it is banked).
 
-**Suite floor (last known, `main` at `893cb5a`, 2026-10-14):** `4132 passed, 27 skipped, 538 warnings` (294.01 s,
-FOREGROUND; dense gate 6/6 both Llama). `cargo test` in `vaayu_rust/`: `38 passed, 0 failed, 1 ignored`. Needs a
+**Suite floor (last known, after S56, 2026-10-16):** `4092 passed, 89 skipped, 1 failed` (228.83 s, FOREGROUND).
+The 1 failure is the pre-existing machine-local `config_local.py MAX_BATCH_SIZE=3` artifact
+(`test_max_batch_size_defaults_to_one`), not a code regression — passes with `config_local` absent. 4092 =
+EXL3-K baseline 4076 + S56's 16 new tests. (Prior floor `4132 passed` was `main` at `893cb5a` 2026-10-14, before
+S57/EXL3-K/S56 and before the `config_local` batching-sweep leftover; dense gate 6/6 both Llama, ppl 8.87.) `cargo test` in `vaayu_rust/`: `38 passed, 0 failed, 1 ignored`. Needs a
 current `vaayu_rust` build (`maturin develop --release` in `vaayu_rust/`, needs `VIRTUAL_ENV` set). Re-establish this
 floor at the top of the next session before changing CODE (the sweep so far changed no code, so the floor stands).
 
@@ -49,7 +52,7 @@ running. Boot/kill a background server with the Bash tool; `pkill -9 -f "python 
 1. **S55-B** ✅ **DONE 2026-10-15** — DELETE_ORIGINAL default flipped True→False (see closed row below).
 2. **EXL3-UP** ✅ **DONE 2026-10-15 (S57)** — exllamav3 0.0.34→1.6.2 SHIPPED (cu132 wheel on cu130; engine re-gate 6/6; benign drift). See row below.
 3. **EXL3-K** ✅ **DONE 2026-10-15** — half-integer trellis-K floor fixed at both sites (see closed row below).
-4. **S56** server batching-hint (option 1) + Rudra hand-off doc.  ← NEXT
+4. **S56** ✅ **DONE 2026-10-16** — server batching-hint + Rudra hand-off doc SHIPPED (see closed row below).
 5. **LOWEST / likely DROP — the DeepSeek-V4-exl3 thread:** **S55-A** (EXL3 modeling port) → **S55** (batching
    test, blocked on it) → **S55'** (alt model if dropped). S55-A is a multi-day modeling port AND asset-blocked
    (TileLang `inference/` + `encoding/` not on disk); its one consumer (S55) is a predicted-redundant datapoint.
@@ -178,25 +181,33 @@ The VRAM-resident-MoE open question (does `is_moe` alone mispredict the batching
 VRAM?) is still unanswered. If S55-A is not fixed, stage a different model to answer it — ideally a small MoE that is
 VRAM-resident, not streamed. ASK THE USER before staging.
 
-## [ ] S56 — build the server batching-hint (option 1) + a self-contained Rudra spec
+## [x] S56 — server batching-hint (client fan-out advice) + Rudra hand-off — DONE 2026-10-16, SHIPPED
 
-USER approved option 1 (2026-10-14): the **server advertises whether client fan-out (→ N>1 batching) is worth it**,
-because the benefit is load-determined and only the server knows the model. The decision is static per load (a model
-property), not per request — no runtime A/B needed. Two deliverables:
+**Verdict:** the server now advertises whether client fan-out (→ N>1 batching) is worth it, derived once at
+load. Two wire fields on BOTH `/v1/models` (`data[0].batching`) and `/health` (`batching_hint`):
+`helps` (static model property) + `recommended_client_concurrency` (`max_batch_size` when helps AND server
+batch-configured (`MAX_BATCH_SIZE>=2`+sdpa), else 1) + `reason`. Rule (share-vs-diverge, NOT hardcoded
+is_moe): dense→helps (shared streamed weights, +25 % S54); streamed MoE→no (per-chunk routing union, S53
+0.60×); **VRAM-resident MoE→no (predicted-share but UNMEASURED, S55 on hold — the resident branch is the
+one-line flip point when measured)**; recurrent/windowed/one-length cache→no (batched decode drops the prefix
+cache); width-2-won't-admit→no. Pure helpers in `vaayu/batch.py` (`derive_batching_hint`, `_width2_admits`
+dry-running the real `_assert_context_fits(N=2, batched_prefill=True)`, `compute_and_store_batching_hint` —
+never raises); computed in `EngineHandle.__init__`; `batching_hint_payload` in `app.py`; README section added.
+TDD: `tests/test_batching_hint.py` 16/16 green (rule parametrized over Qwen3-Next-like & MiniMax-like + resident
+synthetic; store; payload; both endpoints). Full suite `1 failed, 4092 passed, 89 skipped` (4076 EXL3-K baseline
++16; the 1 failure = pre-existing machine-local `config_local MAX_BATCH_SIZE=3` artifact). On-device (Llama-3.2-1B
+dense, real load): `max_seq_len=65953`→width-2 refused→helps=False (honest VRAM-ceiling catch); `=4096`→admits→
+helps=True,rec=2. §8: server OUTPUT field, no knob, reaches the client → **SHIPPED**. Rudra hand-off written.
+Full detail: `docs/2026-10-16-S56-batching-hint-RESULTS.md`; Rudra spec: `docs/2026-10-16-vaayu-batching-hint-for-rudra.md`.
 
-- [ ] **Vaayu side.** At load, derive `batching_helps` and expose it to the client — a field on `/health` and/or
-  `/v1/models`, plus a recommended client concurrency (1 ⇒ don't fan out). Rule:
-  `batching_helps = SHARE-not-DIVERGE AND (not recurrent) AND width-2 admits at the configured max_seq_len`.
-  **Do NOT hardcode `is_moe` as the whole test** until S55 settles whether a VRAM-resident MoE benefits — derive
-  from the share-vs-diverge property (streamed + per-lane-divergent experts → no) rather than the label. Dry-run the
-  width-2 admission on the same path `batched_generate._assert_context_fits(N=2)` uses. §8: server field, no knob,
-  reaches the client → state SHIPPED when wired. Add a test. (S55 should land first so the rule is final.)
-- [ ] **Rudra side — hand-off doc.** Write a SELF-CONTAINED spec `docs/2026-MM-DD-vaayu-batching-hint-for-rudra.md`
-  (Rudra has no Vaayu internals context — self-contained like `docs/rudra-batching-findings-2026-10-14.md`):
-  which field the server exposes and where, its exact meaning, the client logic (read ONCE at startup; set fan-out
-  concurrency = the recommended value; 1 ⇒ send model calls serially), the fallback when the field is absent (assume
-  1 = serial), and the note that the server still auto-serializes any batch that can't admit, so over-fanning is
-  capped but wasteful. Rudra implements its parallel-dispatch gate from this doc alone.
+- [x] **Vaayu side** — fields on both endpoints, derivation, test. SHIPPED.
+- [x] **Rudra side** — self-contained hand-off doc `docs/2026-10-16-vaayu-batching-hint-for-rudra.md`.
+
+**Caveats / open:** width-2 fit is a post-load VRAM snapshot (best case; live load tighter — stated in README +
+Rudra doc). Resident-MoE stays `false` until measured (S55 on hold); the new model offered 2026-10-16
+(`Lygodactylus--Qwen3.8-27B-Uncensored-exl3-8bpw`) does NOT settle it — it is **dense** (one mlp/layer, zero
+experts) + **streamed** (28 GB @ 8bpw) = a streamed-dense point (re-confirms S54), and a new multimodal arch
+(`Qwen3_5ForConditionalGeneration`) whose load is itself unproven in Vaayu.
 
 ## [ ] (2-open) [bug?] server tool-call-as-raw-text under batched streaming — unreproduced, no defect located
 
