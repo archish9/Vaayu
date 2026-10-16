@@ -65,9 +65,10 @@ lookahead stager keeps `_prefill_staged` (int). TDD: `tests/test_fused_exl3_pref
 active, depth=2) now generates coherently — previously crashed. **This RESTORES fused-EXL3 forward coverage** (§0's
 one forward with no model). Evidence: `docs/2026-10-16-qwen3_5_moe-fused-exl3-load-and-smoke-FINDINGS.md`.
 
-**Open follow-up (minor):** a teacher-forced PPL number was not taken — a bare full-sequence `m.forward` (dense-gate
-ppl style) is not the serving path; serving (generate/_chunked_prefill) works. The model is also HYBRID recurrent +
-multimodal (vision tower dropped at load) + streamed, so it does NOT settle resident-MoE or add a batching bucket.
+**Correctness fully verified 2026-10-16:** teacher-forced **PPL 5.98** over 79 tokens of plain English (dense-gate
+ceiling 25) + coherent short and 661-tok generations. Bare `m.forward` ppl works post-fix too. The model is HYBRID
+recurrent + multimodal (vision tower dropped at load) + streamed, so it does NOT settle resident-MoE or add a batching
+bucket — its value was exposing + fixing this bug and restoring fused-EXL3 coverage.
 
 **Priority order (updated 2026-10-15 S57, user approved — each item its own FRESH session, CLAUDE.md §6):**
 1. **S55-B** ✅ **DONE 2026-10-15** — DELETE_ORIGINAL default flipped True→False (see closed row below).
