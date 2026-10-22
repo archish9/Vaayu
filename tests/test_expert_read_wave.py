@@ -105,7 +105,7 @@ def _expected_segments(metas, slab):
 
 def test_the_installed_extension_has_the_wave():
     assert smp._READ_SEGMENTS is not None, (
-        "stale vaayu_rust: run `maturin develop --release` in vaayu_rust/")
+        "stale vaayu_rust: run `pip install -U vaayu-rust`")
 
 
 def test_wave_views_equal_the_serial_path_and_the_clone_path(expert, monkeypatch):
@@ -208,7 +208,7 @@ def test_stale_extension_warning(monkeypatch, capsys, use_iouring, symbol, warns
     monkeypatch.setattr(smp, "_READ_SEGMENTS", symbol)
     smp._warn_if_stale_extension()
     out = capsys.readouterr().out
-    assert ("io_uring_read_segments" in out and "WARNING" in out and "maturin develop --release" in out) is warns
+    assert ("io_uring_read_segments" in out and "WARNING" in out and "pip install -U vaayu-rust" in out) is warns
     if not warns:
         assert out == ""
 

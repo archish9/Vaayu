@@ -26,7 +26,7 @@ def _payload(n: int) -> bytes:
 
 def test_extension_exposes_read_segments():
     assert hasattr(vaayu_rust, "io_uring_read_segments"), (
-        "stale vaayu_rust: run `maturin develop --release` in vaayu_rust/")
+        "stale vaayu_rust: run `pip install -U vaayu-rust`")
 
 
 def test_read_segments_delivers_each_segment(tmp_path):

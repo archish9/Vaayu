@@ -29,7 +29,7 @@ pip install \
     "optimum>=1.17.0" \
     "huggingface-hub>=0.20.0" \
     "bitsandbytes>=0.43.0" \
-    ninja tqdm einops scipy sentencepiece peft evaluate scikit-learn wandb kernels maturin Pillow
+    ninja tqdm einops scipy sentencepiece peft evaluate scikit-learn wandb kernels Pillow
 
 # 4. Install flash-attn using build-isolation bypass (compiles CUDA kernels, 5-15 mins)
 pip install flash-attn --no-build-isolation
@@ -50,22 +50,19 @@ done
 
 ---
 
-## Part 2: Compiling the Native Rust `vaayu_rust` Extension
+## Part 2: Installing the Native Rust `vaayu_rust` Extension
 
-The zero-copy `io_uring` disk-streaming engine lives inside the native C-extension `vaayu_rust`. 
+The zero-copy `io_uring` disk-streaming engine lives inside the native extension `vaayu_rust`, shipped as a prebuilt `manylinux` `abi3` wheel on PyPI (Linux x86-64). No Rust toolchain or compilation needed — one wheel covers Python 3.8+.
 
 ```bash
-# 1. Navigate to the Rust package directory
-cd vaayu_rust
+# 1. Install the prebuilt extension
+pip install vaayu-rust
 
-# 2. Compile and develop the Rust extension in release mode
-# (Maturin compiles Cargo assets and installs the shared library (.so) into your active venv)
-maturin develop --release
-
-# 3. Verify the installation
-cd ..
-python3 -c "import vaayu_rust; print('✅ vaayu_rust extension compiled & loaded successfully!')"
+# 2. Verify the installation
+python3 -c "import vaayu_rust; print('✅ vaayu_rust extension loaded successfully!')"
 ```
+
+If the installed extension is older than the engine expects, the load log prints a `[VAAYU-IO] WARNING`; upgrade with `pip install -U vaayu-rust`.
 
 Rebuild it the same way after pulling changes to `vaayu_rust/`. If the installed extension is older than the engine expects, the load log prints a `[VAAYU-IO] WARNING` naming what is missing and the engine falls back to a slower read path.
 

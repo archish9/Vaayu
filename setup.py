@@ -36,6 +36,7 @@ setuptools.setup(
         'huggingface-hub',
         'scipy',
         #'bitsandbytes' set it to optional to support fallback when not installable
+        'vaayu-rust>=0.2.0; sys_platform == "linux"',  # native io_uring ext (prebuilt wheel)
     ],
     cmdclass={
         'install': PostInstallCommand,

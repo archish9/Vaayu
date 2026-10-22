@@ -378,8 +378,8 @@ def _warn_if_stale_extension() -> None:
     trip per byte group instead of one in total."""
     if _USE_IOURING and _READ_SEGMENTS is None:
         print("[VAAYU-IO] WARNING: the installed vaayu_rust has no io_uring_read_segments — "
-              "expert reads issue one round trip per byte group. Rebuild it: "
-              "`maturin develop --release` in vaayu_rust/.")
+              "expert reads issue one round trip per byte group. Upgrade it: "
+              "`pip install -U vaayu-rust`.")
 
 
 def init_model_io(model_dir: str, use_direct_io: bool) -> None:
