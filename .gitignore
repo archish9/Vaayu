@@ -38,3 +38,5 @@ logs/
 
 command
 notes.md
+# secret rust extension lives in its own repo, shipped via PyPI
+vaayu_rust/
