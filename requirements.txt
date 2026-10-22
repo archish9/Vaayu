@@ -59,8 +59,11 @@ wandb>=0.16.0
 # VLM and specialized model kernels
 kernels>=0.13.0
 
-# Rust extension build tool (for vaayu_rust io_uring module)
-maturin
+# Native io_uring disk-streaming extension (vaayu_rust). Closed-source, shipped as
+# a prebuilt manylinux abi3 wheel from PyPI — Linux-only. The engine imports it at
+# load and falls back to a slower read path with a [VAAYU-IO] WARNING if absent
+# (see vaayu/persist/safetensor_model_persister.py).
+vaayu-rust>=0.2.0 ; sys_platform == "linux"
 
 Pillow
 # HTTP server (vaayu/server) — OpenAI-compatible inference API

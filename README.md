@@ -115,22 +115,20 @@ python3.12 -m venv venv
 source venv/bin/activate
 
 # Install core libraries & Triton JIT requirements
-pip install "torch>=2.6.0" "transformers==5.5.4" "accelerate>=0.28.0" "safetensors>=0.4.0" "optimum>=1.17.0" "huggingface-hub>=0.20.0" "bitsandbytes>=0.43.0" ninja tqdm einops scipy sentencepiece peft evaluate scikit-learn wandb kernels maturin Pillow
+pip install "torch>=2.6.0" "transformers==5.5.4" "accelerate>=0.28.0" "safetensors>=0.4.0" "optimum>=1.17.0" "huggingface-hub>=0.20.0" "bitsandbytes>=0.43.0" ninja tqdm einops scipy sentencepiece peft evaluate scikit-learn wandb kernels Pillow
 
 # Compile CUDA FlashAttention-2 & ExLlamaV3 (compilation takes 5-15 mins)
 pip install flash-attn --no-build-isolation
 pip install git+https://github.com/turboderp-org/exllamav3 --no-build-isolation
 ```
 
-### Step 2: Compile the Native `vaayu_rust` Extension
-Compile our zero-copy `io_uring` disk-streaming engine using Maturin:
+### Step 2: Install the Native `vaayu_rust` Extension
+Vaayu's zero-copy `io_uring` disk-streaming engine ships as a prebuilt wheel on PyPI (Linux x86-64):
 ```bash
-cd vaayu_rust
-maturin develop --release
-cd ..
+pip install vaayu-rust
 ```
 
-Rebuild it the same way after pulling changes to `vaayu_rust/`. If the installed extension is older than the engine expects, the load log prints a `[VAAYU-IO] WARNING` naming what is missing and the engine falls back to a slower read path.
+It is a self-contained `manylinux` `abi3` wheel — no Rust toolchain or compilation needed, and one wheel covers Python 3.8+. If the installed extension is older than the engine expects, the load log prints a `[VAAYU-IO] WARNING` naming what is missing and the engine falls back to a slower read path.
 
 ### Step 3: Relocate Your GPU to the CPU-Direct PCIe x16 Slot
 *If your `gpu_load` times are hovering around ~20 seconds in your logs, your GPU is installed in the wrong slot.*

@@ -23,7 +23,7 @@ pip install \
     "scikit-learn>=1.3.0" \
     "wandb>=0.16.0" \
     "kernels>=0.13.0" \
-    maturin \
+    "vaayu-rust>=0.2.0" \
     Pillow
 
 echo ""
