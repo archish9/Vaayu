@@ -340,4 +340,40 @@ effect accordingly, and say which you are choosing.
 
 ---
 
+## 9. The `vaayu_rust` Native Extension Is a Separate Private Repo (NON-NEGOTIABLE)
+
+**The `io_uring` disk-streaming extension lives in its OWN private git repo
+(`git@github.com:archish9/vaayu_rust.git`), not in this one.** It is gitignored
+here (`vaayu_rust/` in `.gitignore`), and end users get it ONLY as a prebuilt
+`manylinux` `abi3` wheel published to PyPI as `vaayu-rust`. The source is secret
+and never ships. Vaayu's single developer is the user (`p.archish@live.com`); this
+rule is written for that one-person workflow.
+
+- **If the `vaayu_rust/` source is present on disk, edit the Rust directly there.**
+  Do NOT work around a needed Rust change or avoid it because the folder is
+  gitignored — the folder is a nested, independent git checkout. Make the change
+  in `vaayu_rust/src/`, and commit/push it in THAT repo (its own `origin`), never
+  the Vaayu repo. If the folder is absent (e.g. a fresh clone), say the change
+  needs the private repo and stop — do not recreate the source here.
+
+- **A Rust change is INERT until the installed wheel is rebuilt.** Vaayu imports the
+  pip-installed `vaayu_rust`, not `vaayu_rust/src/`. So after ANY edit to the Rust:
+  1. **For local testing on this box:** `source venv/bin/activate && (cd vaayu_rust && maturin develop --release)` rebuilds the `.so` into the venv in place.
+  2. **To ship it to users: ALWAYS REMIND THE USER TO PUBLISH TO PyPI.** Never finish a
+     Rust change without this reminder — it is the exact "banked, not shipped" trap
+     §8 warns about, one layer down. State it plainly in the same response: bump the
+     version in BOTH `vaayu_rust/Cargo.toml` and `vaayu_rust/pyproject.toml` (they
+     must match), then `maturin build --release --zig` + `maturin upload … *.whl`
+     (wheel only). Bump the floor in `requirements.txt` / `setup.py` / `install.sh`
+     if downstream needs the new version.
+
+- **NEVER `maturin publish`** — with `--zig` it builds and uploads an sdist
+  (`.tar.gz`), which leaks the secret source. Build, then upload `*.whl` only, and
+  verify `https://pypi.org/simple/vaayu-rust/` lists no `.tar.gz`. The full release
+  procedure and every detail to remember (abi3→one wheel, Linux-only, manylinux
+  mandatory, the zig gotcha, token) live in `vaayu_rust/README.md` — read it before
+  a release.
+
+---
+
 **These guidelines are working if:** fewer unnecessary changes in diffs, fewer rewrites due to overcomplication, and clarifying questions come before implementation rather than after mistakes.
