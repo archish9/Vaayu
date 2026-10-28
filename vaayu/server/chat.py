@@ -3,7 +3,39 @@
 The checkpoint's own chat template does the work -- there is no per-model
 formatting table here, and there must not be one (CLAUDE.md §5).
 """
+import json
+
 from .tools import detect_tool_format
+
+
+def _normalize_tool_arguments(messages):
+    """A chat template renders a PRIOR assistant tool call by iterating
+    `arguments.items()` -- it needs a dict. The OpenAI wire (and our schema)
+    carries `arguments` as a JSON string, so parse it back to an object before
+    templating, or the template raises `'str object' has no attribute 'items'`.
+    A non-string or unparseable value is left untouched (the template handles or
+    fails on it exactly as before), and the caller's messages are not mutated.
+    """
+    out = []
+    for m in messages:
+        tcs = m.get("tool_calls")
+        if not tcs:
+            out.append(m)
+            continue
+        new_tcs = []
+        for tc in tcs:
+            fn = tc.get("function") if isinstance(tc, dict) else None
+            args = fn.get("arguments") if isinstance(fn, dict) else None
+            if isinstance(args, str):
+                try:
+                    parsed = json.loads(args)
+                except ValueError:
+                    new_tcs.append(tc)
+                    continue
+                tc = {**tc, "function": {**fn, "arguments": parsed}}
+            new_tcs.append(tc)
+        out.append({**m, "tool_calls": new_tcs})
+    return out
 
 
 # Opening/closing pairs seen in the wild. This is a table of CONVENTIONS, not of
@@ -66,6 +98,7 @@ def render_prompt(tokenizer, messages, tools=None, enable_thinking=True, rendere
     checkpoint whose prompt format is not a Jinja template. Given, it is used
     instead of the template; None leaves the template path exactly as it was.
     """
+    messages = _normalize_tool_arguments(messages)
     if renderer is not None:
         return _render_with(renderer, tokenizer, messages, tools, enable_thinking)
 

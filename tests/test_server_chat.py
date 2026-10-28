@@ -178,3 +178,53 @@ def test_a_renderer_rejecting_a_message_propagates_unchanged():
     with pytest.raises(ValueError, match="narrator") as raised:
         render_prompt(TextTokenizer(None), MESSAGES, renderer=renderer)
     assert not isinstance(raised.value, NoChatTemplate)
+
+
+# ── assistant tool_calls replayed into the prompt (multi-turn round-trip) ─────
+# The OpenAI wire (and our schema) carries function.arguments as a JSON STRING,
+# but HF chat templates render a prior call by iterating arguments.items() --
+# they need a dict. Normalise before templating or the template 500s with
+# "'str object' has no attribute 'items'" (MiniMax, verified on-device).
+
+_ASSISTANT_CALL = [
+    {"role": "user", "content": "12 times 7?"},
+    {"role": "assistant", "content": "", "tool_calls": [
+        {"id": "c1", "type": "function",
+         "function": {"name": "multiply", "arguments": '{"a": 12, "b": 7}'}}]},
+]
+
+
+def test_string_tool_call_arguments_are_parsed_to_an_object_before_templating():
+    tok = FakeTokenizer(HERMES_TEMPLATE)
+    render_prompt(tok, _ASSISTANT_CALL, tools=TOOLS)
+    sent = tok.calls[0][0]
+    assert sent[1]["tool_calls"][0]["function"]["arguments"] == {"a": 12, "b": 7}
+
+
+def test_a_template_iterating_arguments_items_survives_string_arguments():
+    class _ItemsTokenizer(FakeTokenizer):
+        def apply_chat_template(self, messages, **kw):
+            for m in messages:
+                for tc in m.get("tool_calls") or []:
+                    tc["function"]["arguments"].items()   # mimics MiniMax template L112
+            return [1, 2, 3]
+
+    assert render_prompt(_ItemsTokenizer(HERMES_TEMPLATE),
+                         _ASSISTANT_CALL, tools=TOOLS) == [1, 2, 3]
+
+
+def test_unparseable_tool_call_arguments_are_left_as_a_string():
+    # Never crash the normaliser on malformed JSON -- leave it for the template
+    # to handle (or fail) exactly as before.
+    msgs = [{"role": "assistant", "content": "", "tool_calls": [
+        {"id": "c1", "type": "function",
+         "function": {"name": "f", "arguments": "not json"}}]}]
+    tok = FakeTokenizer(HERMES_TEMPLATE)
+    render_prompt(tok, msgs, tools=TOOLS)
+    assert tok.calls[0][0][0]["tool_calls"][0]["function"]["arguments"] == "not json"
+
+
+def test_normalisation_does_not_mutate_the_callers_messages():
+    tok = FakeTokenizer(HERMES_TEMPLATE)
+    render_prompt(tok, _ASSISTANT_CALL, tools=TOOLS)
+    assert _ASSISTANT_CALL[1]["tool_calls"][0]["function"]["arguments"] == '{"a": 12, "b": 7}'

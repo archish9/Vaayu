@@ -296,11 +296,32 @@ open below.**
       XML gone from content. Stream → prose content deltas only (zero `<minimax:tool_call>` leak), one
       `delta.tool_calls` chunk, final `finish_reason:tool_calls`, `[DONE]`. Both symptoms from `vaayu-tool-calling.md`
       resolved. Rudra hand-off: `docs/2026-10-28-vaayu-tool-calling-for-rudra.md`.
-- [bug] **markerless (bare-JSON) streaming** (Llama): `open_marker==""` so `_sse` can't buffer mid-stream → a Llama
-      streamed tool call also appears as `content`. Non-streaming Llama is clean; MiniMax/Qwen stream clean. Fix later =
-      full-buffer the turn when `tools` set AND no open_marker, or restrict such models to non-stream. Not Rudra's path
-      (MiniMax is marked).
 - [ ] FUSED-EXL3-GATE-style standing gate for tool formats? (the real-tokenizer probe test is already that, env-free.)
+
+## [x] TOOLCALL-RT — multi-turn tool-call round-trip crashed the template (500) — FIXED + E2E 2026-10-28
+
+**Was blocking Rudra's agent loop at turn 2.** When the history carried a prior ASSISTANT message with `tool_calls`
+(Rudra sends it back per the OpenAI protocol), `engine.prepare` left `tool_calls[].function.arguments` as the
+OpenAI-spec **JSON string**. MiniMax's template (and most HF templates) iterate `arguments.items()` → expect a
+**dict** → `jinja2 UndefinedError: 'str object' has no attribute 'items'` → HTTP 500 at
+`render_prompt`→`generation_tail`.
+
+**Fix (model-agnostic):** `_normalize_tool_arguments` at the top of `chat.render_prompt` parses each assistant
+`tool_calls[].function.arguments` string → object (non-string/unparseable left as-is; caller's messages not mutated),
+so both the real render and `generation_tail` get a dict. **TDD:** `tests/test_server_chat.py` 24/24 (reproduced the
+exact `.items()` crash on a fake template, then green; parse-to-object; unparseable left; no mutation). **ON-DEVICE
+E2E** (MiniMax-M2.7, port 9999): 2-turn curl (user → assistant tool_call with STRING args → `role:tool` result "84" →
+2nd request) returned **HTTP 200**, `"12 times 7 equals **84**."`, `finish_reason:stop` — crash gone, model consumed
+the result. Full suite `1 failed, 4121 passed, 92 skipped` (the 1 = pre-existing config_local artifact).
+
+## [ ] TOOLCALL-STREAM-BARE — markerless (bare-JSON) streamed tool call leaks to content — PENDING, NEED TO FIX
+
+Llama's native tool call has no wrapper marker, so `open_marker==""` and `app.py` `_sse` cannot buffer mid-stream →
+a Llama *streamed* tool call also arrives as `content` (the first balanced JSON object) alongside the final
+`delta.tool_calls`. Non-streamed Llama is clean; MiniMax/Qwen (marked) stream clean, so **not Rudra's path today**.
+Fix = when `req.tools` is set AND the format has no `open_marker`, suppress all content deltas and emit only at the
+final event (buffer the whole turn); cost is that turn loses token-streaming even for a plain-text answer. TDD with an
+app-level streaming test over a markerless (bare-JSON) format.
 
 ## [ ] (2-open) [bug?] server tool-call-as-raw-text under batched streaming — unreproduced, no defect located
 
