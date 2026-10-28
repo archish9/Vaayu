@@ -62,6 +62,18 @@ checkpoint that ships none on purpose: **DeepSeek-V4** is prompted by DeepSeek's
 Nothing is written into the model directory for this. A request carrying `tools` is refused for
 DeepSeek-V4 (its tool-call format is not parsed yet).
 
+**Tool calls.** The model's native tool-call tokens are translated into the OpenAI `tool_calls`
+array (with `finish_reason: "tool_calls"`) before responding — there is no knob, and no model-name
+table. The format is discovered at load by rendering a sentinel call through the checkpoint's OWN
+chat template and reading the delimiters back (`derive_tool_format`). This handles any native shape:
+JSON in a marker (Qwen2.5), bare JSON (Llama), and nested XML in either dialect — `name="x"`
+attributes (MiniMax) or `<function=x>` equals (Qwen3.6). XML parameter values are coerced to the
+types the request's `tools` schema declares. Marked formats also stream (`delta.tool_calls`); a
+markerless bare-JSON format (Llama) is clean non-streamed but, when streamed, a call also appears as
+`content` since there is no marker to buffer from — stream such models' tool turns at your own risk,
+or call them non-streamed. A template that cannot render a tool call at all has its `tools` refused
+rather than silently dropped.
+
 ## Speed
 
 Defaults are already the fast ones, and they differ deliberately from `vaayu_base`'s

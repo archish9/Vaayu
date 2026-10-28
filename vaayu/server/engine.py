@@ -28,7 +28,8 @@ from . import reqlog
 from .chat import NoChatTemplate, TemplateLacksToolSupport, render_prompt
 from .logs import clear_current_session, session_event, set_current_session
 from .stopping import ContextTooLong, finish_reason, resolve_max_tokens
-from .tools import declared_tool_names, detect_tool_format, parse_tool_calls
+from .tools import (declared_tool_names, declared_tool_schemas,
+                    derive_tool_format, detect_tool_format, parse_tool_calls)
 
 
 # Keyword arguments vaayu.streaming.stream_generate constructs itself. Anything
@@ -79,6 +80,9 @@ def cancel_criteria(token: CancelToken):
                               dtype=torch.bool, device=input_ids.device)
 
     return StoppingCriteriaList([_Cancelled()])
+
+
+_UNSET = object()   # "not computed yet", distinct from a probed result of None
 
 
 @dataclass
@@ -190,6 +194,10 @@ class EngineHandle:
         # whether generation has actually STOPPED -- cancellation is cooperative
         # and is only checked once per token -- so `quiesce` needs the thread.
         self._live_thread = None
+        # Tool-call format, discovered once by self-probing the template (two
+        # template renders -- too costly to redo per request). _UNSET until the
+        # first read; see the `tool_format` property.
+        self._tool_format = _UNSET
 
         # vaayu_base falls back to max_seq_len=512 when it built no VramPlan
         # (CPU / no CUDA). This server defaults the generation cap to "the
@@ -218,7 +226,17 @@ class EngineHandle:
 
     @property
     def tool_format(self):
-        return detect_tool_format(getattr(self.model.tokenizer, "chat_template", None))
+        """How THIS checkpoint spells a tool call. Model-agnostic: the self-probe
+        renders a sentinel call through the template and reads the delimiters
+        back (any native shape -- JSON, bare JSON, XML in either dialect). Only
+        if the probe cannot derive one does the marker-table fallback run."""
+        if self._tool_format is _UNSET:
+            tok = getattr(self.model, "tokenizer", None)
+            fmt = derive_tool_format(tok) if tok is not None else None
+            if fmt is None:
+                fmt = detect_tool_format(getattr(tok, "chat_template", None))
+            self._tool_format = fmt
+        return self._tool_format
 
     @property
     def depth(self) -> int:
@@ -638,7 +656,8 @@ class EngineHandle:
             out = payload
             new_ids, text = self._decode_new(out, len(prompt_ids))
             cleaned, calls = parse_tool_calls(text, self.tool_format if req.tools else None,
-                                      declared_tool_names(req.tools))
+                                      declared_tool_names(req.tools),
+                                      declared_tool_schemas(req.tools))
             finish = self._finish(new_ids, cap, calls, cancel=cancel)
             wall = time.time() - started
             self._log(req, "DONE", tokens=len(new_ids), finish=finish,
@@ -811,7 +830,8 @@ class EngineHandle:
 
             full = "".join(parts)
             cleaned, calls = parse_tool_calls(full, self.tool_format if req.tools else None,
-                                      declared_tool_names(req.tools))
+                                      declared_tool_names(req.tools),
+                                      declared_tool_schemas(req.tools))
             produced = len(new_ids)
             finish = self._finish(new_ids, cap, calls, cancel=cancel)
             wall = time.time() - started
@@ -1093,7 +1113,8 @@ class EngineHandle:
                             cleaned, calls = parse_tool_calls(
                                 streams[i].text,
                                 self.tool_format if j.req.tools else None,
-                                declared_tool_names(j.req.tools))
+                                declared_tool_names(j.req.tools),
+                                declared_tool_schemas(j.req.tools))
                             finish = self._finish(streams[i].ids, j.cap, calls,
                                                   cancel=j.cancel)
                             row["finish"] = finish

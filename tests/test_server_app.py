@@ -311,6 +311,32 @@ def test_a_streamed_tool_call_is_emitted_once_and_complete():
     assert events[-1]["choices"][0]["finish_reason"] == "tool_calls"
 
 
+def test_a_streamed_xml_tool_call_never_leaks_its_raw_markup_as_content():
+    # MiniMax emits an XML wrapper, not JSON. The server buffers from the wrapper
+    # marker and emits a structured tool_calls delta -- Rudra must never see the
+    # raw <minimax:tool_call> text in `content` (the exact bug reported).
+    from vaayu.server.tools import ToolCallFormat
+    fmt = ToolCallFormat(
+        name="minimax", grammar="xml",
+        open_marker="<minimax:tool_call>", close_marker="</minimax:tool_call>",
+        call_open_prefix='<invoke name="', call_open_suffix='">',
+        call_close="</invoke>", param_open_prefix='<parameter name="',
+        param_open_suffix='">', param_close="</parameter>")
+    call = ToolCall(id="call_x", function=ToolCallFunction(name="f", arguments='{"a":1}'))
+    engine = FakeEngine(
+        deltas=["ok ", "<minimax:", 'tool_call>\n<invoke name="f">', "..."],
+        result=GenerationResult(text="ok", prompt_tokens=3, completion_tokens=9,
+                                finish_reason="tool_calls", tool_calls=[call]))
+    engine.tool_format = fmt
+    body = dict(BODY, stream=True,
+                tools=[{"type": "function", "function": {"name": "f"}}])
+    events = _sse_events(_client(engine).post("/v1/chat/completions", json=body).text)
+    assert "<minimax:tool_call>" not in _streamed_content(events)
+    with_calls = [e for e in events if e["choices"][0]["delta"].get("tool_calls")]
+    assert len(with_calls) == 1
+    assert events[-1]["choices"][0]["finish_reason"] == "tool_calls"
+
+
 def _streamed_content(events):
     return "".join(e["choices"][0]["delta"].get("content", "") for e in events)
 

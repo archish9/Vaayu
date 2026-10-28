@@ -758,3 +758,40 @@ def test_prepare_renders_with_the_models_own_renderer_when_it_has_one():
     ids, _ = EngineHandle(model).prepare(_req())
 
     assert ids == [120, 121, 122]
+
+
+# ── tool-format discovered by self-probing the template (model-agnostic) ──────
+# A tokenizer that renders MiniMax's native XML tool call when the probe asks
+# for a string render, and ids otherwise. The probe sends an assistant message
+# carrying tool_calls (the call render) and a plain one (to strip the header).
+_MM_CALL = (']~b]ai\n\n<minimax:tool_call>\n<invoke name="ZZNAMEZZ">\n'
+            '<parameter name="KKKEYKK">VVVALVV</parameter>\n</invoke>\n'
+            '</minimax:tool_call>[e~[\n')
+_MM_PLAIN = ']~b]ai\nPLAINTEXTPAYLOAD[e~[\n'
+
+
+class _MiniMaxTokenizer:
+    # Non-empty, and WITHOUT a <tool_call> marker, so the registry fallback would
+    # mis-type this as GENERIC_JSON -- only the probe gets it right.
+    chat_template = "tools go here, call with <minimax:tool_call> ... {{ tools }}"
+
+    def apply_chat_template(self, messages, **kw):
+        if kw.get("tokenize", True) is False:
+            return _MM_CALL if messages[-1].get("tool_calls") else _MM_PLAIN
+        return [1] * 10
+
+
+def test_tool_format_is_discovered_by_probing_the_template_not_the_marker_table():
+    e = EngineHandle(FakeModel())
+    e.model.tokenizer = _MiniMaxTokenizer()
+    fmt = e.tool_format
+    assert fmt is not None and fmt.grammar == "xml"
+    assert fmt.open_marker == "<minimax:tool_call>"
+
+
+def test_the_probed_xml_close_marker_is_added_as_a_stop_string():
+    e = EngineHandle(FakeModel())
+    e.model.tokenizer = _MiniMaxTokenizer()
+    kw = e.build_generate_kwargs(
+        _req(tools=[{"type": "function", "function": {"name": "f"}}]), [1, 2, 3])
+    assert "</minimax:tool_call>" in kw["stop_strings"]

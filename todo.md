@@ -264,6 +264,44 @@ Rudra doc). Resident-MoE stays `false` until measured (S55 on hold); the new mod
 experts) + **streamed** (28 GB @ 8bpw) = a streamed-dense point (re-confirms S54), and a new multimodal arch
 (`Qwen3_5ForConditionalGeneration`) whose load is itself unproven in Vaayu.
 
+## [x] TOOLCALL — model-agnostic tool-call parsing (OpenAI `tool_calls` for ANY template) — DONE + E2E 2026-10-28
+
+**Why:** Rudra (OpenAI-wire client) got the model's tool call as raw `<minimax:tool_call>` XML in `message.content`,
+`finish_reason=stop`, no `tool_calls` array → agent loop stalls. ROOT CAUSE (confirmed in code): the parser registry
+`_KNOWN=(HERMES,)` only knew `<tool_call>`+JSON; MiniMax's `<minimax:tool_call>`+`<invoke>/<parameter>` XML was
+mis-detected as GENERIC_JSON (looks for a ```json fence) → nothing parsed. Probing all on-disk templates showed **4 of
+5 broken, 3 ways**: MiniMax XML-attr, **Qwen3.6 `<tool_call>` wrapping `<function=>` XML (NOT json — HERMES also broke
+it)**, Llama bare-JSON with key `parameters` (no fence). Only Qwen2.5 Hermes-JSON worked. → model-agnostic fix, not a
+MiniMax special-case (CLAUDE.md §5).
+
+**What shipped (A+B, TDD):**
+- **Two grammars** in `vaayu/server/tools.py`: `json` (marker-optional, name/args keys, bare-object B7 gate) and `xml`
+  (wrapper + per-call tag + param tags, attribute OR equals dialect; values schema-coerced via `declared_tool_schemas`).
+- **Tier-B self-probe** `derive_tool_format(tokenizer)`: renders a sentinel call + a plain assistant msg through the
+  checkpoint's OWN template, diffs to strip the role header, derives exact delimiters + grammar. Zero model literals,
+  zero model-name matching. Registry `detect_tool_format` kept as fallback only.
+- **Wired (§8):** `EngineHandle.tool_format` prefers the probe (cached, computed once — 2 renders), schemas passed at
+  all 3 parse sites (non-stream/stream/batch). SSE buffering already keys off `open_marker` → XML streams clean.
+- **Verified:** `tests/test_server_tool_grammars.py` + `test_server_tool_probe.py` (incl. ON-DEVICE derivation through
+  the 4 real tokenizers, skip if absent) + engine + app XML-stream test. Full suite **`1 failed, 4116 passed, 92
+  skipped`** (278 s, FOREGROUND) — the 1 failure is the pre-existing machine-local `config_local MAX_BATCH_SIZE=3`
+  artifact (`test_max_batch_size_defaults_to_one`), not this change; +22 over the 4094 floor.
+
+**Reach (§8):** non-streaming + MARKED-format streaming (MiniMax, Qwen3.6, Qwen2.5) fully reach the server. **Still
+open below.**
+
+- [x] parser grammars (json+xml, coercion) · [x] self-probe derivation · [x] engine wiring + schemas · [x] unit+probe+engine+app tests
+- [x] **ON-DEVICE E2E** (2026-10-28, MiniMax-M2.7 live server, port 9999): §2 repro curl both ways. Non-stream →
+      `tool_calls:[{multiply, arguments:"{\"a\": 12, \"b\": 7}"}]` (ints COERCED from XML), `finish_reason:tool_calls`,
+      XML gone from content. Stream → prose content deltas only (zero `<minimax:tool_call>` leak), one
+      `delta.tool_calls` chunk, final `finish_reason:tool_calls`, `[DONE]`. Both symptoms from `vaayu-tool-calling.md`
+      resolved. Rudra hand-off: `docs/2026-10-28-vaayu-tool-calling-for-rudra.md`.
+- [bug] **markerless (bare-JSON) streaming** (Llama): `open_marker==""` so `_sse` can't buffer mid-stream → a Llama
+      streamed tool call also appears as `content`. Non-streaming Llama is clean; MiniMax/Qwen stream clean. Fix later =
+      full-buffer the turn when `tools` set AND no open_marker, or restrict such models to non-stream. Not Rudra's path
+      (MiniMax is marked).
+- [ ] FUSED-EXL3-GATE-style standing gate for tool formats? (the real-tokenizer probe test is already that, env-free.)
+
 ## [ ] (2-open) [bug?] server tool-call-as-raw-text under batched streaming — unreproduced, no defect located
 
 (From S52.) Rudra saw a planner tool call returned as raw `<tool_call>` text under batched decode (2/2), never
