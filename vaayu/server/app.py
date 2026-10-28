@@ -136,6 +136,12 @@ class ServerConfig:
     # What `stream` means when the request omits it. True here, NOT OpenAI's
     # false: nothing is sent until the last token otherwise.
     default_stream: bool = True
+    # Seconds of silence on a stream before a `: keepalive` SSE comment is sent.
+    # Covers the prefill/queue window, where _sse waits on an empty job.out and
+    # emits nothing -- 26 s on a cold MiniMax load, minutes on a large agentic
+    # prompt. That silence trips an idle-timeout proxy/tunnel (e.g. ngrok) and
+    # drops the connection before the first token. 0 disables it. See config.py.
+    sse_keepalive_s: float = 15.0
 
 
 # Seconds between disconnect polls on a non-streaming request. Server policy,
@@ -712,7 +718,8 @@ def create_app(config: ServerConfig | None = None, engine=None) -> FastAPI:
             return StreamingResponse(
                 _sse(e, req, _served_name(app), warning, CancelToken(),
                      session_id=req.session_key, prepared=prepared,
-                     scheduler=app.state.scheduler),
+                     scheduler=app.state.scheduler,
+                     keepalive_s=getattr(cfg, "sse_keepalive_s", 0.0)),
                 media_type="text/event-stream",
                 headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no",
                          **_session_header(req)},
@@ -876,7 +883,7 @@ def _error_event(ex, kind: str = "internal_error") -> str:
 
 
 async def _sse(engine, req, model_name, warning, cancel=None, session_id=None,
-               prepared=None, scheduler=None):
+               prepared=None, scheduler=None, keepalive_s=0.0):
     """OpenAI-shaped SSE. Content streams; a tool call is BUFFERED and emitted
     once, complete -- partial tool-call JSON breaks clients that parse each
     delta, and the gain from streaming it is nil."""
@@ -936,7 +943,22 @@ async def _sse(engine, req, model_name, warning, cancel=None, session_id=None,
         job.stream = True
         await scheduler.submit(job)
         while True:
-            item = await job.out.get()
+            if keepalive_s and keepalive_s > 0:
+                # The prefill/queue window is silent: job.out stays empty from
+                # submit() until the first token (26 s on a cold MiniMax load,
+                # minutes on a large prompt). A `: keepalive` comment -- legal
+                # SSE, ignored by every client -- refreshes a proxy/tunnel idle
+                # timer so the stream is not dropped before the answer starts.
+                # Once tokens flow they arrive well inside the interval, so the
+                # timeout never fires during decode. A cancelled get() leaves no
+                # item behind (asyncio.Queue), so nothing is lost on timeout.
+                try:
+                    item = await asyncio.wait_for(job.out.get(), keepalive_s)
+                except asyncio.TimeoutError:
+                    yield ": keepalive\n\n"
+                    continue
+            else:
+                item = await job.out.get()
             if item is None:
                 if not engine_owns_the_row:
                     # `_form` dropped this job before the dispatcher ever ran

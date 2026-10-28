@@ -51,6 +51,7 @@ def main() -> int:
         exclusive_gpu_min_mib=config.EXCLUSIVE_GPU_MIN_MIB,
         enable_thinking=config.ENABLE_THINKING,
         default_stream=config.DEFAULT_STREAM,
+        sse_keepalive_s=config.SSE_KEEPALIVE_S,
         ram_cache_budget=(None if config.RAM_CACHE_BUDGET_GB is None
                           else int(config.RAM_CACHE_BUDGET_GB * 1024 ** 3)))
 

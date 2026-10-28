@@ -18,7 +18,7 @@ NOT_MODEL_KWARGS = {"model_path", "queue_depth", "max_batch_size", "batch_wait_m
                     "host", "port",
                     "served_model_name",
                     "require_exclusive_gpu", "exclusive_gpu_min_mib",
-                    "enable_thinking", "default_stream",
+                    "enable_thinking", "default_stream", "sse_keepalive_s",
                     "log_dir", "capture_stdio", "log_rotate_mb",
                     "require_session_id"}
 

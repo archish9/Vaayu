@@ -19,7 +19,11 @@ _PREPARE_ERRORS = (ContextTooLong, TemplateLacksToolSupport, NoChatTemplate)
 class FakeEngine:
     """Implements only what app.py touches."""
 
-    def __init__(self, result=None, raises=None, deltas=None):
+    def __init__(self, result=None, raises=None, deltas=None, delta_delay=0.0):
+        # Seconds to sleep before the FIRST delta -- models the prefill gap
+        # (TTFT) during which _sse waits on an empty job.out and must emit
+        # keepalive comments so a proxy/tunnel idle timer does not fire.
+        self.delta_delay = delta_delay
         self.max_seq_len = 8192
         self.queue_depth = 8
         self.depth = 0
@@ -75,6 +79,8 @@ class FakeEngine:
         self.cancel = cancel
         if self._raises is not None and not isinstance(self._raises, QueueFull):
             raise self._raises
+        if self.delta_delay:
+            await asyncio.sleep(self.delta_delay)
         for d in self._deltas:
             yield ("delta", d)
         yield ("final", self._result)
@@ -273,6 +279,46 @@ def test_a_stream_emits_role_then_content_then_a_terminating_done():
     assert events[0]["object"] == "chat.completion.chunk"
     contents = [e["choices"][0]["delta"].get("content") for e in events]
     assert "".join(c for c in contents if c) == "hello"
+
+
+def _live_client(**cfg_overrides):
+    """A TestClient whose lifespan is OPEN (scheduler running) for streaming."""
+    from vaayu.server.app import ServerConfig, create_app
+    engine = FakeEngine(delta_delay=cfg_overrides.pop("delta_delay", 0.0))
+    cfg_overrides.setdefault("require_session_id", False)
+    cfg = ServerConfig(model_path="unused", **cfg_overrides)
+    return TestClient(create_app(config=cfg, engine=engine))
+
+
+def test_a_slow_first_token_gets_sse_keepalive_comments():
+    # Prefill (TTFT) is a silent window: _sse waits on an empty job.out before
+    # the first delta. With keepalive on, it must emit a `: keepalive` SSE
+    # comment so an idle-timeout proxy/tunnel keeps the connection open.
+    with _live_client(sse_keepalive_s=0.03, delta_delay=0.2) as c:
+        r = c.post("/v1/chat/completions", json=dict(BODY, stream=True))
+    assert r.status_code == 200
+    assert ": keepalive" in r.text               # fired during the prefill gap
+    # And the real answer still arrives intact after the keepalives.
+    contents = [e["choices"][0]["delta"].get("content") for e in _sse_events(r.text)]
+    assert "".join(c for c in contents if c) == "hello"
+    assert r.text.rstrip().endswith("data: [DONE]")
+
+
+def test_sse_keepalive_off_emits_no_keepalive_comments():
+    # 0 disables it -- the pre-fix behaviour, so a long silent prefill emits
+    # nothing until the first token.
+    with _live_client(sse_keepalive_s=0, delta_delay=0.2) as c:
+        r = c.post("/v1/chat/completions", json=dict(BODY, stream=True))
+    assert r.status_code == 200
+    assert ": keepalive" not in r.text
+
+
+def test_sse_keepalive_does_not_fire_when_tokens_flow():
+    # Deltas arriving faster than the interval reset the wait every time, so a
+    # healthy stream carries no keepalive noise.
+    with _live_client(sse_keepalive_s=0.5, delta_delay=0.0) as c:
+        r = c.post("/v1/chat/completions", json=dict(BODY, stream=True))
+    assert ": keepalive" not in r.text
 
 
 def test_the_last_stream_event_carries_the_finish_reason():

@@ -51,6 +51,25 @@ running. Boot/kill a background server with the Bash tool; `pkill -9 -f "python 
 
 # OPEN
 
+## [x] SSE keepalive for the prefill/queue silent window — DONE 2026-10-28
+
+**Verdict:** prompted by Rudra's 2nd connection failure (run `logs/run-2026-10-28T10-46-53Z`, MiniMax-M2.7).
+Root cause of that run was NOT a Vaayu bug — the server streamed 649 tokens steadily (`io_wait=0.0s`, every token
+0.4–0.8 s) and the client/ngrok-free tunnel dropped mid-decode at 354 s; `finish=cancelled` (requests.jsonl) vs
+`finish=length` (DONE log) is the by-design cancelled→wire-"length" mapping (`stopping.py:63`), not a logging bug.
+BUT the investigation found a real gap: `_sse` (`app.py`) waits on an empty `job.out` from `submit()` to the first
+token — **26 s on this cold load, minutes on a large prompt** — emitting nothing, so an idle-timeout proxy/tunnel
+drops the stream before token 1. **Fix:** new knob `SSE_KEEPALIVE_S` (config.py, default **15 s**, `0`=off) → wraps
+`job.out.get()` in `asyncio.wait_for`; on timeout emits a `: keepalive\n\n` SSE comment and loops. Fires only while
+stalled (decode tokens arrive inside the interval → none sent); a cancelled `get()` loses no item. **§8:** knob in
+`config.py` + `server/README.md` + `ServerConfig`, plumbed `__main__.py`→route→`_sse`, reachable in the DEFAULT
+streaming mode at N=1 (not an N>1 feature). **Does NOT fix** a stream killed by a TOTAL-duration limit (bytes flowing)
+— that needs a faster model (Qwen3-Next/gpt-oss) or shorter answer; MiniMax @ 1.83 tok/s is wrong for remote agentic
+fan-out. Evidence: `tests/test_server_app.py` +3 (`test_a_slow_first_token_gets_sse_keepalive_comments`,
+`_off_emits_no`, `_does_not_fire_when_tokens_flow`); affected suites green (`test_server_app` +
+`test_server_config_passthrough` + `test_engine_param_reachability` + `test_streaming` + chat + batch_stream =
+116 passed). Client guidance: `docs/rudra-vaayu-integration-2026-10-28.md`. NOT committed yet.
+
 ## [x] fused-EXL3 chunk-major prefill crash — FIXED 2026-10-16
 
 **Verdict:** two prefill staging mechanisms shared `self._prefill_staged` with incompatible key types. The

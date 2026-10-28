@@ -82,6 +82,27 @@ ENABLE_THINKING = False
 # `"stream": false` in the request still wins.
 DEFAULT_STREAM = True
 
+# Seconds of silence on a stream before the server sends a `: keepalive` SSE
+# comment. The prefill/queue window is silent -- nothing reaches the client
+# between the opening role chunk and the first generated token: 26 s on a cold
+# MiniMax-M2.7 load, and MINUTES on a large agentic prompt (prefill scales with
+# prompt length). A reverse proxy or tunnel with an idle timeout (ngrok free,
+# most load balancers: 30-60 s) drops the connection during that silence, so
+# the client sees the stream die before any token -- the exact failure that
+# motivated this knob. A `: keepalive` comment is legal SSE, ignored by every
+# client, and resets the idle timer. It costs ~13 bytes per interval and fires
+# ONLY while output is stalled: once tokens flow (every ~0.5 s even on the
+# slowest target) they arrive inside the interval and no keepalive is sent.
+#
+# COST OF GETTING IT WRONG: too HIGH (or 0 = off) re-exposes the drop on any
+# prefill longer than the proxy's idle timeout -- a dropped request, retried
+# from scratch, is minutes of wasted compute on this hardware. Too LOW is
+# nearly free (a few extra comment bytes). It does NOT help a stream dropped by
+# a TOTAL-duration limit (bytes are flowing then); only model choice or a
+# shorter answer does. Default 15 s clears a cold MiniMax prefill with one or
+# two frames and sits well under a 30-60 s idle cutoff.
+SSE_KEEPALIVE_S = 15
+
 # Where logs are written. One directory per process, `<LOG_DIR>/run-<UTC>/`,
 # with `<LOG_DIR>/latest` always pointing at the newest. Within it,
 # `server.log` receives EVERYTHING the process emits -- Python prints,
