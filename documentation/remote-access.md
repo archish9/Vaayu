@@ -50,6 +50,48 @@ The load is not instant (pinning, NVMe warmup, expert-cache sizing — seconds f
 dense model, minutes for a large MoE one). It is ready when it prints the "listening"
 line. Leave it running.
 
+### Recommended: run Vaayu as a systemd service
+
+Running `python -m vaayu.server` by hand in a terminal has a trap on a **desktop Linux
+box**: the process lives in the GNOME session's `user.slice`, which `systemd-oomd`
+watches. Under a sustained multi-call session (a long agent run streaming a large MoE
+model), memory **pressure** on that slice crosses oomd's 50 % limit and oomd **SIGKILLs
+the whole terminal scope** — taking Vaayu with it. The signature: a stream dies mid-answer
+(`peer closed connection`), then every later request gets an **instant 502** (nothing is
+listening any more), and `dmesg` shows nothing because the kill is userspace oomd, not the
+kernel. Confirm with `journalctl -u systemd-oomd` / `oomctl`.
+
+The installer puts Vaayu in a **system service** instead — its own cgroup in `system.slice`
+(outside oomd's `user.slice` watch), memory-bounded, and auto-restarting:
+
+```bash
+sudo bash scripts/install-vaayu-service.sh --headless   # or --gui
+```
+
+- `--headless` (default): no desktop logged in; control the box over SSH/Tailscale. Vaayu
+  gets almost all RAM (OS reserve only). rustdesk's *graphical* view is unavailable while
+  headless — SSH still gives full control.
+- `--gui`: a desktop (e.g. rustdesk) stays logged in alongside Vaayu; a larger RAM reserve
+  is left so the desktop is not starved, so Vaayu's cap is lower.
+
+The memory caps (`MemoryHigh` / `MemoryMax`) are **derived from the machine's RAM**, not
+hardcoded. `MemoryMax` is a hard cap on Vaayu's *own* cgroup: a runaway OOM-kills only
+Vaayu (never the desktop), and `Restart=always` brings it straight back. On a box too
+small to hold the model's working set plus the desktop, this trades a rare self-restart
+for never taking the machine down — the durable fix is to cut footprint (`prefix_sessions`,
+`ram_cache_budget` in `config_local.py`) or serve a smaller/faster model.
+
+Manage it like any service:
+
+```bash
+systemctl status vaayu.service --no-pager
+journalctl -u vaayu.service -f          # watch load + warmup, or live logs
+sudo systemctl restart vaayu.service
+oomctl | grep -A3 -i vaayu || echo "not oomd-managed (good)"
+```
+
+With the service running, `tailscale serve`/`funnel` (below) front it exactly as before.
+
 ---
 
 ## Option A1 — bind Vaayu to the tailnet (plain HTTP, zero setup)

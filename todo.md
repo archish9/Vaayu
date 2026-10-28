@@ -51,6 +51,43 @@ running. Boot/kill a background server with the Bash tool; `pkill -9 -f "python 
 
 # OPEN
 
+## [~] OOMD-KILL — Vaayu SIGKILLed mid-session by systemd-oomd; ship it as a systemd service — FIX WRITTEN, NOT DEPLOYED/VERIFIED 2026-10-28
+
+**Root cause (CONFIRMED, not a Vaayu code bug):** run `logs/run-2026-10-28T11-27-55Z` (MiniMax-M2.7, Tailscale, Rudra on
+a Mac). After ~50 min of sustained calls, the server **vanished** mid-decode: stream #15 died with `peer closed
+connection`, then every later request got an **instant (0.0–0.1 s) 502** — connection refused by the `tailscale serve`
+front-end because nothing was listening on `127.0.0.1:9999` any more. Proof chain: server.log stops dead at 13:09:30Z
+with NO traceback/shutdown line; `requests.jsonl` has no entry for #15+ (died mid-request); one startup (11:28:13Z),
+never restarted. `dmesg`/kernel log empty — because the killer was **userspace `systemd-oomd`**, not the kernel OOM-killer.
+`journalctl`: `systemd-oomd Killed .../gnome-terminal.../vte-spawn-664e….scope ... memory pressure for user@1000.service
+being 54.91% > 50.00% for > 20s`, scope `Current Memory Usage: 28.3G`, `killed 10 process(es)`, `result 'oom-kill'`. Kill
+time 18:40:33 IST = 13:10:33Z = **exactly 113.8 s into #15** (the client's reported failure time). Vaayu ran in a
+gnome-terminal scope inside `user.slice` (oomd-managed, 50 % PSI limit); its legitimate ~28 G footprint (pinned expert
+cache 9.12 G + growing KV prefix cache toward 11 G + working set + model page-cache churn) kept slice PSI over the limit
+→ oomd killed the scope. NOT the kernel OOM-killer, NOT a leak, NOT transport (Tailscale held 350–674 s streams fine),
+NOT batching (server is N=1).
+
+**Fix (ops/deploy, no engine code — correct for this bug class):** `scripts/install-vaayu-service.sh [--headless|--gui]`
+installs `vaayu.service` into `system.slice` (OUT of oomd's `user.slice` watch), own cgroup, `Restart=always`,
+`OOMScoreAdjust=-200`, `TimeoutStartSec=600`. Memory caps `MemoryHigh`/`MemoryMax` **derived from `/proc/meminfo`** (§5,
+no hardcoded box numbers): `--headless` reserves 3 G for the OS, `--gui` reserves 6 G for a live desktop/rustdesk. A
+runaway now OOM-kills only Vaayu's cgroup (never the desktop) and auto-restarts. Documented in
+`documentation/remote-access.md` (§1 "Recommended: run Vaayu as a systemd service").
+
+**§8 reachability:** this is a deployment knob, not a server param — it reaches the operator via the installer + runbook,
+not `config.py`. **§9:** no Rust change, no PyPI release needed.
+
+**What's left to call this DONE (per §4 — verify, don't assert):**
+1. [ ] Operator runs `sudo bash scripts/install-vaayu-service.sh --headless` on the box (sudo = interactive; Claude can't).
+2. [ ] Verify: `systemctl status` active, `ss` listening on 9999, `oomctl` shows Vaayu NOT oomd-managed.
+3. [ ] **Reproduce the failure condition:** a sustained multi-call Rudra run (the bug only appeared after ~50 min of
+   load). Confirm no oomd kill in `journalctl -u systemd-oomd`, and if the cap is ever hit, that `Restart=always` recovers.
+4. [ ] NOT committed yet (script + runbook edit).
+
+**Durable follow-up (separate, optional):** 31 G box is undersized for 144 G MiniMax streaming + a desktop. Cut footprint
+(`prefix_sessions` 3→1–2, `ram_cache_budget`) or serve Qwen3-Next-80B int4 / gpt-oss-20b → pressure never builds, fits
+with the desktop. This removes the cause; the service only makes it survivable.
+
 ## [x] SSE keepalive for the prefill/queue silent window — DONE 2026-10-28
 
 **Verdict:** prompted by Rudra's 2nd connection failure (run `logs/run-2026-10-28T10-46-53Z`, MiniMax-M2.7).
