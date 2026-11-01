@@ -68,6 +68,20 @@ The installer puts Vaayu in a **system service** instead — its own cgroup in `
 sudo bash scripts/install-vaayu-service.sh --headless   # or --gui
 ```
 
+The installer **does not start Vaayu and does not enable boot-start** — it only writes the
+unit. You run Vaayu as a daemon by hand, so the GPU is free for other work whenever it is
+stopped:
+
+```bash
+sudo systemctl start vaayu.service      # start the daemon
+sudo systemctl stop vaayu.service       # stop it, free the GPU
+```
+
+While the daemon is running, `Restart=always` respawns it on a crash (an oomd/OOM kill, a
+segfault). A **commanded `stop` is not a crash** — it stays down until you start it again.
+If you want Vaayu to come up automatically on every boot, opt in once with
+`sudo systemctl enable vaayu.service` (and `disable` to undo).
+
 - `--headless` (default): no desktop logged in; control the box over SSH/Tailscale. Vaayu
   gets almost all RAM (OS reserve only). rustdesk's *graphical* view is unavailable while
   headless — SSH still gives full control.

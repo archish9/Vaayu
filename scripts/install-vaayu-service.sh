@@ -3,6 +3,12 @@
 # death, and lives in system.slice — OUT of systemd-oomd's user.slice watch, so
 # oomd can no longer kill the terminal scope out from under it.
 #
+# This installs the unit but does NOT start it and does NOT enable boot-start.
+# You start/stop Vaayu by hand (so the GPU is free for other work when it is
+# stopped); while it is running, Restart=always respawns it on a crash. See the
+# final echo for the exact commands. Boot-start is a deliberate opt-in later:
+#   sudo systemctl enable vaayu.service
+#
 # Usage:
 #   sudo bash scripts/install-vaayu-service.sh [--headless | --gui]
 #
@@ -102,10 +108,14 @@ WantedBy=multi-user.target
 EOF
 
 systemctl daemon-reload
-systemctl enable --now vaayu.service
 
 echo ""
-echo "[Vaayu] Service installed and started. Verify:"
+echo "[Vaayu] Service installed (NOT started, NOT enabled at boot)."
+echo "        Start it when you want it (GPU is free for other work while stopped):"
+echo "    sudo systemctl start vaayu.service      # start the daemon now"
+echo "    sudo systemctl stop vaayu.service       # stop it, free the GPU"
 echo "    systemctl status vaayu.service --no-pager"
-echo "    oomctl | grep -A3 -i vaayu   # Vaayu should NOT be listed (out of oomd's reach)"
-echo "    journalctl -u vaayu.service -f   # watch load + warmup until 'Uvicorn running'"
+echo "    journalctl -u vaayu.service -f          # watch load + warmup until 'Uvicorn running'"
+echo "        While running, Restart=always respawns it on a crash."
+echo "        To also start it automatically at boot (opt-in):"
+echo "    sudo systemctl enable vaayu.service"

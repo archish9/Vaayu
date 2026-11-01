@@ -51,7 +51,18 @@ running. Boot/kill a background server with the Bash tool; `pkill -9 -f "python 
 
 # OPEN
 
-## [~] OOMD-KILL — Vaayu SIGKILLed mid-session by systemd-oomd; ship it as a systemd service — FIX WRITTEN, NOT DEPLOYED/VERIFIED 2026-10-28
+## [~] OOMD-KILL — Vaayu SIGKILLed mid-session by systemd-oomd; ship it as a systemd service — DEPLOYED + installer made manual-start 2026-11-01; sustained-load verify still open
+
+**Update 2026-11-01:** the service IS installed and running (`/etc/systemd/system/vaayu.service`,
+`system.slice`, `Restart=always`, caps `MemoryHigh=26G`/`MemoryMax=28G` from `/proc/meminfo`). But the
+original installer did `systemctl enable --now`, so Vaayu started at boot and respawned on every manual
+`kill` — a surprise for a dev box whose GPU is also used for other work. **Fixed per the user's ask:** the
+installer now only writes the unit + `daemon-reload` (NO `enable`, NO auto-start); `Restart=always` is kept
+and is independent of boot-start, so a hand-started daemon still respawns on a *crash* but a commanded `stop`
+stays down and frees the GPU. Boot-start is a deliberate opt-in (`systemctl enable`). Changed:
+`scripts/install-vaayu-service.sh` (drop `enable --now` → `daemon-reload`, header + echo rewritten) and
+`documentation/remote-access.md` §1 (manual start/stop block). On this box, run `sudo systemctl disable
+vaayu` once to drop the existing boot symlink (leaves the running process alive). NOT committed yet.
 
 **Root cause (CONFIRMED, not a Vaayu code bug):** run `logs/run-2026-10-28T11-27-55Z` (MiniMax-M2.7, Tailscale, Rudra on
 a Mac). After ~50 min of sustained calls, the server **vanished** mid-decode: stream #15 died with `peer closed
@@ -78,11 +89,12 @@ runaway now OOM-kills only Vaayu's cgroup (never the desktop) and auto-restarts.
 not `config.py`. **§9:** no Rust change, no PyPI release needed.
 
 **What's left to call this DONE (per §4 — verify, don't assert):**
-1. [ ] Operator runs `sudo bash scripts/install-vaayu-service.sh --headless` on the box (sudo = interactive; Claude can't).
-2. [ ] Verify: `systemctl status` active, `ss` listening on 9999, `oomctl` shows Vaayu NOT oomd-managed.
+1. [x] Installer run on the box — service installed, loaded, ran (pid 21806 serving on 9999, VRAM fine).
+2. [x] Verified: `systemctl status` active, listening on 9999, `system.slice` (out of oomd's `user.slice` watch).
 3. [ ] **Reproduce the failure condition:** a sustained multi-call Rudra run (the bug only appeared after ~50 min of
    load). Confirm no oomd kill in `journalctl -u systemd-oomd`, and if the cap is ever hit, that `Restart=always` recovers.
-4. [ ] NOT committed yet (script + runbook edit).
+4. [ ] `sudo systemctl disable vaayu` on this box (drop the boot symlink from the old `enable --now` install).
+5. [ ] NOT committed yet (installer manual-start change + runbook edit, 2026-11-01).
 
 **Durable follow-up (separate, optional):** 31 G box is undersized for 144 G MiniMax streaming + a desktop. Cut footprint
 (`prefix_sessions` 3→1–2, `ram_cache_budget`) or serve Qwen3-Next-80B int4 / gpt-oss-20b → pressure never builds, fits
