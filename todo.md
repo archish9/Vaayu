@@ -129,20 +129,48 @@ cgroup OOM, peak 12.7 G vs `MemoryMax=28G`.
   No Rust (§9: no PyPI). **KEEP the guard** — warn-and-load costs up to 13× token rate. **Left:**
   `sudo bash scripts/install-vaayu-service.sh --headless` (rewrites unit, no start/enable), then the on-device
   repro — hold VRAM with a hand-started Vaayu, `systemctl start vaayu` ⇒ expect ONE wait then at most ONE exit into
-  `failed`, never a loop. NOT committed.
-- [ ] **Bug 2 — cgroup `MemoryHigh` throttle starves decode (root-caused, 1 probe left).** Budgets derive from HOST
-  free RAM (`vaayu_base.py:804,3061,3191,3662`) with **zero cgroup awareness**, so they sum to ~26 GB against the
-  unit's `MemoryHigh=26G` → RSS walks into the cap → kernel throttles. Stalled tokens: `total=170.8s compute=170.3s
-  io_wait=0.0s expert_disk=0.2s rss=25.24GB` (and 179.5 s / 28.7 s @ `rss=25.84GB`) vs healthy `total=0.5s rss=15.26GB`.
-  **NOT disk** — kills the report's hypothesis. Explains Surface A: first ~10 chunks land, then RSS hits the cap and
-  token time blows past the client's 300 s timer; tokens >300 s are **cancelled before logging**, so the 179.5 s max is
-  censored. `SSE_KEEPALIVE_S` worked fine (client ignores SSE comments) — not implicated.
-  **STOP RULE: do not build until `/sys/fs/cgroup/system.slice/vaayu.service/memory.events`' `high` is shown climbing
-  during a live stall.** Flat ⇒ re-probe prefix-cache compress-on-evict instead. **Verified 2026-11-02: that cgroup
-  directory does not exist while the unit is stopped** (counters are per-cgroup and die with it), so the probe is
-  physically impossible outside a live sustained run — the Bug 1 → Bug 2 ordering is forced, not a preference. Fix direction: read our own
-  `memory.high`/`max`/`current` and take budget basis `min(host avail, cap − current − headroom)` (derived per §5,
-  no-op when unset) — max resources WITHOUT the throttle cliff.
+  `failed`, never a loop. **COMMITTED `4ec9c01`** on branch `fix/exclusive-gpu-wait` (9 files, +238/−14); not yet on
+  `main` (`git merge --ff-only fix/exclusive-gpu-wait`).
+- [ ] **Bug 2 — cgroup `MemoryHigh` throttle starves decode (root-caused, STOP-RULED).** Full TASK:
+  `docs/2026-11-02-SVC-REGRESSION-bug2-cgroup-aware-budgets-TASK.md`. Budgets derive from HOST free RAM with **zero
+  cgroup awareness**, so they sum to ~26 GB against the unit's `MemoryHigh=26G` → RSS walks into the cap → kernel
+  throttles into direct reclaim with no swap. Stalled tokens: `total=170.8s compute=170.3s io_wait=0.0s
+  expert_disk=0.2s rss=25.24GB` (and 179.5 s / 28.7 s @ `rss=25.84GB`) vs healthy `total=0.5s rss=15.26GB`. **NOT
+  disk** — kills the report's hypothesis. Explains Surface A: first ~10 chunks land, then RSS hits the cap and token
+  time blows past the client's 300 s timer; tokens >300 s are **cancelled before logging**, so 179.5 s is a CENSORED
+  max. `SSE_KEEPALIVE_S` worked fine (client ignores SSE comments) — not implicated.
+  - **STOP RULE: do not build until `/sys/fs/cgroup/system.slice/vaayu.service/memory.events`' `high` is shown
+    climbing during a live >10 s token.** Flat ⇒ TASK is void, re-probe prefix-cache compress-on-evict / a CPU-side
+    cache op inside `compute`. **Verified 2026-11-02: that cgroup directory does not exist while the unit is
+    stopped** (counters are per-cgroup and die with it) ⇒ the probe needs a live sustained run and the Bug 1 → Bug 2
+    order is FORCED, not a preference. `compute` is where BOTH a reclaim stall and a slow Python cache op land, so
+    the counter is what discriminates; `rss`-at-cap only correlates.
+  - **Fix (ONE scalar, 4+1 sites — not 4 fixes).** All budgets funnel one "available bytes" into pure helpers:
+    `derive_expert_ceiling` (`vaayu_base.py:3221`→`:377`), `compute_expert_budget` (`:3231`→`:402`),
+    `compute_prefix_cache_budget` (`:3662`→`:812`), `spec_preload_refusal` (`:3061`→`:313`). **Do not touch the
+    helpers** — they are correct given their input; the input is the bug. New reader `effective_available_bytes()`:
+    cgroup v2 only (`/proc/self/cgroup` = `0::/path`; box is `cgroup2fs`), `cap = min(memory.high, memory.max)`
+    skipping `max`, basis = `min(host avail, cap − unreclaimable − headroom)`, **no-op (host value) when uncapped,
+    v1, `cap >= MemTotal`, or unreadable**. 5th site: the buffered-vs-O_DIRECT "can page cache hold 40 % of the
+    checkpoint" decision (`config.py:258-266`) takes the same basis — page cache is charged to OUR cgroup, and S29
+    measured 21 % on dense for getting that wrong.
+  - **TRAP (worth ~9 GB).** `unreclaimable = current − file` is WRONG: **pinned memory shows as RssShmem**, cgroup
+    v2 counts `shmem` INSIDE `file`, and the pinned expert arena is 9.12 GB — counting it reclaimable shrinks the
+    basis to near nothing. With no swap, shmem is unreclaimable. Use `reclaimable = file − shmem`,
+    `unreclaimable = current − reclaimable`. Inverse trap: do NOT deduct raw `current` either (a 144 GB stream keeps
+    page cache at the cap forever). Headroom DERIVED from the measured 0.3–1.8 GB first-request native-malloc growth.
+  - **Arithmetic checks out:** today basis 26.76 GB (host) → caches 11.27 + 12.35 = 23.6 + ~4 footprint = 27.6 > 26
+    cap ⇒ throttle. Fixed: 26 − 4 − ~2 = ~20 GB → ~24 GB total < 26 cap, still ~92 % of the cgroup = **max resources
+    WITHOUT the cliff**.
+  - **NOT the fix:** raising/removing `MemoryHigh` (High throttles, Max KILLS — and High is what keeps oomd off the
+    desktop); a smaller model (**REJECTED by user 2026-11-02**); a `--headless` reinstall (real but SEPARATE policy,
+    do not bundle); touching the four sizing helpers.
+  - **§8: no knob** — respecting one's own cap is correctness, not policy; reaches the server every load at N=1.
+    `envinfo` should record cap + effective basis in `env.json`. **§9: no Rust, no PyPI.**
+  - **Acceptance (all four):** `high` delta **0** over a run that previously climbed · no token above ~2 s ·
+    **generated ids identical** to a pre-fix run (caches are exact; sizing must not move output) · dense decode not
+    regressed (guards the O_DIRECT flip). Gates: `test_dense_gate.py` on BOTH Llama checkpoints, FOREGROUND; suite
+    floor `1 failed, 4131 passed, 92 skipped`.
 - [ ] **Blocks `OOMD-KILL` item 3** (sustained-load verify): a server in a boot loop cannot be profiled. Do Bug 1
   first, then run the sustained repro carrying Bug 2's probe. **REJECTED as the fix** (user, 2026-11-02): "serve a
   smaller model" — 16 GB VRAM + 32 GB RAM must be used to the max and MiniMax-M2.7 is a deliberate stress target.
