@@ -155,6 +155,20 @@ def test_a_gitignored_local_override_can_shadow_any_value():
         "(MODEL_PATH) stay out of git")
 
 
+def test_exclusive_gpu_wait_s_reaches_the_server_config(monkeypatch, launched):
+    """The wait is what stops the boot loop, and the ONLY caller that builds a
+    ServerConfig for the real service is main(). Unforwarded, every service boot
+    keeps the dataclass default by luck rather than by wiring -- and a value the
+    operator sets in config.py does nothing (CLAUDE.md section 8)."""
+    monkeypatch.setattr(config, "MODEL_PATH", "/ckpt")
+    monkeypatch.setattr(config, "EXCLUSIVE_GPU_WAIT_S", 45)
+
+    from vaayu.server.__main__ import main
+    assert main() == 0
+
+    assert launched["cfg"].exclusive_gpu_wait_s == 45
+
+
 def test_batch_wait_ms_reaches_the_server_config(monkeypatch, launched):
     """The window is what makes MAX_BATCH_SIZE reachable: at 0 the dispatcher
     forms the instant the first request is queued, so two simultaneous clients

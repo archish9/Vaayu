@@ -93,14 +93,15 @@ not `config.py`. **§9:** no Rust change, no PyPI release needed.
 2. [x] Verified: `systemctl status` active, listening on 9999, `system.slice` (out of oomd's `user.slice` watch).
 3. [ ] **Reproduce the failure condition:** a sustained multi-call Rudra run (the bug only appeared after ~50 min of
    load). Confirm no oomd kill in `journalctl -u systemd-oomd`, and if the cap is ever hit, that `Restart=always` recovers.
-4. [ ] `sudo systemctl disable vaayu` on this box (drop the boot symlink from the old `enable --now` install).
-5. [ ] NOT committed yet (installer manual-start change + runbook edit, 2026-11-01).
+   **Carries SVC-REGRESSION Bug 2's cgroup probe — do them in one run.** Blocked until Bug 1's unit is applied.
+4. [x] `sudo systemctl disable vaayu` — DONE (user ran it 2026-11-02); `systemctl status` reads `disabled`.
+5. [x] Committed as `296cecd` ("fix(deploy): make vaayu.service manual-start, not boot-start") — this row was stale.
 
 **Durable follow-up (separate, optional):** 31 G box is undersized for 144 G MiniMax streaming + a desktop. Cut footprint
 (`prefix_sessions` 3→1–2, `ram_cache_budget`) or serve Qwen3-Next-80B int4 / gpt-oss-20b → pressure never builds, fits
 with the desktop. This removes the cause; the service only makes it survivable.
 
-## [ ] SVC-REGRESSION — the OOMD-KILL systemd service cured oomd and introduced TWO new bugs — ROOT-CAUSED 2026-11-02, nothing built
+## [~] SVC-REGRESSION — the OOMD-KILL systemd service cured oomd and introduced TWO new bugs — Bug 1 BUILT + off-device green 2026-11-02; Bug 2 still stop-ruled
 
 **Full brief (self-contained: evidence, fix plans, tests, §8/§9):**
 `docs/2026-11-02-SVC-REGRESSION-restart-loop-and-cgroup-throttle-BRIEF.md`
@@ -110,14 +111,25 @@ MiniMax-M2.7 over Tailscale. Report claims "one bug, three surfaces" — **wrong
 the 2026-11-01 service deployment. The oomd kill itself IS fixed: oomd never touched `vaayu.service` on Nov 1–2, no
 cgroup OOM, peak 12.7 G vs `MemoryMax=28G`.
 
-- [ ] **Bug 1 — GPU-not-exclusive crash-restart LOOP (CONFIRMED).** `_check_gpu_is_exclusive` (`app.py:185-213`)
-  `SystemExit`s (exit 3) when another Vaayu holds VRAM; `Restart=always`+`RestartSec=5` respawns it every ~9 s forever.
-  **1405 failed starts / 3 h 33 m (Nov 01 11:56→15:29) + 1144 / 2 h 51 m (Nov 02 08:41→11:33) = ~6.5 h endpoint-down,
-  2549 boots.** Explains report Surfaces B (0 bytes) + C (instant 502) — Vaayu was simply DOWN. Fix: guard **waits**
-  (poll `gpu_audit.audit()`, new knob `EXCLUSIVE_GPU_WAIT_S=120` in `config.py`+`ServerConfig`+`server/README.md`,
-  under `TimeoutStartSec=600`) + `RestartPreventExitStatus=3` in the unit & installer (crashes still restart).
-  Tests off-device (`tests/test_exclusive_gpu_wait.py`, 5 cases, monkeypatched audit+sleep). **KEEP the guard** —
-  warn-and-load costs up to 13× token rate.
+- [~] **Bug 1 — GPU-not-exclusive crash-restart LOOP — FIXED IN CODE, off-device green; live unit + on-device repro
+  OUTSTANDING (both need `sudo`, password-gated).** Results: `docs/2026-11-02-SVC-REGRESSION-bug1-exclusive-gpu-wait-RESULTS.md`.
+  Root cause re-measured here, not inherited: **2547** `status=3` exits, max restart counter **1404**, only **8**
+  successful startups, Nov 01 11:56:50 → Nov 02 11:32:59 ⇒ ~6.5 h endpoint-down. `_check_gpu_is_exclusive`
+  (`app.py`) gave a *permanent* verdict to a *transient* condition (the holder was a prior Vaayu still releasing)
+  and `Restart=always`+`RestartSec=5` turned it into a ~9 s respawn loop. Explains report Surfaces B (0 bytes) +
+  C (instant 502) — Vaayu was simply DOWN. **Built:** (1a) `_wait_for_exclusive_gpu` polls `gpu_audit.audit()`
+  every 2 s, prints on entry + on clear, refuses only on expiry with a FRESH report; (1b) knob
+  `EXCLUSIVE_GPU_WAIT_S=120` in `config.py` + `ServerConfig.exclusive_gpu_wait_s` + `__main__.py` + `server/README.md`
+  (0 = old refuse-immediately contract; 120 < `TimeoutStartSec=600`); (1c) `RestartPreventExitStatus=3` in
+  `scripts/install-vaayu-service.sh` — **`Restart=always` KEPT**, only exit 3 carved out. 1d (guard above
+  `new_run_dir`) deliberately NOT bundled. **Evidence:** `tests/test_exclusive_gpu_wait.py` 7/7 (RED→GREEN, audit +
+  `time.sleep` monkeypatched) + `test_exclusive_gpu_wait_s_reaches_the_server_config` (§8 plumbing, real `main()`);
+  affected suites 152 passed; full suite **`1 failed, 4131 passed, 92 skipped`** (389 s, FOREGROUND) — the 1 failure
+  is the pre-existing `config_local MAX_BATCH_SIZE=3` artifact, PROVEN (`config.py:195`=1, `config_local.py:12`=3).
+  No Rust (§9: no PyPI). **KEEP the guard** — warn-and-load costs up to 13× token rate. **Left:**
+  `sudo bash scripts/install-vaayu-service.sh --headless` (rewrites unit, no start/enable), then the on-device
+  repro — hold VRAM with a hand-started Vaayu, `systemctl start vaayu` ⇒ expect ONE wait then at most ONE exit into
+  `failed`, never a loop. NOT committed.
 - [ ] **Bug 2 — cgroup `MemoryHigh` throttle starves decode (root-caused, 1 probe left).** Budgets derive from HOST
   free RAM (`vaayu_base.py:804,3061,3191,3662`) with **zero cgroup awareness**, so they sum to ~26 GB against the
   unit's `MemoryHigh=26G` → RSS walks into the cap → kernel throttles. Stalled tokens: `total=170.8s compute=170.3s
@@ -126,7 +138,9 @@ cgroup OOM, peak 12.7 G vs `MemoryMax=28G`.
   token time blows past the client's 300 s timer; tokens >300 s are **cancelled before logging**, so the 179.5 s max is
   censored. `SSE_KEEPALIVE_S` worked fine (client ignores SSE comments) — not implicated.
   **STOP RULE: do not build until `/sys/fs/cgroup/system.slice/vaayu.service/memory.events`' `high` is shown climbing
-  during a live stall.** Flat ⇒ re-probe prefix-cache compress-on-evict instead. Fix direction: read our own
+  during a live stall.** Flat ⇒ re-probe prefix-cache compress-on-evict instead. **Verified 2026-11-02: that cgroup
+  directory does not exist while the unit is stopped** (counters are per-cgroup and die with it), so the probe is
+  physically impossible outside a live sustained run — the Bug 1 → Bug 2 ordering is forced, not a preference. Fix direction: read our own
   `memory.high`/`max`/`current` and take budget basis `min(host avail, cap − current − headroom)` (derived per §5,
   no-op when unset) — max resources WITHOUT the throttle cliff.
 - [ ] **Blocks `OOMD-KILL` item 3** (sustained-load verify): a server in a boot loop cannot be profiled. Do Bug 1

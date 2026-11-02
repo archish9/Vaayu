@@ -130,6 +130,11 @@ class ServerConfig:
     # torch blocks the boot while costing nothing. Under this it is reported,
     # not blocked.
     exclusive_gpu_min_mib: int = 256
+    # How long to wait for a blocking holder to drain before refusing. The
+    # holder is usually a prior Vaayu still releasing; with Restart=always, an
+    # instant refusal becomes an endless respawn loop (measured: 2547 failed
+    # starts, ~6.5 h down). 0 restores the old refuse-immediately contract.
+    exclusive_gpu_wait_s: int = 120
     # Suppress the model's reasoning block. Off by default: a reasoning trace is
     # tokens the caller did not ask for, at the same tok/s as the answer.
     enable_thinking: bool = False
@@ -182,12 +187,44 @@ def resolve_stream(req, config) -> bool:
     return bool(config.default_stream) if config is not None else False
 
 
+EXCLUSIVE_GPU_POLL_S = 2.0
+
+
+def _wait_for_exclusive_gpu(gpu_audit, device, min_mib, wait_s) -> str | None:
+    """Poll until nothing blocking holds the GPU. None once clear, else the
+    last report.
+
+    The holder is usually a prior Vaayu that has not finished releasing -- a
+    transient condition that used to get the permanent verdict below. Under
+    `Restart=always` that cost 2547 failed starts and ~6.5 h of endpoint-down,
+    where one process waiting would have cost one pause.
+
+    `wait_s` bounds the SLEEPING (rounded down to whole polls); a slow `audit()`
+    can push real wall time past it, which is why the default sits well under
+    systemd's TimeoutStartSec.
+    """
+    interval = min(EXCLUSIVE_GPU_POLL_S, wait_s)
+    print(f"[Vaayu-Server] the GPU is not exclusive yet -- waiting up to "
+          f"{wait_s:g}s for it to free")
+    report = None
+    for _ in range(max(1, int(wait_s / interval))):
+        time.sleep(interval)
+        users = gpu_audit.audit(device=device)
+        if not gpu_audit.blocking_users(users, min_mib):
+            print("[Vaayu-Server] the GPU is exclusive now -- loading")
+            return None
+        report = gpu_audit.compose_report(users, min_mib=min_mib)
+    return report
+
+
 def _check_gpu_is_exclusive(config) -> None:
-    """Refuse the load when another process holds GPU memory on our device.
+    """Wait out, then refuse, a GPU another process holds on our device.
 
     Raises SystemExit, which uvicorn reports as a failed startup. Warn-and-load
     was rejected: the penalty is a permanently smaller pinning budget, invisible
-    in the output, and measured at up to 13x on the token rate.
+    in the output, and measured at up to 13x on the token rate. But the refusal
+    is preceded by a bounded wait (`exclusive_gpu_wait_s`), because a holder
+    that is draining is not a reason to fail the boot.
 
     Two things it does NOT refuse over, because neither costs this load
     anything: a holder on a different GPU, and one under
@@ -207,6 +244,11 @@ def _check_gpu_is_exclusive(config) -> None:
     if config is not None and not config.require_exclusive_gpu:
         print(f"[Vaayu-Server] WARNING: {report}")
         return
+    wait_s = getattr(config, "exclusive_gpu_wait_s", 0)
+    if wait_s > 0:
+        report = _wait_for_exclusive_gpu(gpu_audit, device, min_mib, wait_s)
+        if report is None:
+            return
     # Printed, not folded into the exception: uvicorn wraps a startup exception
     # in a traceback, and this report is the part worth reading.
     print(f"[Vaayu-Server] refusing to load -- the GPU is not exclusive:\n{report}")

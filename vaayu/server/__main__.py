@@ -49,6 +49,7 @@ def main() -> int:
         require_session_id=config.REQUIRE_SESSION_ID,
         require_exclusive_gpu=config.REQUIRE_EXCLUSIVE_GPU,
         exclusive_gpu_min_mib=config.EXCLUSIVE_GPU_MIN_MIB,
+        exclusive_gpu_wait_s=config.EXCLUSIVE_GPU_WAIT_S,
         enable_thinking=config.ENABLE_THINKING,
         default_stream=config.DEFAULT_STREAM,
         sse_keepalive_s=config.SSE_KEEPALIVE_S,

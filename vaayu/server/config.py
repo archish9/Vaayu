@@ -50,6 +50,16 @@ REQUIRE_EXCLUSIVE_GPU = True
 # processes on DEVICE count at all; a job on another GPU is not Vaayu's problem.
 EXCLUSIVE_GPU_MIN_MIB = 256
 
+# How long to wait for a blocking holder to drain before refusing the boot. The
+# holder is usually a prior Vaayu that has not finished releasing its VRAM, so a
+# refusal is a permanent verdict on a transient condition -- and under the
+# service's Restart=always it becomes an invisible respawn loop (measured on
+# this box: 2547 failed starts, ~6.5 h of endpoint-down). Too low and the loop
+# comes back; too high and a boot sits waiting while the GPU is genuinely busy
+# with other work. Must stay under the unit's TimeoutStartSec (600), or systemd
+# calls the wait a failed start. 0 = refuse immediately (the pre-fix behaviour).
+EXCLUSIVE_GPU_WAIT_S = 120
+
 # Delete the ORIGINAL downloaded shards once Vaayu's own split copy is verified
 # complete (every layer has its .safetensors AND its .done marker), reclaiming
 # 39-66 GB per checkpoint. A server holds one checkpoint for its whole life, so
