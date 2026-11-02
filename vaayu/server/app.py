@@ -204,14 +204,17 @@ def _wait_for_exclusive_gpu(gpu_audit, device, min_mib, wait_s) -> str | None:
     systemd's TimeoutStartSec.
     """
     interval = min(EXCLUSIVE_GPU_POLL_S, wait_s)
+    # flush=True, not decoration: under the service `capture_stdio` makes fd 1 a
+    # pipe, so print is BLOCK-buffered and this line would surface only once
+    # something else filled 8 KB -- i.e. after the pause it exists to explain.
     print(f"[Vaayu-Server] the GPU is not exclusive yet -- waiting up to "
-          f"{wait_s:g}s for it to free")
+          f"{wait_s:g}s for it to free", flush=True)
     report = None
     for _ in range(max(1, int(wait_s / interval))):
         time.sleep(interval)
         users = gpu_audit.audit(device=device)
         if not gpu_audit.blocking_users(users, min_mib):
-            print("[Vaayu-Server] the GPU is exclusive now -- loading")
+            print("[Vaayu-Server] the GPU is exclusive now -- loading", flush=True)
             return None
         report = gpu_audit.compose_report(users, min_mib=min_mib)
     return report
@@ -251,7 +254,8 @@ def _check_gpu_is_exclusive(config) -> None:
             return
     # Printed, not folded into the exception: uvicorn wraps a startup exception
     # in a traceback, and this report is the part worth reading.
-    print(f"[Vaayu-Server] refusing to load -- the GPU is not exclusive:\n{report}")
+    print(f"[Vaayu-Server] refusing to load -- the GPU is not exclusive:\n{report}",
+          flush=True)
     raise SystemExit(f"[Vaayu-Server] refusing to load: {report}")
 
 

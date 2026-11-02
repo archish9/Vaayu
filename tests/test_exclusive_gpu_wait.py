@@ -135,6 +135,49 @@ def test_the_installer_carves_exit_3_out_of_the_restart_policy():
     assert "Restart=always" in text, "crash recovery must survive the carve-out"
 
 
+def test_the_wait_message_is_flushed_before_the_wait_begins(monkeypatch):
+    """A message the operator reads AFTER the pause explains nothing.
+
+    Under the service, `capture_stdio` makes fd 1 a pipe (logs.py `dup2`), so
+    `print` is BLOCK-buffered, not line-buffered. Measured on device 2026-11-02:
+    the guard printed, slept 63 s, and the text only appeared once the load's own
+    output filled the 8 KB buffer -- both guard lines carrying one late
+    timestamp, and nothing in `journalctl -f` during the pause. An operator
+    watching a two-minute silence got no reason for it, which is a milder form of
+    the invisibility this whole guard change was about.
+    """
+    import sys
+
+    import vaayu.gpu_audit as ga
+    from vaayu.server.app import _check_gpu_is_exclusive
+
+    events = []
+
+    class Recorder:
+        """Records write/flush ORDER -- print(flush=True) writes then flushes."""
+
+        def write(self, s):
+            if s.strip():
+                events.append(("write", s.strip()[:48]))
+            return len(s)
+
+        def flush(self):
+            events.append(("flush",))
+
+    monkeypatch.setattr(ga, "audit", lambda **kw: [BLOCKER])
+    monkeypatch.setattr(sys, "stdout", Recorder())
+    monkeypatch.setattr(time, "sleep", lambda s: events.append(("sleep",)))
+
+    with pytest.raises(SystemExit):
+        _check_gpu_is_exclusive(_config(exclusive_gpu_wait_s=4))
+
+    kinds = [e[0] for e in events]
+    assert "sleep" in kinds, "the wait must actually have happened"
+    assert "flush" in kinds[:kinds.index("sleep")], (
+        "the reason for the pause must be flushed BEFORE the first sleep; "
+        f"got {events[:4]}")
+
+
 def test_the_installed_unit_body_has_no_shell_substitutions():
     """The unit is written by an UNQUOTED heredoc, because it has to expand
     $RUN_USER/$REPO_DIR/$HIGH_GB -- so a backtick or $( ) in the body EXECUTES
