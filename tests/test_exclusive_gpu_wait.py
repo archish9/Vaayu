@@ -133,3 +133,24 @@ def test_the_installer_carves_exit_3_out_of_the_restart_policy():
 
     assert "RestartPreventExitStatus=3" in text
     assert "Restart=always" in text, "crash recovery must survive the carve-out"
+
+
+def test_the_installed_unit_body_has_no_shell_substitutions():
+    """The unit is written by an UNQUOTED heredoc, because it has to expand
+    $RUN_USER/$REPO_DIR/$HIGH_GB -- so a backtick or $( ) in the body EXECUTES
+    at install time and dumps the output into the unit file.
+
+    This is not hypothetical: a backticked word in the RestartPreventExitStatus
+    comment ran `systemctl status` during the install and wrote 260 lines of the
+    box's process tree into /etc/systemd/system/vaayu.service (2026-11-02). The
+    directives still parsed, so nothing failed loudly -- which is exactly why it
+    needs a test rather than care.
+    """
+    from pathlib import Path
+
+    script = (Path(__file__).resolve().parents[1]
+              / "scripts" / "install-vaayu-service.sh").read_text()
+
+    body = script.split("<<EOF", 1)[1].split("\nEOF", 1)[0]
+    assert "`" not in body, "backtick in the heredoc body: it runs at install time"
+    assert "$(" not in body, "$( ) in the heredoc body: it runs at install time"

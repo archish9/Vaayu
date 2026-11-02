@@ -88,8 +88,8 @@ RestartSec=5
 # ...but NOT after exit 3 = "the GPU is still not exclusive after waiting".
 # Vaayu already waits EXCLUSIVE_GPU_WAIT_S for a draining holder, so exit 3 means
 # a human has to kill the holder; respawning every 5 s cannot help and hides the
-# reason (measured: 2547 failed starts, ~6.5 h of endpoint-down). A unit sitting
-# in `failed` with the report in `systemctl status` is the correct outcome.
+# reason (measured: 2547 failed starts, ~6.5 h of endpoint-down). A unit left in
+# "failed" state, with the report in "systemctl status", is the correct outcome.
 RestartPreventExitStatus=3
 
 # system.slice is not oomd-managed by default; be explicit
