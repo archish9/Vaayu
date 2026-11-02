@@ -111,8 +111,15 @@ MiniMax-M2.7 over Tailscale. Report claims "one bug, three surfaces" — **wrong
 the 2026-11-01 service deployment. The oomd kill itself IS fixed: oomd never touched `vaayu.service` on Nov 1–2, no
 cgroup OOM, peak 12.7 G vs `MemoryMax=28G`.
 
-- [~] **Bug 1 — GPU-not-exclusive crash-restart LOOP — FIXED IN CODE, off-device green; live unit + on-device repro
-  OUTSTANDING (both need `sudo`, password-gated).** Results: `docs/2026-11-02-SVC-REGRESSION-bug1-exclusive-gpu-wait-RESULTS.md`.
+- [x] **Bug 1 — GPU-not-exclusive crash-restart LOOP — FIXED and VERIFIED ON-DEVICE 2026-11-02 (both arms).**
+  Results: `docs/2026-11-02-SVC-REGRESSION-bug1-exclusive-gpu-wait-RESULTS.md`.
+  **On-device (unit reinstalled clean, 41 lines, `systemd-analyze verify` silent):** **Arm A** — 1.5 GiB holder
+  (pid 304923), `systemctl start` ⇒ `the GPU is not exclusive yet -- waiting up to 120s`, held ~63 s, holder killed
+  ⇒ `the GPU is exclusive now -- loading` ⇒ `loaded in 17.6s`, Uvicorn on 9999. Pre-fix this exited instantly and
+  respawned forever. **Arm B** — holder left in place: started 14:07:52, refused 14:09:57 (**125 s** = 120 s wait +
+  ~5 s import), exit-3 count 2547 → **2548 exactly**, `Scheduled restart` count **0**, unit `failed` with
+  `NRestarts=0 ExecMainStatus=3`. The refusal named the holder + its `kill` line, and listed rustdesk (0.14 GiB) as
+  below-threshold NON-blocking ⇒ the B11 narrowing verified on device as well.
   Root cause re-measured here, not inherited: **2547** `status=3` exits, max restart counter **1404**, only **8**
   successful startups, Nov 01 11:56:50 → Nov 02 11:32:59 ⇒ ~6.5 h endpoint-down. `_check_gpu_is_exclusive`
   (`app.py`) gave a *permanent* verdict to a *transient* condition (the holder was a prior Vaayu still releasing)
@@ -129,8 +136,19 @@ cgroup OOM, peak 12.7 G vs `MemoryMax=28G`.
   No Rust (§9: no PyPI). **KEEP the guard** — warn-and-load costs up to 13× token rate. **Left:**
   `sudo bash scripts/install-vaayu-service.sh --headless` (rewrites unit, no start/enable), then the on-device
   repro — hold VRAM with a hand-started Vaayu, `systemctl start vaayu` ⇒ expect ONE wait then at most ONE exit into
-  `failed`, never a loop. **COMMITTED `4ec9c01`** on branch `fix/exclusive-gpu-wait` (9 files, +238/−14); not yet on
-  `main` (`git merge --ff-only fix/exclusive-gpu-wait`).
+  `failed`, never a loop. **COMMITTED `4ec9c01`** + ledger `ced6990` + installer fix `b1d9ef8`, all on `main`.
+  - [bug] **the installer executed its own unit comments (FIXED `b1d9ef8`, same day).** The unit is written by an
+    UNQUOTED heredoc (it must expand `$RUN_USER`/`$REPO_DIR`/`$HIGH_GB`), so backticks in `4ec9c01`'s
+    `RestartPreventExitStatus` comment RAN: `line 72: failed: command not found`, and `systemctl status`'s output —
+    260 lines of the box's process tree — was written into the unit (34 → **296 lines**). It failed QUIETLY: systemd
+    logs `Missing '=', ignoring line` and all 20 real directives still took effect. Fix = double quotes, plus
+    `test_the_installed_unit_body_has_no_shell_substitutions` (no backtick, no `$(` in the heredoc body). Re-render:
+    41 lines, 20 directives. **Anyone who installed between `4ec9c01` and `b1d9ef8` must re-run the installer.**
+  - [bug] **the wait message does not reach the operator LIVE.** `capture_stdio` buffers, so both guard lines carry
+    the same flush timestamp and `journalctl -u vaayu -f` shows an unexplained ~2 min pause with no reason given —
+    a milder version of the invisibility Bug 1 was about. The text is correct and lands in `logs/<run>/server.log`;
+    only the timing is wrong. Fix = `flush=True` on the two `_wait_for_exclusive_gpu` prints (or print before
+    `capture_stdio` installs). Small, not bundled into the verified fix.
 - [ ] **Bug 2 — cgroup `MemoryHigh` throttle starves decode (root-caused, STOP-RULED).** Full TASK:
   `docs/2026-11-02-SVC-REGRESSION-bug2-cgroup-aware-budgets-TASK.md`. Budgets derive from HOST free RAM with **zero
   cgroup awareness**, so they sum to ~26 GB against the unit's `MemoryHigh=26G` → RSS walks into the cap → kernel
