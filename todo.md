@@ -100,6 +100,39 @@ not `config.py`. **§9:** no Rust change, no PyPI release needed.
 (`prefix_sessions` 3→1–2, `ram_cache_budget`) or serve Qwen3-Next-80B int4 / gpt-oss-20b → pressure never builds, fits
 with the desktop. This removes the cause; the service only makes it survivable.
 
+## [ ] SVC-REGRESSION — the OOMD-KILL systemd service cured oomd and introduced TWO new bugs — ROOT-CAUSED 2026-11-02, nothing built
+
+**Full brief (self-contained: evidence, fix plans, tests, §8/§9):**
+`docs/2026-11-02-SVC-REGRESSION-restart-loop-and-cgroup-throttle-BRIEF.md`
+
+**Provenance:** Rudra's report `vaayu-backend-stall-bugreport.md` (repo root), runs D (2026-10-28) + E (2026-11-01/02),
+MiniMax-M2.7 over Tailscale. Report claims "one bug, three surfaces" — **wrong, two independent bugs**, both created by
+the 2026-11-01 service deployment. The oomd kill itself IS fixed: oomd never touched `vaayu.service` on Nov 1–2, no
+cgroup OOM, peak 12.7 G vs `MemoryMax=28G`.
+
+- [ ] **Bug 1 — GPU-not-exclusive crash-restart LOOP (CONFIRMED).** `_check_gpu_is_exclusive` (`app.py:185-213`)
+  `SystemExit`s (exit 3) when another Vaayu holds VRAM; `Restart=always`+`RestartSec=5` respawns it every ~9 s forever.
+  **1405 failed starts / 3 h 33 m (Nov 01 11:56→15:29) + 1144 / 2 h 51 m (Nov 02 08:41→11:33) = ~6.5 h endpoint-down,
+  2549 boots.** Explains report Surfaces B (0 bytes) + C (instant 502) — Vaayu was simply DOWN. Fix: guard **waits**
+  (poll `gpu_audit.audit()`, new knob `EXCLUSIVE_GPU_WAIT_S=120` in `config.py`+`ServerConfig`+`server/README.md`,
+  under `TimeoutStartSec=600`) + `RestartPreventExitStatus=3` in the unit & installer (crashes still restart).
+  Tests off-device (`tests/test_exclusive_gpu_wait.py`, 5 cases, monkeypatched audit+sleep). **KEEP the guard** —
+  warn-and-load costs up to 13× token rate.
+- [ ] **Bug 2 — cgroup `MemoryHigh` throttle starves decode (root-caused, 1 probe left).** Budgets derive from HOST
+  free RAM (`vaayu_base.py:804,3061,3191,3662`) with **zero cgroup awareness**, so they sum to ~26 GB against the
+  unit's `MemoryHigh=26G` → RSS walks into the cap → kernel throttles. Stalled tokens: `total=170.8s compute=170.3s
+  io_wait=0.0s expert_disk=0.2s rss=25.24GB` (and 179.5 s / 28.7 s @ `rss=25.84GB`) vs healthy `total=0.5s rss=15.26GB`.
+  **NOT disk** — kills the report's hypothesis. Explains Surface A: first ~10 chunks land, then RSS hits the cap and
+  token time blows past the client's 300 s timer; tokens >300 s are **cancelled before logging**, so the 179.5 s max is
+  censored. `SSE_KEEPALIVE_S` worked fine (client ignores SSE comments) — not implicated.
+  **STOP RULE: do not build until `/sys/fs/cgroup/system.slice/vaayu.service/memory.events`' `high` is shown climbing
+  during a live stall.** Flat ⇒ re-probe prefix-cache compress-on-evict instead. Fix direction: read our own
+  `memory.high`/`max`/`current` and take budget basis `min(host avail, cap − current − headroom)` (derived per §5,
+  no-op when unset) — max resources WITHOUT the throttle cliff.
+- [ ] **Blocks `OOMD-KILL` item 3** (sustained-load verify): a server in a boot loop cannot be profiled. Do Bug 1
+  first, then run the sustained repro carrying Bug 2's probe. **REJECTED as the fix** (user, 2026-11-02): "serve a
+  smaller model" — 16 GB VRAM + 32 GB RAM must be used to the max and MiniMax-M2.7 is a deliberate stress target.
+
 ## [x] SSE keepalive for the prefill/queue silent window — DONE 2026-10-28
 
 **Verdict:** prompted by Rudra's 2nd connection failure (run `logs/run-2026-10-28T10-46-53Z`, MiniMax-M2.7).
