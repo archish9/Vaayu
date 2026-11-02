@@ -101,7 +101,7 @@ not `config.py`. **§9:** no Rust change, no PyPI release needed.
 (`prefix_sessions` 3→1–2, `ram_cache_budget`) or serve Qwen3-Next-80B int4 / gpt-oss-20b → pressure never builds, fits
 with the desktop. This removes the cause; the service only makes it survivable.
 
-## [~] SVC-REGRESSION — the OOMD-KILL systemd service cured oomd and introduced TWO new bugs — Bug 1 BUILT + off-device green 2026-11-02; Bug 2 still stop-ruled
+## [~] SVC-REGRESSION — the OOMD-KILL systemd service cured oomd and introduced TWO new bugs — Bug 1 FIXED + VERIFIED ON-DEVICE 2026-11-02 (both arms); Bug 2 stop-ruled, unbuilt, waiting on a sustained run
 
 **Full brief (self-contained: evidence, fix plans, tests, §8/§9):**
 `docs/2026-11-02-SVC-REGRESSION-restart-loop-and-cgroup-throttle-BRIEF.md`
@@ -137,18 +137,33 @@ cgroup OOM, peak 12.7 G vs `MemoryMax=28G`.
   `sudo bash scripts/install-vaayu-service.sh --headless` (rewrites unit, no start/enable), then the on-device
   repro — hold VRAM with a hand-started Vaayu, `systemctl start vaayu` ⇒ expect ONE wait then at most ONE exit into
   `failed`, never a loop. **COMMITTED `4ec9c01`** + ledger `ced6990` + installer fix `b1d9ef8`, all on `main`.
-  - [bug] **the installer executed its own unit comments (FIXED `b1d9ef8`, same day).** The unit is written by an
+  - [x] **the installer executed its own unit comments — FIXED `b1d9ef8`, same day.** The unit is written by an
     UNQUOTED heredoc (it must expand `$RUN_USER`/`$REPO_DIR`/`$HIGH_GB`), so backticks in `4ec9c01`'s
     `RestartPreventExitStatus` comment RAN: `line 72: failed: command not found`, and `systemctl status`'s output —
     260 lines of the box's process tree — was written into the unit (34 → **296 lines**). It failed QUIETLY: systemd
     logs `Missing '=', ignoring line` and all 20 real directives still took effect. Fix = double quotes, plus
     `test_the_installed_unit_body_has_no_shell_substitutions` (no backtick, no `$(` in the heredoc body). Re-render:
     41 lines, 20 directives. **Anyone who installed between `4ec9c01` and `b1d9ef8` must re-run the installer.**
-  - [bug] **the wait message does not reach the operator LIVE.** `capture_stdio` buffers, so both guard lines carry
-    the same flush timestamp and `journalctl -u vaayu -f` shows an unexplained ~2 min pause with no reason given —
-    a milder version of the invisibility Bug 1 was about. The text is correct and lands in `logs/<run>/server.log`;
-    only the timing is wrong. Fix = `flush=True` on the two `_wait_for_exclusive_gpu` prints (or print before
-    `capture_stdio` installs). Small, not bundled into the verified fix.
+  - [x] **the wait message did not reach the operator LIVE — FIXED `a1fc96a`.** Root cause is NOT "a missing flush"
+    loosely: `capture_stdio` replaces **fd 1 with a pipe** (`logs.py:400-404` `dup2`), and Python **block-buffers**
+    stdout when it is not a tty — so the guard printed, slept 63 s, and the bytes left the process only once the
+    load's own output filled the 8 KB buffer. Hence two identical LATE timestamps and a silent `journalctl -f`
+    during the pause: the text was never late to be WRITTEN, only late to LEAVE. A milder form of the invisibility
+    Bug 1 was about. Fix = `flush=True` on the three time-sensitive prints (wait entry, wait cleared, refusal — the
+    last also for ordering, since uvicorn prints a traceback right behind it). **Evidence:**
+    `test_the_wait_message_is_flushed_before_the_wait_begins` records write/flush/sleep ORDER through a fake stdout
+    and asserts a flush precedes the first sleep — the operator-visible property, not a keyword; RED beforehand as
+    `[write, sleep, sleep, write]`, no flush at all. `test_exclusive_gpu_wait.py` + `test_gpu_audit.py` = **36
+    passed**; full-suite gate was still running at commit time, so it is NOT yet re-established at 4133. §8: no
+    knob, reaches the operator on every boot that waits. The service running on 2026-11-02 predates it — the fix
+    lands on its next restart.
+  - [ ] **NOT fixed, deliberately its own item: every OTHER print on the load path is still block-buffered** through
+    the same pipe, so a whole cold load arrives in one burst (observed 2026-11-02: every `[Vaayu-MoE] patched…` line
+    stamped 14:01:42). The class fix is one line in `capture_stdio` — make the captured stdout line-buffered
+    (`reconfigure(line_buffering=True)` after the `dup2`) — but it touches ALL output, so it was not folded into a
+    three-line guard change. Cost of leaving it: an operator watching a ~2 min cold load sees nothing, then a wall
+    of text, and any future boot-time pause is invisible again. Needs its own before/after check on a real load
+    (and a thought about `\r` progress frames, which line buffering does not flush).
 - [ ] **Bug 2 — cgroup `MemoryHigh` throttle starves decode (root-caused, STOP-RULED).** Full TASK:
   `docs/2026-11-02-SVC-REGRESSION-bug2-cgroup-aware-budgets-TASK.md`. Budgets derive from HOST free RAM with **zero
   cgroup awareness**, so they sum to ~26 GB against the unit's `MemoryHigh=26G` → RSS walks into the cap → kernel
@@ -189,9 +204,11 @@ cgroup OOM, peak 12.7 G vs `MemoryMax=28G`.
     **generated ids identical** to a pre-fix run (caches are exact; sizing must not move output) · dense decode not
     regressed (guards the O_DIRECT flip). Gates: `test_dense_gate.py` on BOTH Llama checkpoints, FOREGROUND; suite
     floor `1 failed, 4131 passed, 92 skipped`.
-- [ ] **Blocks `OOMD-KILL` item 3** (sustained-load verify): a server in a boot loop cannot be profiled. Do Bug 1
-  first, then run the sustained repro carrying Bug 2's probe. **REJECTED as the fix** (user, 2026-11-02): "serve a
-  smaller model" — 16 GB VRAM + 32 GB RAM must be used to the max and MiniMax-M2.7 is a deliberate stress target.
+- [x] **No longer blocks `OOMD-KILL` item 3** — that block was "a server in a boot loop cannot be profiled", and
+  Bug 1 is fixed + verified on-device (2026-11-02), so the sustained repro carrying Bug 2's probe is now RUNNABLE.
+  It is the next action and belongs to the user (Rudra drives the load). **REJECTED as the fix** (user, 2026-11-02):
+  "serve a smaller model" — 16 GB VRAM + 32 GB RAM must be used to the max and MiniMax-M2.7 is a deliberate stress
+  target.
 
 ## [x] SSE keepalive for the prefill/queue silent window — DONE 2026-10-28
 
