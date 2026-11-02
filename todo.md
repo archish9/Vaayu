@@ -28,11 +28,19 @@ Status keys: `[ ]` pending · `[~]` in progress · `[!]` blocked · `[bug]` open
 Protocol: `CLAUDE.md` §6 (this ledger), §7 (all plans / RESULTS go in `docs/`, gitignored — so every row carries its
 own numbers), §8 (every change must reach the server; say if it is banked).
 
-**Suite floor (last known, after FUSED-EXL3-GATE, 2026-10-16):** `4094 passed, 92 skipped, 1 failed` (230.23 s, FOREGROUND).
+**Suite floor (CURRENT, after SVC-REGRESSION Bug 1 + the flush fix, 2026-11-02): `4134 passed, 92 skipped, 1 failed`**
+(356.02 s). Reconciled, not assumed: 4124 pre-session + 10 new tests = 4134 — 9 in `tests/test_exclusive_gpu_wait.py`
+(7 from `4ec9c01`, +1 heredoc guard `b1d9ef8`, +1 flush-order `a1fc96a`) and 1 in `test_server_config_module.py`
+(the §8 forwarding test, added AFTER the 4131 interim run, which is why that figure looked 1 short). `cargo test`
+not re-run: no Rust touched this session.
+
+**Prior floor (after FUSED-EXL3-GATE, 2026-10-16):** `4094 passed, 92 skipped, 1 failed` (230.23 s, FOREGROUND).
 The 1 failure is the pre-existing machine-local `config_local.py MAX_BATCH_SIZE=3` artifact
-(`test_max_batch_size_defaults_to_one`), not a code regression — passes with `config_local` absent. 4094 =
+(`test_max_batch_size_defaults_to_one`), not a code regression — **proven** 2026-11-02: `config.py:195` ships
+`MAX_BATCH_SIZE = 1`, the gitignored `config_local.py:12` shadows it to `3`. 4094 =
 S56 floor 4092 + 2 from `a0ba81c`'s `test_fused_exl3_prefill_staging.py`; the FUSED-EXL3-GATE adds +3 **skipped**
-(89→92) when `FUSED_EXL3_CKPT` is unset. Two on-device gates skip unless their env is set: `DENSE_CKPT=`
+(89→92) when `FUSED_EXL3_CKPT` is unset. (That 4094 note understated the real count — the TOOLCALL rows had already
+taken it to 4124 by 2026-10-28.) Two on-device gates skip unless their env is set: `DENSE_CKPT=`
 (`test_dense_gate.py`) and `FUSED_EXL3_CKPT=` (`test_fused_exl3_gate.py`, model
 `darkbit1001--Qwen3.6-35B-A3B-EXL3-6.00bpw-hb6`, ppl 5.98). (Prior floor `4132 passed` was `main` at `893cb5a` 2026-10-14, before
 S57/EXL3-K/S56 and before the `config_local` batching-sweep leftover; dense gate 6/6 both Llama, ppl 8.87.) `cargo test` in `vaayu_rust/`: `38 passed, 0 failed, 1 ignored`. Needs a
@@ -154,7 +162,7 @@ cgroup OOM, peak 12.7 G vs `MemoryMax=28G`.
     `test_the_wait_message_is_flushed_before_the_wait_begins` records write/flush/sleep ORDER through a fake stdout
     and asserts a flush precedes the first sleep — the operator-visible property, not a keyword; RED beforehand as
     `[write, sleep, sleep, write]`, no flush at all. `test_exclusive_gpu_wait.py` + `test_gpu_audit.py` = **36
-    passed**; full-suite gate was still running at commit time, so it is NOT yet re-established at 4133. §8: no
+    passed**; full suite then confirmed green — see the floor below. §8: no
     knob, reaches the operator on every boot that waits. The service running on 2026-11-02 predates it — the fix
     lands on its next restart.
   - [ ] **NOT fixed, deliberately its own item: every OTHER print on the load path is still block-buffered** through
