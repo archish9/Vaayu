@@ -308,11 +308,11 @@ def cancel_fields(meter) -> dict:
 
 # Most specific first; the first probe that matches wins. The optional group
 # is the major version, taken from the digits right after the product name.
-_VER = r"(?:[/ ]v?(\d+))?"
+_VER = r"(?:[/ ]v?(\d{1,4})(?!\d))?"
 _CLIENT_PROBES = [(re.compile(p, re.I), fam) for p, fam in (
     (r"\bopenai/python" + _VER, "openai-python"),
     (r"\bopenai/js" + _VER, "openai-js"),
-    (r"\banthropic[/-]\w+" + _VER, "anthropic-sdk"),
+    (r"\banthropic(?:[/-][A-Za-z]+)*" + _VER, "anthropic-sdk"),
     (r"\bcurl" + _VER, "curl"),
     (r"\bpython-httpx" + _VER, "httpx"),
     (r"\bpython-requests" + _VER, "python-requests"),

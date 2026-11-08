@@ -585,3 +585,13 @@ def test_a_row_with_no_derived_shape_has_client_null(tmp_path):
     e = EngineHandle(M(), log_dir=tmp_path)
     _drive_sse(e, _req())
     assert rows(tmp_path)[0]["client"] is None
+
+
+def test_a_streamed_row_through_the_route_carries_the_client_shape(tmp_path, monkeypatch):
+    run_dir = _run_dir(tmp_path)
+    with _route_client(run_dir, monkeypatch) as c:
+        r = c.post("/v1/chat/completions", json={**_ROUTE_BODY, "stream": True},
+                   headers={"user-agent": "curl/8.5.0 host=alice-laptop.local"})
+        assert r.status_code == 200
+    row = rows(run_dir)[0]
+    assert row["client"] == {"family": "curl", "version": "8", "forwarded": False}

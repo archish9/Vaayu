@@ -274,6 +274,15 @@ def test_s_since_last_chunk_falls_back_to_time_since_arrival_with_no_chunk():
     (None, "unknown", None),
     ("x" * 100000, "unknown", None),
     (b"curl/8", "unknown", None),
+    ("OpenAI/JS 4.67.1", "openai-js", "4"),
+    ("anthropic-sdk-python/0.1", "anthropic-sdk", "0"),
+    ("Anthropic/Python 0.40.0", "anthropic-sdk", "0"),
+    ("python-requests/2.31.0", "python-requests", "2"),
+    ("Python/3.12 aiohttp/3.9.5", "aiohttp", "3"),
+    ("undici", "undici", None),
+    ("axios/1.7.2", "axios", "1"),
+    ("Go-http-client/2.0", "go-http-client", "2"),
+    ("curl/999999999999999999999999", "curl", None),
 ])
 def test_the_client_family_is_derived(ua, family, version):
     assert client_shape(ua, forwarded=False) == {
