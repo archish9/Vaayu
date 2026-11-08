@@ -1,0 +1,2 @@
+1. docs/2026-11-08-SQE-PLUG-rust-mitigation-PLAN.md -> FIX RUST
+2. docs/2026-11-08-HANG-kernel-blk-mq-CVE-2026-64017.md -> ERROR THAT WAS CAUSING HANG THE MACHINE
