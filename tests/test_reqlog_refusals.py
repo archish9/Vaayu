@@ -570,8 +570,9 @@ def test_a_disconnect_while_queued_still_writes_a_row(run_dir):
                 pass
 
         await e._lock.acquire()             # A will block here once picked up
+        meter_a = WireMeter("chatcmpl-a")
         gen_a = app_mod._sse(e, req_a, "m", None, prepared=e.prepare(req_a),
-                             scheduler=sched, meter=WireMeter("chatcmpl-a"))
+                             scheduler=sched, meter=meter_a)
         task_a = asyncio.create_task(drain(gen_a))
         # Long enough for A's job to be submitted, picked up by `_form`, and
         # blocked inside `_run` on `engine._lock`. From this point on the
@@ -593,6 +594,10 @@ def test_a_disconnect_while_queued_still_writes_a_row(run_dir):
         # generator, own writing their rows.
         await sched.stop()
         await task_a
+        # A reason noted by `_sse`'s `finally` lands AFTER A's engine row is
+        # already on disk, so it is observable only on the meter -- the row
+        # assertion below cannot see it.
+        assert meter_a.cancel_reason is None
 
     asyncio.run(main())
     rs = {r["session"]: r for r in rows(run_dir)}
@@ -607,6 +612,7 @@ def test_a_disconnect_while_queued_still_writes_a_row(run_dir):
     # are already out by the time B reaches submit().
     assert rs["b"]["cancel_reason"] == "abandoned_queued"
     assert rs["b"]["wire"] is not None and rs["b"]["wire"]["chunks_sent"] >= 1
+    # Guards the engine row writer itself noting a reason on a normal finish.
     assert rs["a"]["cancel_reason"] is None
 
 

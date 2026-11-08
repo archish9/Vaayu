@@ -1254,6 +1254,9 @@ async def _sse(engine, req, model_name, warning, cancel=None, session_id=None,
         # Starlette closes this generator when the client goes away, so this is
         # where an abandoned SSE stream stops generating. Cancelling after a
         # normal finish is harmless -- the token is already spent.
+        # A reason passed here would be observable only on rows written AFTER
+        # this `finally`: an engine row for a run that finished is already on
+        # disk by now. Reasons belong at the cancel site, not here.
         cancel.cancel()
         # Guarded on the handover, not on the exception type: once
         # engine.stream owns the row, writing one here would DOUBLE-count the
