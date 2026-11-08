@@ -955,6 +955,11 @@ def _chunk(cid, created, model_name, *, delta, finish=None, usage=None,
     return f"data: {json.dumps(body)}\n\n"
 
 
+# The end-of-stream event, named because every exit yields it and each one
+# also records it on the meter.
+_DONE = "data: [DONE]\n\n"
+
+
 def _error_event(ex, kind: str = "internal_error") -> str:
     payload = {"error": {"message": f"{type(ex).__name__}: {ex}",
                          "type": kind}}
@@ -987,6 +992,21 @@ async def _sse(engine, req, model_name, warning, cancel=None, session_id=None,
     # tool-call heartbeat below, which is the one window where the engine is
     # producing normally and the wire is nonetheless silent.
     last_write = time.monotonic()
+
+    def _wrote(s):
+        """Record one data chunk on the meter, AFTER the `yield` wrote it.
+
+        After, because a yield that never returns is a client that went away
+        mid-write, and those bytes never left this frame. One helper because
+        `meter=None` is legal -- `_sse` has callers with no socket -- and a
+        guard forgotten at one of fifteen chunk sites is an AttributeError on
+        the generation path. The comment and heartbeat sites guard inline:
+        which of the three a write is decides whether it ends a silence span,
+        so it is not a detail to hide behind a default.
+        """
+        if meter is not None:
+            meter.note_chunk(len(s))
+
     # Everything already delivered as a content delta. The final event carries
     # the CLEANED text -- prose before the call plus whatever followed it -- and
     # the tail of that was never sent (B15), so the emitter needs to know where
@@ -1014,12 +1034,23 @@ async def _sse(engine, req, model_name, warning, cancel=None, session_id=None,
         # queued caller tell "waiting behind N requests" from "hung". These
         # three yields are INSIDE the try because a disconnect suspended on
         # any of them is exactly the unowned window described above.
-        yield f": vaayu queue position {scheduler.depth}\n\n"
+        pos = f": vaayu queue position {scheduler.depth}\n\n"
+        yield pos
+        # The FIRST write of the frame, and what gives this request a `wire`
+        # block at all -- including a request that dies in the unowned window
+        # below, whose row `_sse` itself writes.
+        if meter is not None:
+            meter.note_comment(len(pos))
         if warning:
-            yield f": warning {warning}\n\n"
+            warn_line = f": warning {warning}\n\n"
+            yield warn_line
+            if meter is not None:
+                meter.note_comment(len(warn_line))
 
-        yield _chunk(cid, created, model_name, session_id=session_id,
-                     delta={"role": "assistant"})
+        ev = _chunk(cid, created, model_name, session_id=session_id,
+                    delta={"role": "assistant"})
+        yield ev
+        _wrote(ev)
 
         # Submitted HERE, not in the route: this generator body runs after the
         # handler returned, so a job submitted around that return would sit
@@ -1051,10 +1082,20 @@ async def _sse(engine, req, model_name, warning, cancel=None, session_id=None,
                     # the answer to START -- but once a tool call is being
                     # buffered the client is mid-answer and counting CHUNKS, so
                     # the same silence has to be broken with one (see below).
-                    yield (_chunk(cid, created, model_name, session_id=session_id,
-                                  delta={"content": ""}) if suppressing
-                           else ": keepalive\n\n")
+                    beat = (_chunk(cid, created, model_name,
+                                   session_id=session_id,
+                                   delta={"content": ""}) if suppressing
+                            else ": keepalive\n\n")
+                    yield beat
                     last_write = time.monotonic()
+                    if meter is not None:
+                        # A chunk mid-answer, a comment while the client is
+                        # still waiting for it to start -- and only the chunk
+                        # ends a silence span.
+                        if suppressing:
+                            meter.note_heartbeat(len(beat))
+                        else:
+                            meter.note_comment(len(beat))
                     continue
             else:
                 item = await job.out.get()
@@ -1105,9 +1146,12 @@ async def _sse(engine, req, model_name, warning, cancel=None, session_id=None,
                 # a finish_reason) nor change the assembled answer.
                 if keepalive_s and keepalive_s > 0 \
                         and time.monotonic() - last_write >= keepalive_s:
-                    yield _chunk(cid, created, model_name, session_id=session_id,
-                                 delta={"content": ""})
+                    beat = _chunk(cid, created, model_name,
+                                  session_id=session_id, delta={"content": ""})
+                    yield beat
                     last_write = time.monotonic()
+                    if meter is not None:
+                        meter.note_heartbeat(len(beat))
                 continue
             held += payload
             if open_marker and open_marker in held:
@@ -1117,9 +1161,11 @@ async def _sse(engine, req, model_name, warning, cancel=None, session_id=None,
                 cut = held.index(open_marker)
                 if held[:cut]:
                     sent += held[:cut]
-                    yield _chunk(cid, created, model_name, session_id=session_id,
-                                 delta={"content": held[:cut]})
+                    ev = _chunk(cid, created, model_name, session_id=session_id,
+                                delta={"content": held[:cut]})
+                    yield ev
                     last_write = time.monotonic()
+                    _wrote(ev)
                 held, buffered, suppressing = "", held[cut:], True
                 continue
             # Hold back a marker-length tail so an open marker split
@@ -1128,8 +1174,10 @@ async def _sse(engine, req, model_name, warning, cancel=None, session_id=None,
             if len(held) > keep:
                 emit, held = held[:len(held) - keep], held[len(held) - keep:]
                 sent += emit
-                yield _chunk(cid, created, model_name, session_id=session_id, delta={"content": emit})
+                ev = _chunk(cid, created, model_name, session_id=session_id, delta={"content": emit})
+                yield ev
                 last_write = time.monotonic()
+                _wrote(ev)
     except QueueFull as ex:
         # The route's eager depth check turns the ordinary full queue into a
         # real 503; this is the admission race it cannot see. The headers are
@@ -1142,21 +1190,30 @@ async def _sse(engine, req, model_name, warning, cancel=None, session_id=None,
         # runs. Without this row the request that lost the admission race is
         # the one kind of request that ends with no row at all.
         owed = ("QueueFull", str(ex), "refused")
-        yield _error_event(ex, "server_busy")
-        yield "data: [DONE]\n\n"
+        ev = _error_event(ex, "server_busy")
+        yield ev
+        _wrote(ev)
+        yield _DONE
+        _wrote(_DONE)
         return
     except (ContextTooLong, TemplateLacksToolSupport, NoChatTemplate) as ex:
         # Unreachable from the route, which now prepares before responding.
         # Kept for any other caller of _sse, and so this class of error is
         # never again reported as a fault of the server's.
         owed = (type(ex).__name__, str(ex), "refused")
-        yield _error_event(ex, "invalid_request_error")
-        yield "data: [DONE]\n\n"
+        ev = _error_event(ex, "invalid_request_error")
+        yield ev
+        _wrote(ev)
+        yield _DONE
+        _wrote(_DONE)
         return
     except Exception as ex:                            # noqa: BLE001
         owed = (type(ex).__name__, str(ex), "error")
-        yield _error_event(ex)
-        yield "data: [DONE]\n\n"
+        ev = _error_event(ex)
+        yield ev
+        _wrote(ev)
+        yield _DONE
+        _wrote(_DONE)
         return
     except BaseException as ex:                        # noqa: BLE001 -- re-raised
         # GeneratorExit (Starlette closing an abandoned stream) and
@@ -1183,15 +1240,19 @@ async def _sse(engine, req, model_name, warning, cancel=None, session_id=None,
                          finish=owed[2], meter=meter)
 
     if held and not suppressing:
-        yield _chunk(cid, created, model_name, session_id=session_id, delta={"content": held})
+        ev = _chunk(cid, created, model_name, session_id=session_id, delta={"content": held})
+        yield ev
+        _wrote(ev)
 
     if suppressing and not (final is not None and final.tool_calls):
         # The marker did not open a tool call after all -- it was ordinary text
         # (a ```json code answer, or a marked block whose JSON did not parse,
         # which the non-streaming path also returns verbatim). Emitting it here
         # rather than dropping it is the whole point of buffering.
-        yield _chunk(cid, created, model_name, session_id=session_id,
-                     delta={"content": buffered})
+        ev = _chunk(cid, created, model_name, session_id=session_id,
+                    delta={"content": buffered})
+        yield ev
+        _wrote(ev)
 
     if final is not None and final.tool_calls:
         # The prose that FOLLOWED the call. It is in `final.text` -- which the
@@ -1209,19 +1270,26 @@ async def _sse(engine, req, model_name, warning, cancel=None, session_id=None,
         text = final.text or ""
         pending = text[len(head):] if text.startswith(head) else ""
         if pending:
-            yield _chunk(cid, created, model_name, session_id=session_id,
-                         delta={"content": pending})
-        yield _chunk(cid, created, model_name, session_id=session_id, delta={"tool_calls": final.tool_calls})
+            ev = _chunk(cid, created, model_name, session_id=session_id,
+                        delta={"content": pending})
+            yield ev
+            _wrote(ev)
+        ev = _chunk(cid, created, model_name, session_id=session_id, delta={"tool_calls": final.tool_calls})
+        yield ev
+        _wrote(ev)
 
     usage = None
     if final is not None and req.stream_options and req.stream_options.include_usage:
         usage = Usage(prompt_tokens=final.prompt_tokens,
                       completion_tokens=final.completion_tokens,
                       total_tokens=final.prompt_tokens + final.completion_tokens)
-    yield _chunk(cid, created, model_name, session_id=session_id, delta={},
-                 # No final event means the stream did not run to completion.
-                 # "stop" there would tell the client its truncated answer is
-                 # whole -- the same lie B5 fixed inside the engine.
-                 finish=(final.finish_reason if final is not None else "length"),
-                 usage=usage)
-    yield "data: [DONE]\n\n"
+    ev = _chunk(cid, created, model_name, session_id=session_id, delta={},
+                # No final event means the stream did not run to completion.
+                # "stop" there would tell the client its truncated answer is
+                # whole -- the same lie B5 fixed inside the engine.
+                finish=(final.finish_reason if final is not None else "length"),
+                usage=usage)
+    yield ev
+    _wrote(ev)
+    yield _DONE
+    _wrote(_DONE)

@@ -47,8 +47,9 @@ class WireMeter:
     concurrent requests to each other.
 
     The `note_*` methods record what the socket did; the fields they feed are
-    published by `row()` as the measurements that need them land. Only
-    `engine_started_s` is published today.
+    published by `row()` as the measurements that need them land.
+    `tokens_held_at_max_silence` and `buffering` are published as None until
+    the tool-call buffer is measured -- every row keeps the same keys.
     """
 
     def __init__(self, request_id: str, *, client: dict | None = None,
@@ -84,6 +85,19 @@ class WireMeter:
         self._comments = 0
         self._heartbeats = 0
         self._bytes = 0
+        self._first_byte = None
+        self._first_chunk = None
+        self._last_chunk = None
+        # The OPEN silence span's start. Request arrival, not the first chunk:
+        # the wait for the first chunk is client-visible silence too -- a
+        # chunk-counting client times out on a cold prefill exactly as it does
+        # on a buffered tool call (the run-D class).
+        self._silence_from = self._t0
+        # None until a data chunk has closed a span. `0` would be a
+        # measurement ("silent for nothing"), and a wire that never carried a
+        # chunk has nothing to report.
+        self._max_silence = None
+        self._max_silence_at = None
         self._tokens = 0
         self._buffering_opened_at_token = None
         self._buffered_bytes = 0
@@ -92,26 +106,56 @@ class WireMeter:
 
     def note_chunk(self, nbytes: int) -> None:
         """One SSE data chunk went out. What a chunk-counting client sees."""
-        self._chunks += 1
-        self._bytes += nbytes
-        self._recorded = True
+        self._data_chunk(nbytes)
 
     def note_comment(self, nbytes: int) -> None:
         """One `: ...` comment line went out -- a queue position or keepalive.
 
         Separate from a chunk because a client's timer does not count
         comments: in run E the keepalive comments were flowing and the client
-        died anyway.
+        died anyway. So this moves `bytes_sent`, `comments_sent` and
+        `first_byte_s`, and deliberately does NOT end the silence span -- the
+        single most consequential line in this object. A byte-silence meter
+        would have reported ~15 s for run E (`SSE_KEEPALIVE_S` guarantees a
+        byte that often) and called it healthy.
         """
+        now = self._clock()
         self._comments += 1
         self._bytes += nbytes
         self._recorded = True
+        if self._first_byte is None:
+            self._first_byte = now
 
     def note_heartbeat(self, nbytes: int) -> None:
-        """One empty-content chunk from the buffered-tool-call heartbeat."""
+        """One empty-content chunk from the buffered-tool-call heartbeat.
+
+        A data CHUNK, which is why it is one on the wire too (`656e3e2`): it
+        counts in `chunks_sent` and it ends the silence span, because a
+        chunk-counting client's timer is what it exists to refresh.
+        """
         self._heartbeats += 1
+        self._data_chunk(nbytes)
+
+    def _data_chunk(self, nbytes: int) -> None:
+        """A data chunk left the frame: the event that ENDS a silence span.
+
+        Reads the clock once (see the module docstring) and shares that one
+        reading between the first/last markers and the span it closes.
+        """
+        now = self._clock()
+        self._chunks += 1
         self._bytes += nbytes
         self._recorded = True
+        if self._first_byte is None:
+            self._first_byte = now
+        if self._first_chunk is None:
+            self._first_chunk = now
+        self._last_chunk = now
+        span = now - self._silence_from
+        if self._max_silence is None or span > self._max_silence:
+            self._max_silence = span
+            self._max_silence_at = self._silence_from - self._t0
+        self._silence_from = now
 
     def note_engine_started(self) -> None:
         """The engine took its own `started` just now.
@@ -166,7 +210,45 @@ class WireMeter:
         """
         if not self._recorded:
             return None
+        max_silence, max_silence_at = self._max_silence, self._max_silence_at
+        if self._chunks:
+            # Close the span that is still OPEN. The row is written from the
+            # engine's `finally`, so run E's own row was written while its
+            # 322 s of quiet was still in flight: reporting only the spans a
+            # chunk happened to CLOSE would have read `max_silence_s: 0` on
+            # the one request this object exists to describe.
+            open_span = self._clock() - self._silence_from
+            if open_span > max_silence:
+                max_silence = open_span
+                max_silence_at = self._silence_from - self._t0
         return {
+            # As of ROW time, not for the whole response: `_sse` emits the
+            # terminating chunk and `data: [DONE]` after the engine's
+            # row-writing `finally` has run. Those are milliseconds; the
+            # silence this measures happens during generation.
+            "chunks_sent": self._chunks,
+            "comments_sent": self._comments,
+            "heartbeats_sent": self._heartbeats,
+            "bytes_sent": self._bytes,
+            # Seconds from request ARRIVAL. `first_byte_s` counts a comment
+            # (the queue-position line is usually the first byte out);
+            # `first_chunk_s` is the first thing a chunk-counting client sees.
+            "first_byte_s": (None if self._first_byte is None
+                             else self._first_byte - self._t0),
+            "first_chunk_s": (None if self._first_chunk is None
+                              else self._first_chunk - self._t0),
+            "last_chunk_s": (None if self._last_chunk is None
+                             else self._last_chunk - self._t0),
+            # The headline number: the longest span with no data CHUNK, and
+            # when that span started. None -- never `0` -- when no chunk was
+            # ever written: there is no span to report, and a zero there would
+            # read as a healthy wire on the rows most likely to be broken.
+            "max_silence_s": max_silence,
+            "max_silence_at_s": max_silence_at,
+            # Filled by the task that measures the tool-call buffer. Published
+            # as None from here so every row keeps the same keys.
+            "tokens_held_at_max_silence": None,
+            "buffering": None,
             # Seconds from request ARRIVAL to the engine's own `started`. The
             # offset that makes the wire's seconds comparable with the row's
             # `ttft_s` and `wall_s`, which start only once this request was

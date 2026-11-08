@@ -42,6 +42,7 @@ class FakeEngine:
         self.tool_format = None
         self.cancel = None          # the CancelToken the route handed us
         self.cancelled_all = False  # set by shutdown
+        self.wire_row = None        # meter.row() as of row-writing time
         # BatchScheduler._run holds this for a whole batch/serial run -- the
         # real EngineHandle's own lock, which app.py's routes no longer touch
         # directly now that admission goes through the scheduler (P10).
@@ -79,13 +80,22 @@ class FakeEngine:
 
     async def stream(self, req, cancel=None, prepared=None, meter=None):
         self.cancel = cancel
-        if self._raises is not None and not isinstance(self._raises, QueueFull):
-            raise self._raises
-        if self.delta_delay:
-            await asyncio.sleep(self.delta_delay)
-        for d in self._deltas:
-            yield ("delta", d)
-        yield ("final", self._result)
+        try:
+            if self._raises is not None and not isinstance(self._raises, QueueFull):
+                raise self._raises
+            if self.delta_delay:
+                await asyncio.sleep(self.delta_delay)
+            for d in self._deltas:
+                yield ("delta", d)
+            yield ("final", self._result)
+        finally:
+            # Where the REAL `EngineHandle.stream` writes its row: its own
+            # `finally` calls `_write_request_row(..., meter=meter)`, which
+            # reads `meter.row()`. Snapshotting the same call here is what
+            # lets a test below see the `wire` block as the row carries it --
+            # chunks after this point are the post-row tail the spec
+            # documents, and this fake writes no row of its own.
+            self.wire_row = meter.row() if meter is not None else None
 
     def cancel_all(self):
         self.cancelled_all = True
@@ -436,6 +446,122 @@ def test_the_buffered_tool_call_heartbeat_is_off_when_keepalive_is_off(monkeypat
         r = c.post("/v1/chat/completions", json=_TOOL_BODY)
     events = _sse_events(r.text)
     assert _span_between_prose_and_call(events) == []
+
+
+# ── what the row says about the wire (run E's own numbers) ──────────────────
+
+
+def _metered_clock(monkeypatch):
+    """One ticking clock driving BOTH `app.time` and the route's `WireMeter`,
+    and the list of meters the route minted.
+
+    `wire.WireMeter` binds `time.monotonic` as a DEFAULT ARGUMENT and the
+    route constructs it with no `clock=`, so patching neither `app.time` nor
+    `wire.time` reaches the meter -- and production must not grow a test hook
+    to make this easier. The route looks the CLASS up as a module global, so
+    replacing that name is where a test clock gets in.
+
+    Driving the clock rather than sleeping is what makes these tests
+    deterministic: the fake engine runs ahead and the whole buffered span
+    drains with no wall time passing at all (`_TickingClock`'s docstring).
+    """
+    from vaayu.server import app as app_module
+    from vaayu.server.wire import WireMeter
+
+    clock, meters = _TickingClock(), []
+
+    def mint(rid, **kw):
+        meters.append(WireMeter(rid, clock=clock.monotonic, **kw))
+        return meters[-1]
+
+    monkeypatch.setattr(app_module, "time", clock)
+    monkeypatch.setattr(app_module, "WireMeter", mint)
+    return meters
+
+
+@pytest.mark.parametrize("fmt_key", sorted(_BUFFERING_FORMATS))
+def test_the_row_reports_the_wire_silence_of_a_long_buffered_tool_call(
+        monkeypatch, fmt_key):
+    """The run-E acceptance test.
+
+    That request's row read healthy on every engine-side number -- 629 tokens,
+    1.911 tok/s, `io_wait` 0.0 s per token -- while the client got nothing for
+    300 s and timed out. The row must now carry what the SOCKET did, and the
+    counts must match the bytes that actually went out: a `yield` whose
+    recording was forgotten shows up here as an off-by-one.
+    """
+    meters = _metered_clock(monkeypatch)
+    engine = _buffered_tool_call_engine(fmt_key)
+    with _live_client(engine=engine, sse_keepalive_s=0.5) as c:
+        r = c.post("/v1/chat/completions", json=_TOOL_BODY)
+    assert r.status_code == 200
+    # As of ROW time, which is what reaches `requests.jsonl`. The fake engine
+    # snapshots `meter.row()` where the real one writes its row.
+    assert engine.wire_row is not None, "a streaming row must carry a wire block"
+    assert engine.wire_row["max_silence_s"] > 0
+    assert engine.wire_row["chunks_sent"] >= 1
+    assert engine.wire_row["comments_sent"] >= 0
+    # The whole frame, against the body the client actually received. The fake
+    # engine finishes before `_sse` drains it -- a real one is the slow part --
+    # so the row-time snapshot above is early, and this is where every write
+    # site is accounted for.
+    wire = meters[-1].row()
+    lines = r.text.splitlines()
+    assert wire["chunks_sent"] == len([l for l in lines if l.startswith("data: ")])
+    assert wire["comments_sent"] == len([l for l in lines if l.startswith(": ")])
+    assert wire["bytes_sent"] == len(r.text)
+    assert wire["heartbeats_sent"] == len(
+        _span_between_prose_and_call(_sse_events(r.text)))
+    # Dated, so a reader can place the span against `first_chunk_s`.
+    assert wire["max_silence_at_s"] is not None
+    assert wire["last_chunk_s"] >= wire["first_chunk_s"]
+
+
+@pytest.mark.parametrize("fmt_key", sorted(_BUFFERING_FORMATS))
+def test_the_quiet_the_row_reports_is_the_buffered_one_not_the_startup_wait(
+        monkeypatch, fmt_key):
+    """Run E's signature: a span that begins AFTER the answer started.
+
+    A cold prefill is legitimately silence too (the run-D class, 26 s on a
+    cold MiniMax load), so a row that only ever reported the wait for the
+    first chunk would describe every slow load and never this. The keepalive
+    interval here is longer than the whole buffered body, so no heartbeat
+    intervenes -- the pre-`656e3e2` wire, which is what run E had.
+    """
+    meters = _metered_clock(monkeypatch)
+    engine = _buffered_tool_call_engine(fmt_key)
+    # Run E's shape: 620 more tokens generated INSIDE the buffer. Each delta
+    # there costs a clock reading and emits nothing, so the span grows exactly
+    # as that one did. They are discarded with the rest of the buffer once the
+    # final event says a tool call was parsed, so the answer is unchanged.
+    engine._deltas = engine._deltas + ["tok"] * 24
+    with _live_client(engine=engine, sse_keepalive_s=100) as c:
+        r = c.post("/v1/chat/completions", json=_TOOL_BODY)
+    assert r.status_code == 200
+    wire = meters[-1].row()
+    assert wire["heartbeats_sent"] == 0, "no beat may break the span under test"
+    assert wire["max_silence_at_s"] >= wire["first_chunk_s"]
+    assert wire["max_silence_s"] > wire["first_chunk_s"]
+    assert _streamed_content(_sse_events(r.text)) == "ok "
+
+
+@pytest.mark.parametrize("fmt_key", sorted(_BUFFERING_FORMATS))
+def test_silence_is_still_measured_when_keepalive_is_off(monkeypatch, fmt_key):
+    """`SSE_KEEPALIVE_S = 0` turns the heartbeat off. It must not turn
+    MEASUREMENT off, or the one configuration most likely to strand a client
+    is the one whose rows say nothing about it (Review Focus 2)."""
+    meters = _metered_clock(monkeypatch)
+    engine = _buffered_tool_call_engine(fmt_key)
+    with _live_client(engine=engine, sse_keepalive_s=0) as c:
+        r = c.post("/v1/chat/completions", json=_TOOL_BODY)
+    assert r.status_code == 200
+    wire = meters[-1].row()
+    assert wire["heartbeats_sent"] == 0 and wire["max_silence_s"] > 0
+    # The queue-position line is the only comment with the keepalive off --
+    # and it is the FIRST write of the frame, which is what gives even a
+    # request that dies before its first chunk a wire block at all.
+    assert wire["comments_sent"] == 1
+    assert engine.wire_row is not None
 
 
 def test_the_last_stream_event_carries_the_finish_reason():
