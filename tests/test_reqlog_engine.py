@@ -5,6 +5,7 @@ Audit item 9: a failed request used to leave a REQ line with no DONE, and its
 traceback landed in server.log unattributed.
 """
 import asyncio
+import contextlib
 import json
 
 import pytest
@@ -452,3 +453,84 @@ def test_a_library_caller_without_a_meter_still_streams_and_still_rows(tmp_path)
     assert any(k == "delta" for k, _ in out)
     row = rows(tmp_path)[0]
     assert row["id"] is None and row["wire"] is None
+
+
+# ── the same id, through the REAL route ─────────────────────────────────────
+
+@contextlib.contextmanager
+def _route_client(log_dir, monkeypatch):
+    """A `TestClient` over the real `/v1/chat/completions`, with this file's
+    streaming fake behind it.
+
+    `_drive_sse` above enters at `_sse`, which is DOWNSTREAM of the frame that
+    mints the id -- so it cannot see the route failing to hand the meter over,
+    and three one-line route mutants (dropping `meter=` from the `_sse` call,
+    nulling `job.meter` on the non-streaming path, minting a second id for the
+    response body) all passed against it. These two tests post through the
+    route itself, which is the only place that hand-off exists.
+
+    `no_real_load`'s pattern, as `tests/test_reqlog_refusals.py` uses it:
+    without it `create_app`'s lifespan calls `AutoModel.from_pretrained` on a
+    checkpoint that is not here.
+    """
+    from fastapi.testclient import TestClient
+
+    from vaayu.server.app import ServerConfig, create_app
+
+    class FakeAutoModel:
+        @staticmethod
+        def from_pretrained(path, **kwargs):
+            return M()
+
+    import vaayu.auto_model as am
+    import vaayu.gpu_audit as ga
+    monkeypatch.setattr(am, "AutoModel", FakeAutoModel)
+    monkeypatch.setattr(ga, "audit", lambda **kw: [])
+
+    cfg = ServerConfig(model_path="/ckpt", log_dir=str(log_dir.parent),
+                       capture_stdio=False, default_stream=False)
+    app = create_app(cfg)
+    with TestClient(app) as c:
+        # Point the rows at the directory this test owns; the lifespan built
+        # its engine against its own new_run_dir(). The scheduler looks every
+        # attribute up on `self.engine` per dispatch, so repointing that one
+        # reference is enough.
+        app.state.engine = EngineHandle(M(), log_dir=log_dir)
+        app.state.scheduler.engine = app.state.engine
+        yield c
+
+
+def _run_dir(tmp_path):
+    d = tmp_path / "run-test"
+    (d / "sessions").mkdir(parents=True)
+    return d
+
+
+_ROUTE_BODY = {"model": "m", "session_id": "s", "max_tokens": 16,
+               "messages": [{"role": "user", "content": "hi"}]}
+
+
+def test_the_non_streaming_body_id_is_the_row_id(tmp_path, monkeypatch):
+    """The id the client keeps is the id the row carries. Minting a second one
+    for the response body is what made a reporter's quoted id join nothing."""
+    run_dir = _run_dir(tmp_path)
+    with _route_client(run_dir, monkeypatch) as c:
+        r = c.post("/v1/chat/completions", json={**_ROUTE_BODY, "stream": False})
+    assert r.status_code == 200
+    row = rows(run_dir)[-1]
+    assert row["stream"] is False
+    assert r.json()["id"] == row["id"]
+
+
+def test_the_streamed_chunk_ids_are_the_row_id(tmp_path, monkeypatch):
+    """Same property on the streaming path, where the id reaches the client as
+    every chunk's `id` and reaches the row through `job.meter`."""
+    run_dir = _run_dir(tmp_path)
+    with _route_client(run_dir, monkeypatch) as c:
+        r = c.post("/v1/chat/completions", json={**_ROUTE_BODY, "stream": True})
+    assert r.status_code == 200
+    chunk_ids = {json.loads(line[6:])["id"] for line in r.text.splitlines()
+                 if line.startswith("data: {")}
+    row = rows(run_dir)[-1]
+    assert row["stream"] is True
+    assert chunk_ids == {row["id"]}
