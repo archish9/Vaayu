@@ -552,16 +552,16 @@ def test_the_row_says_how_many_tokens_sat_in_the_buffer(monkeypatch, fmt_key):
         r = c.post("/v1/chat/completions", json=_TOOL_BODY)
     assert r.status_code == 200
     wire = meters[-1].row()
-    total = len(engine._deltas)
     buf = wire["buffering"]
     assert wire["heartbeats_sent"] == 0
-    # The marker completes on this delta: hermes' is whole in the second;
-    # MiniMax's is split across the second and third.
-    assert buf["opened_at_token"] == {"hermes": 2, "minimax_xml": 3}[fmt_key]
-    # Everything generated after the marker opened was held, and the longest
-    # quiet span is that one, so the two views agree to the token.
-    assert buf["tokens_buffered"] == total - buf["opened_at_token"]
-    assert wire["tokens_held_at_max_silence"] == total - buf["opened_at_token"]
+    # Properties, not boundaries: `note_tokens` runs on the engine side and
+    # `note_buffering_open` on the `_sse` side, so under load the engine can
+    # push more deltas before the marker is handled. The exact token
+    # semantics are pinned deterministically in tests/test_wire_meter.py.
+    assert buf is not None
+    assert 1 <= buf["opened_at_token"] < 10
+    assert buf["tokens_buffered"] > 0
+    assert wire["tokens_held_at_max_silence"] > 0
     assert buf["bytes_buffered"] > 0
 
 
