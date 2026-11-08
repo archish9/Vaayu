@@ -175,3 +175,54 @@ def test_the_wire_block_has_every_key_the_row_promises():
         "first_chunk_s", "last_chunk_s", "max_silence_s", "max_silence_at_s",
         "heartbeats_sent", "engine_started_s", "tokens_held_at_max_silence",
         "buffering"}
+
+
+def _ticks(*readings):
+    return _Clock(*readings)
+
+
+def test_tokens_held_is_measured_when_the_span_opens_not_when_it_closes():
+    # Readings: __init__, note_chunk, row().
+    m = WireMeter("chatcmpl-x", clock=_ticks(0.0, 1.0, 100.0))
+    m.note_tokens(9)
+    m.note_buffering_open()
+    m.note_chunk(40)                       # closes the 1 s startup span (9 tokens)
+    m.note_tokens(629)                     # the body generates while the wire is quiet
+    r = m.row()                            # the open 99 s span wins
+    assert r["max_silence_s"] == 99.0
+    assert r["buffering"]["opened_at_token"] == 9
+    assert r["tokens_held_at_max_silence"] == 620      # 629 - 9, held, not produced
+    assert r["buffering"]["tokens_buffered"] == 620
+
+
+def test_the_tokens_belong_to_the_winning_span_not_the_latest_one():
+    # Span 1 (t 0->50) holds 30 tokens and wins; span 2 (50->51) holds 5.
+    m = WireMeter("chatcmpl-x", clock=_ticks(0.0, 50.0, 51.0, 51.5))
+    m.note_tokens(30)
+    m.note_chunk(1)
+    m.note_tokens(35)
+    m.note_chunk(1)
+    m.note_tokens(36)
+    assert m.row()["tokens_held_at_max_silence"] == 30
+
+
+def test_tokens_held_is_zero_when_the_quiet_was_not_a_tool_call():
+    # The longest span (0->10) had no tokens in it; the 5 arrived after.
+    m = WireMeter("chatcmpl-x", clock=_ticks(0.0, 10.0, 11.0))
+    m.note_chunk(40)
+    m.note_tokens(5)
+    r = m.row()
+    assert r["max_silence_s"] == 10.0
+    assert r["tokens_held_at_max_silence"] == 0 and r["buffering"] is None
+
+
+def test_buffered_bytes_accumulate_and_a_chunkless_wire_holds_nothing():
+    m = WireMeter("chatcmpl-x")
+    m.note_tokens(3)
+    m.note_buffering_open()
+    m.note_buffered_bytes(10)
+    m.note_buffered_bytes(5)
+    r = m.row()
+    assert r["buffering"] == {"opened_at_token": 3, "tokens_buffered": 0,
+                              "bytes_buffered": 15}
+    assert r["tokens_held_at_max_silence"] is None

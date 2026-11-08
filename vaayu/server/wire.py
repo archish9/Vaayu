@@ -99,6 +99,12 @@ class WireMeter:
         self._max_silence = None
         self._max_silence_at = None
         self._tokens = 0
+        # The running token total when the OPEN span started, and the
+        # (opened, closed) totals of the longest span so far: the tokens that
+        # accumulated while the wire was quiet are closed - opened, which is
+        # not the total produced and not the total at row time.
+        self._silence_from_tokens = 0
+        self._max_silence_tokens = None
         self._buffering_opened_at_token = None
         self._buffered_bytes = 0
 
@@ -155,7 +161,9 @@ class WireMeter:
         if self._max_silence is None or span > self._max_silence:
             self._max_silence = span
             self._max_silence_at = self._silence_from - self._t0
+            self._max_silence_tokens = (self._silence_from_tokens, self._tokens)
         self._silence_from = now
+        self._silence_from_tokens = self._tokens
 
     def note_engine_started(self) -> None:
         """The engine took its own `started` just now.
@@ -211,6 +219,7 @@ class WireMeter:
         if not self._recorded:
             return None
         max_silence, max_silence_at = self._max_silence, self._max_silence_at
+        silence_tokens = self._max_silence_tokens
         if self._chunks:
             # Close the span that is still OPEN. The row is written from the
             # engine's `finally`, so run E's own row was written while its
@@ -221,6 +230,8 @@ class WireMeter:
             if open_span > max_silence:
                 max_silence = open_span
                 max_silence_at = self._silence_from - self._t0
+                silence_tokens = (self._silence_from_tokens, self._tokens)
+        opened = self._buffering_opened_at_token
         return {
             # As of ROW time, not for the whole response: `_sse` emits the
             # terminating chunk and `data: [DONE]` after the engine's
@@ -245,10 +256,18 @@ class WireMeter:
             # read as a healthy wire on the rows most likely to be broken.
             "max_silence_s": max_silence,
             "max_silence_at_s": max_silence_at,
-            # Filled by the task that measures the tool-call buffer. Published
-            # as None from here so every row keeps the same keys.
-            "tokens_held_at_max_silence": None,
-            "buffering": None,
+            # Tokens generated while the longest quiet span was open (run E:
+            # 629 - 9 = 620). None when no chunk was ever written, like
+            # `max_silence_s`; 0 when that span was not a tool call.
+            "tokens_held_at_max_silence": (
+                None if silence_tokens is None
+                else silence_tokens[1] - silence_tokens[0]),
+            # None unless a tool-call open marker was seen.
+            "buffering": (None if opened is None else {
+                "opened_at_token": opened,
+                "tokens_buffered": self._tokens - opened,
+                "bytes_buffered": self._buffered_bytes,
+            }),
             # Seconds from request ARRIVAL to the engine's own `started`. The
             # offset that makes the wire's seconds comparable with the row's
             # `ttft_s` and `wall_s`, which start only once this request was

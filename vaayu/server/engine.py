@@ -830,6 +830,12 @@ class EngineHandle:
                         row["ttft_s"] = time.time() - started
                         self._log(req, "TTFT", meter=meter,
                                   at=f"{row['ttft_s']:.1f}s")
+                    if meter is not None:
+                        # The real id count, not a delta count: one streamer
+                        # `put` can carry a whole accepted speculative run.
+                        # Only stream() may call this -- it marks the meter
+                        # as having a wire block.
+                        meter.note_tokens(len(new_ids))
                     yield ("delta", payload)
             except BaseException:                   # noqa: BLE001 -- re-raised
                 # The consumer went away -- Starlette closes this generator with

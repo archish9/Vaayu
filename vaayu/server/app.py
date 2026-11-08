@@ -1133,6 +1133,8 @@ async def _sse(engine, req, model_name, warning, cancel=None, session_id=None,
                 break
             if suppressing:
                 buffered += payload
+                if meter is not None:
+                    meter.note_buffered_bytes(len(payload))
                 # From the open marker to the final event nothing above is
                 # yielded, so a tool call whose body takes minutes to generate
                 # leaves the wire silent for minutes while decode is healthy --
@@ -1167,6 +1169,9 @@ async def _sse(engine, req, model_name, warning, cancel=None, session_id=None,
                     last_write = time.monotonic()
                     _wrote(ev)
                 held, buffered, suppressing = "", held[cut:], True
+                if meter is not None:
+                    meter.note_buffering_open()
+                    meter.note_buffered_bytes(len(buffered))
                 continue
             # Hold back a marker-length tail so an open marker split
             # across two chunks is still recognised.

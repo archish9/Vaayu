@@ -21,7 +21,17 @@ _PREPARE_ERRORS = (ContextTooLong, TemplateLacksToolSupport, NoChatTemplate)
 class FakeEngine:
     """Implements only what app.py touches."""
 
-    def __init__(self, result=None, raises=None, deltas=None, delta_delay=0.0):
+    def __init__(self, result=None, raises=None, deltas=None, delta_delay=0.0,
+                 tokens_per_delta=1, delta_gap=0.0):
+        # Seconds between deltas. 0 lets this fake run ahead of `_sse`, so the
+        # whole stream is produced before the first byte is parsed -- fine for
+        # byte accounting, wrong for anything that needs to know how many
+        # tokens existed WHEN the buffer opened.
+        self.delta_gap = delta_gap
+        # Token ids the model produced per delta, which the real engine reads
+        # off `len(new_ids)`. 1 models plain decode; more models a speculative
+        # run delivered as one delta.
+        self.tokens_per_delta = tokens_per_delta
         # Seconds to sleep before the FIRST delta -- models the prefill gap
         # (TTFT) during which _sse waits on an empty job.out and must emit
         # keepalive comments so a proxy/tunnel idle timer does not fire.
@@ -85,8 +95,15 @@ class FakeEngine:
                 raise self._raises
             if self.delta_delay:
                 await asyncio.sleep(self.delta_delay)
+            produced = 0
             for d in self._deltas:
+                produced += self.tokens_per_delta
+                if meter is not None:
+                    # As engine.stream does, before the delta is yielded.
+                    meter.note_tokens(produced)
                 yield ("delta", d)
+                if self.delta_gap:
+                    await asyncio.sleep(self.delta_gap)
             yield ("final", self._result)
         finally:
             # Where the REAL `EngineHandle.stream` writes its row: its own
@@ -517,6 +534,78 @@ def test_the_row_reports_the_wire_silence_of_a_long_buffered_tool_call(
     # Dated, so a reader can place the span against `first_chunk_s`.
     assert wire["max_silence_at_s"] is not None
     assert wire["last_chunk_s"] >= wire["first_chunk_s"]
+
+
+@pytest.mark.parametrize("fmt_key", sorted(_BUFFERING_FORMATS))
+def test_the_row_says_how_many_tokens_sat_in_the_buffer(monkeypatch, fmt_key):
+    """Run E's other half: not just that the wire went quiet, but that
+    620 tokens sat in the buffer while it did. 24 more deltas arrive inside
+    the buffer here, one token each, and no heartbeat breaks the span.
+
+    The engine is paced (`delta_gap`): an unpaced fake finishes before `_sse`
+    reads its first delta, so every token already exists when the buffer
+    opens and the held count is a vacuous 0."""
+    meters = _metered_clock(monkeypatch)
+    engine = _buffered_tool_call_engine(fmt_key, delta_gap=0.02)
+    engine._deltas = engine._deltas + ["tok"] * 24
+    with _live_client(engine=engine, sse_keepalive_s=100) as c:
+        r = c.post("/v1/chat/completions", json=_TOOL_BODY)
+    assert r.status_code == 200
+    wire = meters[-1].row()
+    total = len(engine._deltas)
+    buf = wire["buffering"]
+    assert wire["heartbeats_sent"] == 0
+    # The marker completes on this delta: hermes' is whole in the second;
+    # MiniMax's is split across the second and third.
+    assert buf["opened_at_token"] == {"hermes": 2, "minimax_xml": 3}[fmt_key]
+    # Everything generated after the marker opened was held, and the longest
+    # quiet span is that one, so the two views agree to the token.
+    assert buf["tokens_buffered"] == total - buf["opened_at_token"]
+    assert wire["tokens_held_at_max_silence"] == total - buf["opened_at_token"]
+    assert buf["bytes_buffered"] > 0
+
+
+def test_tokens_held_follows_the_token_ids_not_the_delta_count():
+    """Speculative / prompt-lookup decode (`use_prompt_lookup` defaults to
+    auto) delivers a whole accepted run as ONE delta, so counting deltas
+    under-reports. Through the REAL `EngineHandle.stream`: 3 deltas whose
+    `new_ids` advance 4 at a time must read 12 held, not 3."""
+    import asyncio
+    import itertools
+
+    import vaayu.streaming as streaming_mod
+    from vaayu.server.engine import EngineHandle
+    from vaayu.server.schemas import ChatCompletionRequest
+    from vaayu.server.wire import WireMeter
+    from .test_server_engine import FakeModel, _CountingTokenizer, _Config
+
+    model = FakeModel(max_seq_len=100)
+    model.tokenizer = _CountingTokenizer()
+    model.config = _Config(2)
+
+    def fake(m, input_ids, max_new_tokens=None, token_ids_out=None, **kw):
+        for i in range(3):
+            token_ids_out.extend([10 + 4 * i + j for j in range(4)])
+            yield "a b c d "
+
+    real = streaming_mod.stream_generate
+    streaming_mod.stream_generate = fake
+    try:
+        ticks = itertools.count()
+        meter = WireMeter("chatcmpl-x", clock=lambda: float(next(ticks)))
+        meter.note_chunk(10)    # the wire is quiet from here (tokens: 0)
+
+        async def run():
+            req = ChatCompletionRequest(
+                model="v", max_tokens=50,
+                messages=[{"role": "user", "content": "hi"}])
+            return [k async for k, _ in EngineHandle(model).stream(req, meter=meter)]
+
+        kinds = asyncio.run(run())
+    finally:
+        streaming_mod.stream_generate = real
+    assert kinds.count("delta") == 3
+    assert meter.row()["tokens_held_at_max_silence"] == 12
 
 
 @pytest.mark.parametrize("fmt_key", sorted(_BUFFERING_FORMATS))
