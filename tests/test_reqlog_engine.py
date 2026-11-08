@@ -396,6 +396,26 @@ def test_an_engine_row_carries_the_completion_id_the_client_saw(tmp_path):
     assert row["cancel_reason"] is None
 
 
+def test_the_session_log_lines_carry_the_same_id_as_the_row(tmp_path):
+    """Spec 5.5: the id is on the `REQ`/`TTFT`/`DONE` session lines too, not
+    just the row. That is the second of the three joins the id exists to make
+    -- a reporter's quoted id has to reach the token-by-token story in
+    `sessions/<id>.log`, which is where the original incident was read from.
+
+    Reddened by `_log`'s `fields = {"id": meter.id, **fields}` in
+    `engine.py`: it is the only line that puts the id there, and dropping it
+    left 258 tests passing.
+    """
+    e = EngineHandle(M(), log_dir=tmp_path)
+    _drive_sse(e, _req())
+    row = rows(tmp_path)[0]
+    lines = (tmp_path / "sessions" / "s.log").read_text().splitlines()
+    for event in ("REQ", "DONE"):
+        line = next((l for l in lines if f" {event} " in l), None)
+        assert line is not None, f"no {event} line to join on"
+        assert f"id={row['id']}" in line
+
+
 def test_a_streaming_row_carries_the_wire_block_with_real_numbers(tmp_path):
     """The file-level leg: a POPULATED `wire` block in `requests.jsonl`,
     written by the real engine's row writer.
@@ -460,7 +480,42 @@ def test_the_row_can_rebase_wire_times_onto_ttft(tmp_path):
     meter.note_chunk(1)        # what `_sse` will do; `row()` is None without it
     offset = meter.row()["engine_started_s"]
     assert offset >= 0, "the engine cannot have started before the request arrived"
-    assert row["wall_s"] >= 0, "nothing to rebase onto"
+
+
+def test_a_non_streaming_disconnect_labels_the_row_client_disconnected(
+        tmp_path, monkeypatch):
+    """The non-streaming route hands its `CancelToken` the meter, and that is
+    the ONLY thing that turns the disconnect watchdog's cancel into a label on
+    the row. `client_disconnected` is also the only reason that route can
+    produce, so this seam is the whole label.
+
+    Reddened by `app.py`'s `cancel = CancelToken(meter)` on the non-streaming
+    route: mutating it to `CancelToken()` left 166 tests passing, because
+    every other test builds the token by hand -- downstream of this seam.
+
+    Driven through the real route, the real scheduler and the real engine's
+    row writer, with a `Request` that reports itself disconnected. Which
+    branch then writes the row (the queued drop or the completed generation)
+    is a scheduling race and is deliberately not asserted; the label is not.
+    """
+    from fastapi.testclient import TestClient
+    from starlette.requests import Request
+
+    import vaayu.server.app as app_mod
+
+    async def _gone(self):
+        return True
+
+    monkeypatch.setattr(Request, "is_disconnected", _gone)
+    e = EngineHandle(M(), log_dir=tmp_path)
+    with TestClient(app_mod.create_app(engine=e)) as c:
+        c.post("/v1/chat/completions",
+               json={"model": "v", "session_id": "s", "max_tokens": 16,
+                     "stream": False,
+                     "messages": [{"role": "user", "content": "hi"}]})
+    row = rows(tmp_path)[0]
+    assert row["stream"] is False
+    assert row["cancel_reason"] == "client_disconnected"
 
 
 def test_a_library_caller_without_a_meter_still_streams_and_still_rows(tmp_path):

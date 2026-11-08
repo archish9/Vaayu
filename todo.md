@@ -173,8 +173,11 @@ access line is ever written for it to find. The test's docstring says so.
 **Three options; the user picks, because access logs are genuinely useful** (they are how "did the request even
 arrive" gets answered, and they are the only record of a request that never reached a route):
 1. `access_log=False` in `__main__.py` — one line, loses the arrival record entirely.
-2. Keep the access log and scrub the address — a uvicorn logging filter or formatter that replaces `client_addr`
-   with the derived `client.forwarded`-style shape Vaayu already records. More code, keeps the signal.
+2. **RECOMMENDED (by the 2026-11-09 whole-branch review; the decision is still the USER's).** Keep the access
+   log and scrub the address — a uvicorn logging filter or formatter that replaces `client_addr` with the
+   derived `client.forwarded`-style shape Vaayu already records. More code, keeps the signal. It is the only
+   option of the three that loses NOTHING: option 1 discards the only record of a request that never reached a
+   route (the "did it even arrive" question), and option 3 leaves the address in every folder already mailed.
 3. Accept it, and document "strip `INFO:` access lines before sending" — which
    `documentation/server.md` § Logs now says under `client` as the interim answer.
 
@@ -363,7 +366,7 @@ cgroup OOM, peak 12.7 G vs `MemoryMax=28G`.
   "serve a smaller model" — 16 GB VRAM + 32 GB RAM must be used to the max and MiniMax-M2.7 is a deliberate stress
   target.
 
-## [x] RUN-E-STALL — "stream starts, 10 chunks, then 300 s of silence" — ROOT-CAUSED + FIXED 2026-11-08 (1 OPEN telemetry item)
+## [x] RUN-E-STALL — "stream starts, 10 chunks, then 300 s of silence" — ROOT-CAUSED + FIXED 2026-11-08; its telemetry item CLOSED 2026-11-09 (nothing open in this row)
 
 **Verdict:** the report's PRIMARY surface (`VAAYU-RUN-E-REPORT.md` §2.1) is a **Vaayu bug in `_sse`, now fixed**:
 a buffered tool call makes the WIRE silent for the whole call body while the engine runs normally, and
@@ -464,6 +467,9 @@ every 15 s between the prose and the `tool_calls` chunk.
     with `CAPTURE_STDIO` on and scans every file in the run dir for 4 canaries (prompt, completion, a private
     user-agent tail, an `x-forwarded-for` address). Green first run; 5 mutants each redden exactly one
     assertion (the completion one is caught via `server.log`, which is why it runs in a subprocess).
+    **G7 is MITIGATED, not MET, while `LOG-FOLDER-PEER-IP` (above) is open:** the spec's §4 anti-goal list names
+    "an IP … in the folder" explicitly, and uvicorn's access log still writes the peer address into
+    `server.log`. This closed row must not be read as G7 closed.
   - **§8: SHIPPED, not banked. No knob** — nothing added to `config.py`; the only setting read is the existing
     `SSE_KEEPALIVE_S`, which the warning threshold derives from. Plumbed route → `Job` → scheduler →
     `engine.stream`/`generate` → both row writers (`_refusal_row` too), reachable on every request at the N=1

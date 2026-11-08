@@ -626,15 +626,23 @@ class EngineHandle:
             # Always publish a REAL token, for the same reason stream() does
             # (B9): `cancel_all()` reads it to answer "is anything generating?",
             # and the teardown below has to have something to cancel before it
-            # waits for the worker (B16).
-            cancel = CancelToken()
+            # waits for the worker (B16). With the meter, so a library caller
+            # that passed one but no token still gets the `shutdown` label.
+            cancel = CancelToken(meter)
         started, hits_before = time.time(), self._prefix_hits()
         if meter is not None:
             # `ttft_s` and `wall_s` below are measured from `started`, which
             # is AFTER admission; the meter's own seconds are measured from
             # request arrival. This records the offset between the two, so a
             # reader comparing them on one row is not wrong by the queue wait.
-            meter.note_engine_started()
+            #
+            # Guarded, like every other write to the meter: this runs BEFORE
+            # the `try` whose `finally` writes the row, so a raise here would
+            # cost the request AND the row that would explain it.
+            try:
+                meter.note_engine_started()
+            except Exception:                   # noqa: BLE001 -- logging only
+                pass
         matched_before = self._prefix_matched()
         snap_before = reqlog.snapshot(self.model)
         row = {"tokens": 0, "finish": "error", "error": None}
@@ -763,15 +771,21 @@ class EngineHandle:
             # "is anything generating?", so a None there tells the SIGTERM
             # handler and `_teardown` the engine is idle while the GPU is busy
             # -- and the teardown below would then have nothing to cancel
-            # before it waits for the worker (B9).
-            cancel = CancelToken()
+            # before it waits for the worker (B9). With the meter, so a library
+            # caller that passed one but no token still gets `shutdown`.
+            cancel = CancelToken(meter)
 
         started, hits_before = time.time(), self._prefix_hits()
         if meter is not None:
             # Same offset generate() records, and for the same reason: the
             # wire's clock starts at request arrival, `ttft_s`/`wall_s` here
             # start once this request was admitted.
-            meter.note_engine_started()
+            # Guarded for the same reason generate()'s is: this is outside the
+            # `try` whose `finally` writes the row.
+            try:
+                meter.note_engine_started()
+            except Exception:                   # noqa: BLE001 -- logging only
+                pass
         matched_before = self._prefix_matched()
         snap_before = reqlog.snapshot(self.model)
         row = {"tokens": 0, "finish": "error", "error": None, "ttft_s": None}
@@ -845,7 +859,16 @@ class EngineHandle:
                         # `put` can carry a whole accepted speculative run.
                         # Only stream() may call this -- it marks the meter
                         # as having a wire block.
-                        meter.note_tokens(len(new_ids))
+                        #
+                        # Guarded: this sits inside the consumer loop's
+                        # `except BaseException`, which would file a raise here
+                        # as the REQUEST's error. `except Exception`, never
+                        # BaseException: the GeneratorExit/CancelledError that
+                        # ends an abandoned stream must still propagate.
+                        try:
+                            meter.note_tokens(len(new_ids))
+                        except Exception:       # noqa: BLE001 -- logging only
+                            pass
                     yield ("delta", payload)
             except BaseException:                   # noqa: BLE001 -- re-raised
                 # The consumer went away -- Starlette closes this generator with

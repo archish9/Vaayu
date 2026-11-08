@@ -259,7 +259,10 @@ Every row also carries `batch`: `null` for a request run on its own, or
 ran it together with `n - 1` other requests as one batch.
 
 **`id`** is the `chatcmpl-...` string the client was given — on the row, and on
-every one of this request's `sessions/<id>.log` lines. Rows otherwise key on
+this request's `REQ`/`TTFT`/`DONE` lines in `sessions/<id>.log`. That file also
+receives the stdout pump's lines (the `total=… io_wait=…` token summaries the
+incident below was diagnosed from), which carry no `id=` and join on
+`session=` plus the stamp as they always have. Rows otherwise key on
 `session` plus a second-resolution `ts`, which under fan-out joins concurrent
 requests to each other; `id` is what a reporter quoting their own client's id
 joins to. It is `null` only for a library caller, which has no route to mint
@@ -277,6 +280,14 @@ had received nothing.
 or a refusal answered before the SSE frame was entered. A zero-filled block
 would instead claim "the socket sent nothing", which is a different statement
 about a request that did have a frame.
+
+One streaming case lands there too, and the row says `stream: true`: a client
+that vanished while the frame was suspended on its **first** `yield`. The
+queue-position comment did go out, but the recording call after that `yield`
+never ran, so nothing was recorded. That row reads `{"stream": true, "finish":
+"cancelled", "cancel_reason": "abandoned_queued", "wire": null}` — read it as
+"the client was gone before the first byte was accounted for", not as "no
+stream at all".
 
 | key | what it is |
 |---|---|
@@ -407,16 +418,25 @@ knob for it today; if you are sending a folder to someone else and the address
 matters to you, strip uvicorn's `INFO:` access lines from `server.log` first.
 
 **A live warning in `server.log`, once per request.** While a stream is open the
-server also checks the span that is quiet *now*, and prints:
+server also checks the span that is quiet *now*, and prints a **pair** of lines:
 
 ```
-[Vaayu-Server] WARNING: the stream chatcmpl-… has sent no data chunk for 47 s
-with 0 tokens generated and held meanwhile (threshold 45 s). …
+[Vaayu-Server] WARNING: a stream has sent no data chunk for longer than the 45 s
+threshold, max(3 × SSE_KEEPALIVE_S, 45 s). … Printed once per request; the line
+below names the request and its numbers.
+[Vaayu-Server] quiet stream chatcmpl-…: no data chunk for 47 s with 0 tokens
+generated and held meanwhile (threshold 45 s).
 ```
 
 The threshold is `max(3 × SSE_KEEPALIVE_S, 45 s)` — derived, with no knob of its
-own — and the line is harvested into `env.json`'s `warnings` array, so it reaches
-you even from a pasted tail. It is **best-effort, not a watchdog**: it is
+own. Only the **first** line is harvested into `env.json`'s `warnings` array, so
+it reaches you even from a pasted tail, and because that line is the same text
+every time it collapses to **one** entry however many requests stall. That is
+why it carries no id and no seconds: that buffer dedupes on the exact message
+and holds 200 entries, so a per-request warning would crowd out every other
+warning for the rest of the run. The second line is where the id and the numbers
+are, in `server.log`; the row carries them too, as `max_silence_s` and
+`tokens_held_at_max_silence`. It is **best-effort, not a watchdog**: it is
 evaluated only where the SSE frame happens to wake, which leaves two windows it
 can really fire in:
 
@@ -440,9 +460,11 @@ added to `vaayu/server/config.py` for them, and the only setting they read is
 
 **Under a batch (`batch.n` > 1) `wire` is partial**, in the same way `decode` is.
 The row still carries `id`, `client` and the socket's own chunk and byte counts,
-but the batched path does not feed it the per-stream token total: `engine_started_s`
-reads `null`, and `tokens_held_at_max_silence` and `buffering.tokens_buffered`
-read `0` even on a stream that held tokens back. N>1 accuracy was a stated
+but the batched path does not feed it the per-stream token total: `engine_started_s`,
+`tokens_held_at_max_silence` and `buffering.tokens_buffered` all read `null`,
+including on a stream that held tokens back. They used to read `0` there, which
+claimed "the wire was quiet and nothing was generated" — the one false-healthy
+reading those two fields exist to prevent. N>1 accuracy was a stated
 non-goal for these fields, and the server runs one request at a time by default
 (`MAX_BATCH_SIZE = 1`), so this only appears once batching is turned on.
 

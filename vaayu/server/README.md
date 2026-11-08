@@ -208,9 +208,11 @@ Streaming requests add a `TTFT at=…` line between the two. `prefix_hit` is the
 watch across turns of the same session: `False` on turn 2 means the prefix cache is not
 being reused and TTFT is paying full prefill.
 
-`id=` is the `chatcmpl-…` the client was given, and it is on every line of this request's
-session log and on its `requests.jsonl` row — which is what lets a reporter quoting their
-own client's id join to the right request. These stamps are UTC to the millisecond; before
+`id=` is the `chatcmpl-…` the client was given, and it is on this request's `REQ`/`TTFT`/
+`DONE` lines above and on its `requests.jsonl` row — which is what lets a reporter quoting
+their own client's id join to the right request. The same file also carries the stdout
+pump's lines (the `total=… io_wait=…` token summaries), which have no `id=` and join on
+`session=` plus the stamp as before. These stamps are UTC to the millisecond; before
 2026-11-08 these particular lines were written in local time with no `Z`, so an older run
 directory mixes two clocks (`env.json` carries `host.tz`/`host.tz_offset_s` to rebase it).
 

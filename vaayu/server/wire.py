@@ -50,7 +50,8 @@ class WireMeter:
     The `note_*` methods record what the socket did; the fields they feed are
     published by `row()` as the measurements that need them land.
     `tokens_held_at_max_silence` and `buffering` are None until a chunk or a
-    tool-call open marker is seen -- every row keeps the same keys.
+    tool-call open marker is seen, and the two TOKEN counts stay None until
+    the engine has fed `note_tokens` at all -- every row keeps the same keys.
     """
 
     def __init__(self, request_id: str, *, client: dict | None = None,
@@ -104,6 +105,15 @@ class WireMeter:
         self._max_silence = None
         self._max_silence_at = None
         self._tokens = 0
+        # Has the ENGINE ever handed this meter a token total? `_tokens` is a
+        # counter starting at 0, so without this flag a meter nobody fed is
+        # indistinguishable from one told "zero tokens so far" -- and the
+        # batched path (`run_batch`) never calls `note_tokens` at all, so a
+        # batched stream that held a whole tool call back published
+        # `tokens_held_at_max_silence: 0` and `tokens_buffered: 0`: "the wire
+        # was quiet and nothing was generated", the exact false-healthy
+        # reading those two fields exist to prevent. Zero is not null.
+        self._tokens_seen = False
         # The running token total when the OPEN span started, and the
         # (opened, closed) totals of the longest span so far: the tokens that
         # accumulated while the wire was quiet are closed - opened, which is
@@ -187,6 +197,7 @@ class WireMeter:
         The engine's loop, which has the ids, is what knows the count.
         """
         self._tokens = total
+        self._tokens_seen = True
         self._recorded = True
 
     def note_buffering_open(self) -> None:
@@ -284,14 +295,21 @@ class WireMeter:
             "max_silence_at_s": max_silence_at,
             # Tokens generated while the longest quiet span was open (run E:
             # 629 - 9 = 620). None when no chunk was ever written, like
-            # `max_silence_s`; 0 when that span was not a tool call.
+            # `max_silence_s`, AND None when nothing ever fed the token meter
+            # (`_tokens_seen`): subtracting two unfed counters gives `0`,
+            # which reads as a healthy wire. 0 only when the span was measured
+            # and was not a tool call.
             "tokens_held_at_max_silence": (
-                None if silence_tokens is None
+                None if silence_tokens is None or not self._tokens_seen
                 else silence_tokens[1] - silence_tokens[0]),
-            # None unless a tool-call open marker was seen.
+            # None unless a tool-call open marker was seen. `tokens_buffered`
+            # is None on the same condition as the field above, and for the
+            # same reason; `opened_at_token` then reads 0 as part of that one
+            # "token counts unknown on this row" statement.
             "buffering": (None if opened is None else {
                 "opened_at_token": opened,
-                "tokens_buffered": self._tokens - opened,
+                "tokens_buffered": (None if not self._tokens_seen
+                                    else self._tokens - opened),
                 "bytes_buffered": self._buffered_bytes,
             }),
             # Seconds from request ARRIVAL to the engine's own `started`. The

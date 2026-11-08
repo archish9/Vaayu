@@ -610,7 +610,6 @@ def test_tokens_held_follows_the_token_ids_not_the_delta_count():
     auto) delivers a whole accepted run as ONE delta, so counting deltas
     under-reports. Through the REAL `EngineHandle.stream`: 3 deltas whose
     `new_ids` advance 4 at a time must read 12 held, not 3."""
-    import asyncio
     import itertools
 
     import vaayu.streaming as streaming_mod
@@ -1160,7 +1159,11 @@ def test_engine_handle_forwards_decode_top_k_status():
 
 # ── the live warning: a long silence is visible while it is happening ───────
 
-_SILENT = "WARNING: the stream "
+# The HARVESTED headline: request-independent on purpose, so `note_if_warning`
+# collapses it to one `env.json` entry however many requests stall. The
+# per-request numbers are on the second line, which carries no "warning".
+_SILENT = "WARNING: a stream has sent no data chunk"
+_SILENT_DETAIL = "[Vaayu-Server] quiet stream "
 
 
 @pytest.mark.parametrize("fmt_key", sorted(_BUFFERING_FORMATS))
@@ -1179,8 +1182,46 @@ def test_a_long_silence_warns_once_and_only_once(monkeypatch, capsys, fmt_key):
     assert out.count(_SILENT) == 1
     line = next(l for l in out.splitlines() if _SILENT in l)
     assert line.startswith("[Vaayu-Server] WARNING:")   # what note_if_warning keys on
-    assert "no data chunk for" in line and " s with " in line
-    assert "tokens generated and held" in line
+    # The numbers live on the companion line, which must stay unharvestable.
+    detail = next(l for l in out.splitlines() if _SILENT_DETAIL in l)
+    assert out.count(_SILENT_DETAIL) == 1
+    assert "no data chunk for" in detail and " s with " in detail
+    assert "tokens generated and held" in detail
+    assert "chatcmpl-" in detail
+    assert "warning" not in detail.lower()
+
+
+def test_the_silence_warning_collapses_to_one_env_json_entry(monkeypatch, capsys):
+    """`note_if_warning` dedupes on the EXACT message and drops the NEWEST
+    past `_WARNING_LIMIT` (200). A headline carrying the request id and the
+    elapsed seconds can never dedupe, so ~200 stalled requests would fill
+    `env.json`'s buffer and no further warning of ANY kind would be recorded
+    for the rest of the run -- every other warning in this codebase collapses
+    to one entry.
+
+    Reddened by either half of the split in `_sse`'s `_warn_if_silent`: put
+    the id or the seconds back on the headline and the two requests below
+    leave two entries; let the word "warning" into the detail line and it is
+    harvested per request too.
+    """
+    from vaayu.server import logs
+
+    _metered_clock(monkeypatch, step=30.0)
+    for _ in range(2):
+        with _live_client(engine=_buffered_tool_call_engine("hermes"),
+                          sse_keepalive_s=0) as c:
+            assert c.post("/v1/chat/completions", json=_TOOL_BODY).status_code == 200
+    lines = capsys.readouterr().out.splitlines()
+    headlines = [l for l in lines if _SILENT in l]
+    details = [l for l in lines if _SILENT_DETAIL in l]
+    assert len(headlines) == 2 and len(details) == 2    # one pair per request
+    assert len(set(headlines)) == 1, "the harvested text varies per request"
+    assert len(set(details)) == 2, "the detail must still name each request"
+    # Through the real harvester, as the pump feeds it: `<stamp> session=<id> `.
+    monkeypatch.setattr(logs, "_warnings", [])
+    for line in headlines + details:
+        logs.note_if_warning(f"2026-11-09T00:00:00.000Z session=s {line}\n")
+    assert logs.collected_warnings() == [headlines[0]]
 
 
 @pytest.mark.parametrize("fmt_key", sorted(_BUFFERING_FORMATS))

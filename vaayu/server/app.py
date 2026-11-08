@@ -1025,7 +1025,8 @@ async def _sse(engine, req, model_name, warning, cancel=None, session_id=None,
     # The live warning: ONE per request, not per span -- a per-span line would
     # become the flood it reports (`logs.session_event` warns once per process
     # for the same reason). A print, so the stdout pump timestamps it, keeps it
-    # in server.log and `note_if_warning` harvests it into env.json. The floor
+    # in server.log and `note_if_warning` harvests its headline into env.json
+    # (see the two prints below for why only the headline). The floor
     # on the threshold exists because `keepalive_s == 0` means "off", and
     # `3 * 0` would warn on every span.
     #
@@ -1055,12 +1056,29 @@ async def _sse(engine, req, model_name, warning, cancel=None, session_id=None,
             quiet_s, held = meter.open_silence()
             if quiet_s >= silence_warn_s:
                 silence_warned = True
-                print(f"[Vaayu-Server] WARNING: the stream {meter.id} has sent "
-                      f"no data chunk for {quiet_s:.0f} s with {held} tokens "
-                      f"generated and held meanwhile (threshold "
-                      f"{silence_warn_s:.0f} s). Decode may be healthy; a "
-                      f"client with a chunk timeout shorter than this will "
-                      f"give up. This warning prints once per request.")
+                # TWO lines, and the split is not cosmetic. `logs.note_if_warning`
+                # harvests every line containing "warning" into `env.json`,
+                # dedupes on the EXACT message and drops the NEWEST past
+                # `_WARNING_LIMIT` (200). A headline carrying `meter.id` and
+                # the elapsed seconds can never dedupe, so ~200 stalled
+                # requests would fill that buffer and no further warning of
+                # any kind -- APST, foreign-GPU, anything -- would be recorded
+                # for the rest of the run. So the harvested headline is
+                # request-INDEPENDENT (one entry however many requests stall),
+                # and the per-request numbers go on a second line that must
+                # NOT contain the word "warning", or it is harvested too. The
+                # id and the numbers are not lost: this line is stamped into
+                # `server.log` by the stdout pump, and the row carries
+                # `max_silence_s` and `tokens_held_at_max_silence`.
+                print(f"[Vaayu-Server] WARNING: a stream has sent no data "
+                      f"chunk for longer than the {silence_warn_s:.0f} s "
+                      f"threshold, max(3 x SSE_KEEPALIVE_S, 45 s). Decode may "
+                      f"be healthy; a client with a chunk timeout shorter "
+                      f"than this will give up. Printed once per request; the "
+                      f"line below names the request and its numbers.")
+                print(f"[Vaayu-Server] quiet stream {meter.id}: no data chunk "
+                      f"for {quiet_s:.0f} s with {held} tokens generated and "
+                      f"held meanwhile (threshold {silence_warn_s:.0f} s).")
         except Exception:                       # noqa: BLE001 -- logging only
             pass
 

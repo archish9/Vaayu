@@ -220,6 +220,29 @@ def test_tokens_held_is_zero_when_the_quiet_was_not_a_tool_call():
     assert r["tokens_held_at_max_silence"] == 0 and r["buffering"] is None
 
 
+def test_a_meter_the_engine_never_fed_reports_null_tokens_not_zero():
+    """Both token counts are subtractions of counters the ENGINE feeds, and
+    the batched path (`run_batch`) never calls `note_tokens` at all. `0` there
+    says "the wire was quiet and nothing was generated" -- which is the exact
+    false-healthy reading of the run-E class, where 620 tokens sat in the
+    buffer while the wire was silent. Zero is not null (spec 4).
+
+    Reddened by `row()`'s two `self._tokens_seen` guards in `wire.py`: drop
+    either and the matching field reads `0` on a request nothing measured.
+    """
+    m = WireMeter("chatcmpl-x", clock=_ticks(0.0, 1.0, 100.0))
+    m.note_buffering_open()         # a tool call opened: text stops going out
+    m.note_chunk(40)                # a chunk, so a silence span IS measured
+    m.note_buffered_bytes(900)
+    r = m.row()
+    # The silence itself is measured and must still be reported -- it is only
+    # the TOKEN counts this meter was never told.
+    assert r["max_silence_s"] == 99.0
+    assert r["tokens_held_at_max_silence"] is None
+    assert r["buffering"]["tokens_buffered"] is None
+    assert r["buffering"]["bytes_buffered"] == 900
+
+
 def test_buffered_bytes_accumulate_and_a_chunkless_wire_holds_nothing():
     m = WireMeter("chatcmpl-x")
     m.note_tokens(3)
