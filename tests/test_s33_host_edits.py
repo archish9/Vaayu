@@ -476,11 +476,11 @@ class _RouteEngine:
             raise self._raises
         return [1, 2, 3], 16
 
-    async def generate(self, req, cancel=None, prepared=None):
+    async def generate(self, req, cancel=None, prepared=None, meter=None):
         self.events.append("final")
         return self._result
 
-    async def stream(self, req, cancel=None, prepared=None):
+    async def stream(self, req, cancel=None, prepared=None, meter=None):
         yield ("delta", "hello")
         self.events.append("final")
         yield ("final", self._result)

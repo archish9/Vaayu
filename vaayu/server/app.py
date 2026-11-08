@@ -21,6 +21,7 @@ from .schemas import (ChatCompletionChunk, ChatCompletionRequest,
                       ChatCompletionResponse, Choice, ChunkChoice, Delta,
                       ResponseMessage, Usage, make_completion_id)
 from .stopping import ContextTooLong
+from .wire import WireMeter
 from ..utils import freeze_after_load
 
 
@@ -345,7 +346,7 @@ def _error(status: int, message: str, kind: str, headers=None):
 
 
 def _refusal_row(engine, req, exc_type, message, *, stream: bool,
-                 finish: str = "refused") -> None:
+                 finish: str = "refused", meter=None) -> None:
     """A row for a request that ended BEFORE generation.
 
     The engine writes rows from its own `finally`, but these never reach it:
@@ -375,6 +376,10 @@ def _refusal_row(engine, req, exc_type, message, *, stream: bool,
     disconnected before the stream finished". Pass `exc_type=None` with it --
     that doc says only `error`/`refused` rows carry an `error` object, and
     `EngineHandle.stream` already nulls the error on its own GeneratorExit.
+
+    `meter` is this request's `WireMeter` when the route had already minted
+    one -- which is every route-level refusal. It is what puts the id the
+    client was given on a row the engine never wrote.
     """
     try:
         from datetime import datetime, timezone
@@ -393,6 +398,10 @@ def _refusal_row(engine, req, exc_type, message, *, stream: bool,
         # only the engine row's shape.
         reqlog.write_row(getattr(engine, "log_dir", None), {
             "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            # The id the client was given, when the route had already minted
+            # one. Null for a caller with no meter -- the key is still here,
+            # per the same-keys-on-every-row rule below.
+            "id": meter.id if meter is not None else None,
             "session": getattr(req, "session_key", None),
             "batch": None,
             "prompt_tokens": None, "cap": None, "stream": stream,
@@ -404,6 +413,12 @@ def _refusal_row(engine, req, exc_type, message, *, stream: bool,
             "tokens": 0, "finish": finish,
             "decode_tok_s": None,
             "decode": None,
+            # `wire` is null unless an `_sse` frame recorded something the
+            # socket did -- a route-level refusal is answered before one
+            # exists, so there is no stream to report on.
+            "wire": meter.row() if meter is not None else None,
+            "cancel_reason": None,
+            "client": None,
             "error": (None if exc_type is None else
                       {"type": exc_type, "message": message, "traceback": None}),
         })
@@ -690,6 +705,14 @@ def create_app(config: ServerConfig | None = None, engine=None) -> FastAPI:
     @app.post("/v1/chat/completions")
     async def chat_completions(req: ChatCompletionRequest, request: Request):
         e = app.state.engine
+        # ONE id for this request, minted HERE rather than at the response:
+        # the row, this request's session-log lines and the `chatcmpl-...`
+        # the client logs must all be the same string, or a reporter quoting
+        # their client's id joins to nothing. This is the only frame that
+        # holds both the `Request` and that id, so the meter is built here and
+        # carried down -- it is also where the socket's own measurements will
+        # be recorded.
+        meter = WireMeter(make_completion_id())
         # Idempotent (BatchScheduler.start() no-ops once a dispatch task
         # exists): the lifespan already started it in real use. An engine
         # injected without ever running lifespan (TestClient used without
@@ -701,7 +724,7 @@ def create_app(config: ServerConfig | None = None, engine=None) -> FastAPI:
         if cfg is not None and cfg.require_session_id and not req.session_key:
             _refusal_row(e, req, "MissingSessionId",
                          "no session_id and REQUIRE_SESSION_ID is on",
-                         stream=resolve_stream(req, cfg))
+                         stream=resolve_stream(req, cfg), meter=meter)
             return _error(400,
                           "this request names no session. Send `session_id` (or "
                           "OpenAI's `user`, which is used as one). Without it the "
@@ -728,7 +751,7 @@ def create_app(config: ServerConfig | None = None, engine=None) -> FastAPI:
             if app.state.scheduler.depth >= e.queue_depth:
                 _refusal_row(e, req, "QueueFull",
                              f"{app.state.scheduler.depth} queued, depth "
-                             f"{e.queue_depth}", stream=True)
+                             f"{e.queue_depth}", stream=True, meter=meter)
                 return _error(503, f"{app.state.scheduler.depth} requests are "
                                    f"already queued (depth {e.queue_depth}). "
                                    f"This engine runs one request at a time.",
@@ -742,7 +765,8 @@ def create_app(config: ServerConfig | None = None, engine=None) -> FastAPI:
                 # result is handed to _sse so it is not built twice.
                 prepared = e.prepare(req)
             except (ContextTooLong, TemplateLacksToolSupport, NoChatTemplate) as ex:
-                _refusal_row(e, req, type(ex).__name__, str(ex), stream=True)
+                _refusal_row(e, req, type(ex).__name__, str(ex), stream=True,
+                             meter=meter)
                 return _error(400, str(ex), "invalid_request_error")
             except Exception as ex:                   # noqa: BLE001 -- re-raised
                 # prepare() raises more than those three. render_prompt runs the
@@ -759,13 +783,14 @@ def create_app(config: ServerConfig | None = None, engine=None) -> FastAPI:
                 # the default for exactly that reason, and generate() files
                 # this same failure as "error" on the non-streaming path (V1).
                 _refusal_row(e, req, type(ex).__name__, str(ex), stream=True,
-                             finish="error")
+                             finish="error", meter=meter)
                 raise
             return StreamingResponse(
                 _sse(e, req, _served_name(app), warning, CancelToken(),
                      session_id=req.session_key, prepared=prepared,
                      scheduler=app.state.scheduler,
-                     keepalive_s=getattr(cfg, "sse_keepalive_s", 0.0)),
+                     keepalive_s=getattr(cfg, "sse_keepalive_s", 0.0),
+                     meter=meter),
                 media_type="text/event-stream",
                 headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no",
                          **_session_header(req)},
@@ -794,6 +819,9 @@ def create_app(config: ServerConfig | None = None, engine=None) -> FastAPI:
                       prompt_ids=prepared[0], cap=prepared[1], cancel=cancel)
             job.prepared = prepared
             job.stream = False
+            # How the id and the meter reach generate()'s row: the serial hop
+            # passes `req`, `cancel` and `prepared`, not the Job itself.
+            job.meter = meter
             await app.state.scheduler.submit(job)
             # Consume to completion: a second admission path could run a
             # generation concurrently with the dispatcher's, on an engine that
@@ -827,13 +855,14 @@ def create_app(config: ServerConfig | None = None, engine=None) -> FastAPI:
             # no dispatcher is live to drain it (stopped, or its task died) --
             # either way the honest answer is the same 503 e.slot() used to
             # give for a full queue.
-            _refusal_row(e, req, "QueueFull", str(ex), stream=False)
+            _refusal_row(e, req, "QueueFull", str(ex), stream=False, meter=meter)
             return _error(503, str(ex), "server_busy", headers={"Retry-After": "5"})
         except (ContextTooLong, TemplateLacksToolSupport, NoChatTemplate) as ex:
             # Only prepare() raises these, and prepare() runs before submit() --
             # so `submitted` is always False here. This row is the only one
             # this request will ever get.
-            _refusal_row(e, req, type(ex).__name__, str(ex), stream=False)
+            _refusal_row(e, req, type(ex).__name__, str(ex), stream=False,
+                         meter=meter)
             return _error(400, str(ex), "invalid_request_error")
         except Exception as ex:                       # noqa: BLE001
             # `engine_owns_the_row` tells the three remaining sources apart:
@@ -847,7 +876,7 @@ def create_app(config: ServerConfig | None = None, engine=None) -> FastAPI:
             # second one here would double-count.
             if not engine_owns_the_row:
                 _refusal_row(e, req, type(ex).__name__, str(ex), stream=False,
-                             finish="error")
+                             finish="error", meter=meter)
             return _error(500, f"{type(ex).__name__}: {ex}", "internal_error")
         except BaseException as ex:                   # noqa: BLE001 -- re-raised
             # `_sse` has had this clause all along; this route did not, so a
@@ -863,7 +892,8 @@ def create_app(config: ServerConfig | None = None, engine=None) -> FastAPI:
                                             asyncio.CancelledError))
                 _refusal_row(e, req, None if cancelled else type(ex).__name__,
                              None if cancelled else str(ex), stream=False,
-                             finish="cancelled" if cancelled else "error")
+                             finish="cancelled" if cancelled else "error",
+                             meter=meter)
             raise
         finally:
             watchdog.cancel()
@@ -877,7 +907,8 @@ def create_app(config: ServerConfig | None = None, engine=None) -> FastAPI:
             # token count for. Nothing else ever ran for this job -- no
             # generate() call, no row -- so it is this frame's to write, same
             # as the streaming route's `_sse` does for the identical drop.
-            _refusal_row(e, req, None, None, stream=False, finish="cancelled")
+            _refusal_row(e, req, None, None, stream=False, finish="cancelled",
+                         meter=meter)
             print("[Vaayu-Server] client disconnected before this request ran")
             return _error(499, "client closed the connection; generation was "
                                "stopped", "client_closed_request")
@@ -891,7 +922,9 @@ def create_app(config: ServerConfig | None = None, engine=None) -> FastAPI:
                                "stopped", "client_closed_request")
 
         body = ChatCompletionResponse(
-            id=make_completion_id(), created=int(time.time()),
+            # The id the row and the session log already carry -- minting a
+            # second one here is what made the client's id join nothing.
+            id=meter.id, created=int(time.time()),
             model=_served_name(app),
             choices=[Choice(
                 index=0,
@@ -929,11 +962,16 @@ def _error_event(ex, kind: str = "internal_error") -> str:
 
 
 async def _sse(engine, req, model_name, warning, cancel=None, session_id=None,
-               prepared=None, scheduler=None, keepalive_s=0.0):
+               prepared=None, scheduler=None, keepalive_s=0.0, meter=None):
     """OpenAI-shaped SSE. Content streams; a tool call is BUFFERED and emitted
     once, complete -- partial tool-call JSON breaks clients that parse each
     delta, and the gain from streaming it is nil."""
-    cid, created = make_completion_id(), int(time.time())
+    # The id the ROUTE minted, so this request's chunks, its row and its
+    # session-log lines all carry one string. A caller with no meter (another
+    # caller of `_sse`, this file's own tests) still gets an id, but nothing
+    # joins to it.
+    cid = meter.id if meter is not None else make_completion_id()
+    created = int(time.time())
     if cancel is None:
         cancel = CancelToken()
 
@@ -991,6 +1029,10 @@ async def _sse(engine, req, model_name, warning, cancel=None, session_id=None,
                   prompt_ids=prepared[0], cap=prepared[1], cancel=cancel)
         job.prepared = prepared
         job.stream = True
+        # Same hand-off as the non-streaming route's: the serial hop passes
+        # `req`, `cancel` and `prepared`, so the Job is how the meter reaches
+        # engine.stream() and the row it writes.
+        job.meter = meter
         await scheduler.submit(job)
         while True:
             if keepalive_s and keepalive_s > 0:
@@ -1138,7 +1180,7 @@ async def _sse(engine, req, model_name, warning, cancel=None, session_id=None,
         # row is unaffected by moving it into this branch.
         if owed is not None and not engine_owns_the_row:
             _refusal_row(engine, req, owed[0], owed[1], stream=True,
-                         finish=owed[2])
+                         finish=owed[2], meter=meter)
 
     if held and not suppressing:
         yield _chunk(cid, created, model_name, session_id=session_id, delta={"content": held})

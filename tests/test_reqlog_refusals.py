@@ -683,3 +683,19 @@ def test_a_cancelled_dispatch_error_still_writes_a_row_non_streaming(
     assert len(rs) == 1, "a cancelled dispatcher left no row"
     assert rs[0]["finish"] == "cancelled"
     assert rs[0]["error"] is None
+
+
+def test_a_route_level_refusal_row_still_carries_an_id(client_requiring_session,
+                                                      run_dir):
+    """The error body carries no id -- the OpenAI error shape has no room for
+    one -- but the internal join row <-> session lines <-> server.log is what
+    a mailed folder needs, and a present id costs nothing.
+
+    `wire` is null: this request is refused before `_sse` is ever entered, so
+    no socket frame existed for it.
+    """
+    r = client_requiring_session.post("/v1/chat/completions", json={
+        "model": "m", "messages": [{"role": "user", "content": "hi"}]})
+    assert r.status_code == 400
+    row = rows(run_dir)[-1]
+    assert row["id"].startswith("chatcmpl-") and row["wire"] is None

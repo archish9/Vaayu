@@ -71,13 +71,13 @@ class FakeEngine:
 
         return _Slot()
 
-    async def generate(self, req, cancel=None, prepared=None):
+    async def generate(self, req, cancel=None, prepared=None, meter=None):
         self.cancel = cancel
         if self._raises is not None and not isinstance(self._raises, QueueFull):
             raise self._raises
         return self._result
 
-    async def stream(self, req, cancel=None, prepared=None):
+    async def stream(self, req, cancel=None, prepared=None, meter=None):
         self.cancel = cancel
         if self._raises is not None and not isinstance(self._raises, QueueFull):
             raise self._raises

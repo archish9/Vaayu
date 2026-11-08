@@ -54,6 +54,11 @@ class Job:
         (N>=2) always uses `run_batch` regardless of it; a lone job honours it
         by calling `engine.generate()` (non-streaming, own speculative
         dispatch, `stream=false` in requests.jsonl) or `engine.stream()`.
+      * `meter`: this request's `WireMeter` (vaayu/server/wire.py), minted by
+        the route. The hops below pass `req`, `cancel` and `prepared` rather
+        than the Job, so this is how the id the client was given, and what
+        the socket did, reach the engine's row writer. None for a caller with
+        no socket.
     """
 
     def __init__(self, req, session_key, prompt_ids, cap, cancel):
@@ -69,6 +74,7 @@ class Job:
         # path with a fresh prepare() -- today's default behaviour.
         self.prepared = None
         self.stream = True
+        self.meter = None
 
 
 class BatchScheduler:
@@ -540,7 +546,8 @@ class BatchScheduler:
             base_exc = None
             try:
                 result = await self.engine.generate(job.req, cancel=job.cancel,
-                                                     prepared=job.prepared)
+                                                     prepared=job.prepared,
+                                                     meter=job.meter)
             except Exception as ex:              # noqa: BLE001 -- reported, not re-raised
                 await job.out.put(("error", ex))
             except BaseException as ex:          # noqa: BLE001 -- reported, then re-raised
@@ -553,7 +560,8 @@ class BatchScheduler:
             if base_exc is not None:
                 raise base_exc
             return
-        gen = self.engine.stream(job.req, cancel=job.cancel, prepared=job.prepared)
+        gen = self.engine.stream(job.req, cancel=job.cancel, prepared=job.prepared,
+                                 meter=job.meter)
         base_exc = None
         try:
             async for item in gen:

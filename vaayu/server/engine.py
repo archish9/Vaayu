@@ -368,17 +368,25 @@ class EngineHandle:
 
     # ── request mapping ──────────────────────────────────────────────────────
 
-    def _log(self, req, event, **fields) -> None:
-        if self.log_dir is not None:
-            session_event(self.log_dir, getattr(req, "session_key", None),
-                          event, **fields)
+    def _log(self, req, event, *, meter=None, **fields) -> None:
+        if self.log_dir is None:
+            return
+        if meter is not None:
+            # The id the client was given, first on every line of this
+            # request's session log: it is what joins these lines to the
+            # request's row and to the id the reporter's own client logged.
+            # A library caller has no meter, and the field is then absent
+            # rather than `id=None`.
+            fields = {"id": meter.id, **fields}
+        session_event(self.log_dir, getattr(req, "session_key", None),
+                      event, **fields)
 
     def _write_request_row(self, req, *, stream: bool, started: float,
                            prompt_tokens: int, cap: int, snap_before: dict,
                            tokens: int = 0, finish: str = "error",
                            ttft_s=None, hits_before: int = 0,
                            matched_before: int = 0, error=None,
-                           batch=None) -> None:
+                           batch=None, meter=None) -> None:
         """One `requests.jsonl` row. Called from a `finally`, so it runs on the
         success path, the raise path, and the client-disconnect path alike --
         which is the point: audit item 9 was that a failed request left a REQ
@@ -387,6 +395,12 @@ class EngineHandle:
         Never raises (reqlog.write_row swallows), and never computes anything
         it cannot: a request that produced no tokens gets None per-token means
         rather than a ZeroDivisionError on top of whatever already failed.
+
+        `meter` is this request's `WireMeter` (vaayu/server/wire.py) when it
+        came through the server, carrying the id the client was given and what
+        the socket did. None for a library caller, which has no socket -- the
+        keys are written either way, null where unknowable, so a script can
+        index any field on any row.
 
         The whole body is additionally wrapped in its own try/except: this
         runs from a `finally` on the generation path, and an exception raised
@@ -416,6 +430,7 @@ class EngineHandle:
                 decode = reqlog.decode_block(snap_before, snap_after, tokens)
             reqlog.write_row(self.log_dir, {
                 "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                "id": meter.id if meter is not None else None,
                 "session": getattr(req, "session_key", None),
                 "batch": batch,
                 "prompt_tokens": prompt_tokens,
@@ -436,6 +451,12 @@ class EngineHandle:
                 "decode_tok_s": ((tokens - 1) / wall
                                  if wall > 0 and tokens > 1 else None),
                 "decode": decode,
+                # What the SOCKET did, from the frame that owns the bytes.
+                # Null when there was no stream at all -- a non-streaming
+                # request, or any caller with no `_sse` frame in front of it.
+                "wire": meter.row() if meter is not None else None,
+                "cancel_reason": None,
+                "client": None,
                 "error": reqlog.error_block(error),
             })
         except Exception:                            # noqa: BLE001 -- never displaces
@@ -588,7 +609,8 @@ class EngineHandle:
             produced=len(new_ids), cap=cap,
             cancelled=cancel is not None and cancel.cancelled)
 
-    async def generate(self, req, cancel=None, prepared=None) -> GenerationResult:
+    async def generate(self, req, cancel=None, prepared=None,
+                       meter=None) -> GenerationResult:
         import time
         if cancel is None:
             # Always publish a REAL token, for the same reason stream() does
@@ -597,6 +619,12 @@ class EngineHandle:
             # waits for the worker (B16).
             cancel = CancelToken()
         started, hits_before = time.time(), self._prefix_hits()
+        if meter is not None:
+            # `ttft_s` and `wall_s` below are measured from `started`, which
+            # is AFTER admission; the meter's own seconds are measured from
+            # request arrival. This records the offset between the two, so a
+            # reader comparing them on one row is not wrong by the queue wait.
+            meter.note_engine_started()
         matched_before = self._prefix_matched()
         snap_before = reqlog.snapshot(self.model)
         row = {"tokens": 0, "finish": "error", "error": None}
@@ -615,7 +643,8 @@ class EngineHandle:
         prompt_ids, cap = [], 0
         try:
             prompt_ids, cap = prepared if prepared is not None else self.prepare(req)
-            self._log(req, "REQ", prompt=len(prompt_ids), cap=cap, stream=False,
+            self._log(req, "REQ", meter=meter,
+                      prompt=len(prompt_ids), cap=cap, stream=False,
                       thinking=("on" if self.resolve_thinking(req) else "off"))
             if req.max_tokens is None:
                 # Non-streaming sends NOTHING until the last token, so this
@@ -660,7 +689,8 @@ class EngineHandle:
                                       declared_tool_schemas(req.tools))
             finish = self._finish(new_ids, cap, calls, cancel=cancel)
             wall = time.time() - started
-            self._log(req, "DONE", tokens=len(new_ids), finish=finish,
+            self._log(req, "DONE", meter=meter,
+                      tokens=len(new_ids), finish=finish,
                       prefix_hit=self._prefix_hits() > hits_before,
                       wall=f"{wall:.1f}s",
                       decode=f"{(len(new_ids) - 1) / wall:.3f}tok/s" if wall > 0 and len(new_ids) > 1 else "n/a")
@@ -700,9 +730,10 @@ class EngineHandle:
                 req, stream=False, started=started,
                 prompt_tokens=len(prompt_ids), cap=cap, snap_before=snap_before,
                 tokens=row["tokens"], finish=row["finish"],
-                hits_before=hits_before, matched_before=matched_before, error=row["error"])
+                hits_before=hits_before, matched_before=matched_before,
+                error=row["error"], meter=meter)
 
-    async def stream(self, req, cancel=None, prepared=None):
+    async def stream(self, req, cancel=None, prepared=None, meter=None):
         """Async generator yielding ("delta", text) then ("final", GenerationResult).
 
         Bridges vaayu.streaming's worker thread onto the event loop through a
@@ -726,6 +757,11 @@ class EngineHandle:
             cancel = CancelToken()
 
         started, hits_before = time.time(), self._prefix_hits()
+        if meter is not None:
+            # Same offset generate() records, and for the same reason: the
+            # wire's clock starts at request arrival, `ttft_s`/`wall_s` here
+            # start once this request was admitted.
+            meter.note_engine_started()
         matched_before = self._prefix_matched()
         snap_before = reqlog.snapshot(self.model)
         row = {"tokens": 0, "finish": "error", "error": None, "ttft_s": None}
@@ -737,7 +773,8 @@ class EngineHandle:
         prompt_ids, cap = [], 0
         try:
             prompt_ids, cap = prepared if prepared is not None else self.prepare(req)
-            self._log(req, "REQ", prompt=len(prompt_ids), cap=cap, stream=True,
+            self._log(req, "REQ", meter=meter,
+                      prompt=len(prompt_ids), cap=cap, stream=True,
                       thinking=("on" if self.resolve_thinking(req) else "off"))
             ttft_logged = False
             kwargs = self.build_generate_kwargs(req, prompt_ids, cap, cancel=cancel)
@@ -791,7 +828,8 @@ class EngineHandle:
                     if not ttft_logged:
                         ttft_logged = True
                         row["ttft_s"] = time.time() - started
-                        self._log(req, "TTFT", at=f"{row['ttft_s']:.1f}s")
+                        self._log(req, "TTFT", meter=meter,
+                                  at=f"{row['ttft_s']:.1f}s")
                     yield ("delta", payload)
             except BaseException:                   # noqa: BLE001 -- re-raised
                 # The consumer went away -- Starlette closes this generator with
@@ -835,7 +873,8 @@ class EngineHandle:
             produced = len(new_ids)
             finish = self._finish(new_ids, cap, calls, cancel=cancel)
             wall = time.time() - started
-            self._log(req, "DONE", tokens=produced, finish=finish,
+            self._log(req, "DONE", meter=meter,
+                      tokens=produced, finish=finish,
                       prefix_hit=self._prefix_hits() > hits_before, wall=f"{wall:.1f}s",
                       decode=f"{(produced - 1) / wall:.3f}tok/s" if wall > 0 and produced > 1 else "n/a")
             row["tokens"], row["finish"] = produced, finish
@@ -895,7 +934,8 @@ class EngineHandle:
                 req, stream=True, started=started,
                 prompt_tokens=len(prompt_ids), cap=cap, snap_before=snap_before,
                 tokens=row["tokens"], finish=row["finish"], ttft_s=row["ttft_s"],
-                hits_before=hits_before, matched_before=matched_before, error=row["error"])
+                hits_before=hits_before, matched_before=matched_before,
+                error=row["error"], meter=meter)
 
     async def run_batch(self, jobs):
         """Drive ONE batched_generate over `jobs`, fanning tokens to each queue.
@@ -1154,7 +1194,11 @@ class EngineHandle:
                         snap_before=snap_before, tokens=row["tokens"],
                         finish=row["finish"], ttft_s=ttft[i],
                         hits_before=hits_before, matched_before=matched_before, error=row["error"],
-                        batch=batch_note)
+                        # `getattr`, like `members` above: this expression sits
+                        # OUTSIDE _write_request_row's own try, on the
+                        # generation path's exit, so it must not be the thing
+                        # that raises.
+                        batch=batch_note, meter=getattr(j, "meter", None))
             if pending_base_exc is not None:
                 # Every job has its item and its sentinel by now (the loop
                 # above ran to completion regardless of this exception) --

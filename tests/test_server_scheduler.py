@@ -72,7 +72,7 @@ def test_a_single_waiting_request_runs_serially(monkeypatch):
     engine = EngineHandle(model)
     served = []
 
-    async def fake_stream(req, cancel=None, prepared=None):
+    async def fake_stream(req, cancel=None, prepared=None, meter=None):
         served.append(req.session_key)
         yield ("delta", "hi")
 
@@ -104,7 +104,7 @@ def test_max_batch_size_one_never_batches(monkeypatch):
     model = RecordingModel()
     engine = EngineHandle(model)
 
-    async def fake_stream(req, cancel=None, prepared=None):
+    async def fake_stream(req, cancel=None, prepared=None, meter=None):
         yield ("delta", "x")
 
     monkeypatch.setattr(engine, "stream", fake_stream)
@@ -131,7 +131,7 @@ def test_a_non_sdpa_load_disables_batching(monkeypatch):
     model = RecordingModel(attn="flash_attention_2")
     engine = EngineHandle(model)
 
-    async def fake_stream(req, cancel=None, prepared=None):
+    async def fake_stream(req, cancel=None, prepared=None, meter=None):
         yield ("delta", "x")
 
     monkeypatch.setattr(engine, "stream", fake_stream)
@@ -209,7 +209,7 @@ def test_a_gate_two_refusal_falls_back_to_serial(monkeypatch):
     served = []
     markers = []
 
-    async def fake_stream(req, cancel=None, prepared=None):
+    async def fake_stream(req, cancel=None, prepared=None, meter=None):
         served.append(req.session_key)
         # B2 (final whole-branch review): the fallback loop narrows
         # `_current_sessions` from the whole batch to one member at a time.
@@ -254,7 +254,7 @@ def test_prepared_is_passed_through_on_the_streaming_path(monkeypatch):
     engine = EngineHandle(model)
     seen = []
 
-    async def fake_stream(req, cancel=None, prepared=None):
+    async def fake_stream(req, cancel=None, prepared=None, meter=None):
         seen.append(prepared)
         yield ("delta", "x")
 
@@ -282,12 +282,12 @@ def test_stream_false_routes_to_generate(monkeypatch):
     engine = EngineHandle(model)
     calls = []
 
-    async def fake_generate(req, cancel=None, prepared=None):
+    async def fake_generate(req, cancel=None, prepared=None, meter=None):
         calls.append(req.session_key)
         return GenerationResult(text="hi", prompt_tokens=1, completion_tokens=1,
                                 finish_reason="stop")
 
-    async def fake_stream(req, cancel=None, prepared=None):
+    async def fake_stream(req, cancel=None, prepared=None, meter=None):
         raise AssertionError("stream=False must not call stream()")
         yield  # pragma: no cover -- makes this a generator function
 
@@ -317,7 +317,7 @@ def test_depth_counts_the_running_batch(monkeypatch):
     engine = EngineHandle(model)
     resume = asyncio.Event()
 
-    async def fake_stream(req, cancel=None, prepared=None):
+    async def fake_stream(req, cancel=None, prepared=None, meter=None):
         yield ("delta", "x")
         await resume.wait()
 
@@ -414,7 +414,7 @@ def test_cancelling_the_dispatch_task_ends_it(monkeypatch):
     engine = EngineHandle(model)
     hang = asyncio.Event()
 
-    async def fake_stream(req, cancel=None, prepared=None):
+    async def fake_stream(req, cancel=None, prepared=None, meter=None):
         yield ("delta", "x")
         await hang.wait()
 
@@ -492,7 +492,7 @@ def test_a_job_still_queued_when_the_dispatcher_stops_still_gets_a_sentinel(monk
     model = RecordingModel()
     engine = EngineHandle(model)
 
-    async def fake_stream(req, cancel=None, prepared=None):
+    async def fake_stream(req, cancel=None, prepared=None, meter=None):
         yield ("delta", "x")
 
     monkeypatch.setattr(engine, "stream", fake_stream)
@@ -616,7 +616,7 @@ def test_stop_propagates_the_callers_own_cancellation(monkeypatch):
     engine = EngineHandle(model)
     blocked = asyncio.Event()
 
-    async def fake_stream(req, cancel=None, prepared=None):
+    async def fake_stream(req, cancel=None, prepared=None, meter=None):
         yield ("delta", "x")
         await blocked.wait()             # never set: the batch never finishes
 
@@ -716,7 +716,7 @@ def _interleaved_scheduler(monkeypatch, **kw):
     model = RecordingModel()
     engine = EngineHandle(model)
 
-    async def fake_stream(req, cancel=None, prepared=None):
+    async def fake_stream(req, cancel=None, prepared=None, meter=None):
         yield ("delta", "x")
 
     monkeypatch.setattr(engine, "stream", fake_stream)
@@ -795,7 +795,7 @@ def test_the_window_is_off_when_batching_is(monkeypatch):
     model = RecordingModel()
     engine = EngineHandle(model)
 
-    async def fake_stream(req, cancel=None, prepared=None):
+    async def fake_stream(req, cancel=None, prepared=None, meter=None):
         yield ("delta", "x")
 
     monkeypatch.setattr(engine, "stream", fake_stream)
@@ -864,7 +864,7 @@ def test_a_fallback_member_the_engine_never_ran_gets_a_dispatch_error(monkeypatc
     engine = EngineHandle(model)
     served = []
 
-    async def fake_stream(req, cancel=None, prepared=None):
+    async def fake_stream(req, cancel=None, prepared=None, meter=None):
         served.append(req.session_key)
         raise asyncio.CancelledError()
         yield  # pragma: no cover -- makes this an async generator function

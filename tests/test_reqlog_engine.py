@@ -12,7 +12,8 @@ import torch
 
 import vaayu.server.engine as engine_mod
 from vaayu.server.engine import EngineHandle
-from vaayu.server.schemas import ChatCompletionRequest
+from vaayu.server.schemas import ChatCompletionRequest, make_completion_id
+from vaayu.server.wire import WireMeter
 
 from .test_server_engine import FakeModel
 
@@ -347,3 +348,107 @@ def test_a_failed_request_still_records_what_it_matched(tmp_path):
         asyncio.run(e.generate(_req()))
     r = rows(tmp_path)[0]
     assert r["finish"] == "error" and r["prefix_match_tokens"] == 12
+
+
+# ── the one id that joins a row to the client's own log (G5) ─────────────────
+
+def _drive_sse(e, req):
+    """The SSE lines a client would get, with the meter the ROUTE mints.
+
+    The route is where the meter is created -- it is the one frame holding
+    both the `Request` and the completion id -- so a row carrying an `id`
+    exists only downstream of `_sse` plus the dispatcher. `e.stream()` on its
+    own is the library path, which has no meter by design (see the library
+    caller test below).
+    """
+    import vaayu.server.app as app_mod
+    from vaayu.server.scheduler import BatchScheduler
+
+    async def main():
+        sched = BatchScheduler(e, queue_depth=8, max_batch_size=1,
+                               prefill_chunk_size=512)
+        await sched.start()
+        try:
+            gen = app_mod._sse(e, req, "m", None, prepared=e.prepare(req),
+                               scheduler=sched,
+                               meter=WireMeter(make_completion_id()))
+            return [line async for line in gen]
+        finally:
+            await sched.stop()
+
+    return asyncio.run(main())
+
+
+def test_an_engine_row_carries_the_completion_id_the_client_saw(tmp_path):
+    """G5: the reporter quotes the id their client logged; the user finds the
+    row. Rows key on `session` plus a second-resolution `ts`, which joins a
+    fan-out workload's concurrent requests to each other."""
+    e = EngineHandle(M(), log_dir=tmp_path)
+    _drive_sse(e, _req())
+    row = rows(tmp_path)[0]
+    assert row["id"].startswith("chatcmpl-")
+    # Keys PRESENT, values deliberately not asserted here: the `wire` block is
+    # filled for exactly this (streaming) row by the task that measures the
+    # socket, so asserting null would make this test fail then. The null
+    # assertion belongs to the non-streaming row below.
+    assert {"wire", "cancel_reason", "client"} <= row.keys()
+    assert row["cancel_reason"] is None
+
+
+def test_the_streamed_id_matches_the_row_id(tmp_path):
+    """Minting before generation is the whole point: a second id would join
+    nothing."""
+    e = EngineHandle(M(), log_dir=tmp_path)
+    lines = _drive_sse(e, _req())
+    row = rows(tmp_path)[0]
+    chunk_ids = {json.loads(line[6:])["id"] for line in lines
+                 if line.startswith("data: {")}
+    assert chunk_ids == {row["id"]}
+
+
+def test_a_non_streaming_row_has_an_id_and_a_null_wire(tmp_path):
+    """`wire` is null where there was no stream at all. A zero-filled block
+    would read as "the socket sent nothing", which is a different claim from
+    "this request had no socket frame" -- and the engine start the meter
+    records on EVERY request must not be enough to invent one."""
+    e = EngineHandle(M(), log_dir=tmp_path)
+    asyncio.run(e.generate(_req(), meter=WireMeter(make_completion_id())))
+    row = rows(tmp_path)[0]
+    assert row["stream"] is False
+    assert row["id"].startswith("chatcmpl-") and row["wire"] is None
+
+
+def test_the_row_can_rebase_wire_times_onto_ttft(tmp_path):
+    """Wire times start at request ARRIVAL; `ttft_s`/`wall_s` start at the
+    engine's own `started`, after admission. Without the offset a reader
+    comparing them on one row is wrong by the queue wait.
+
+    The offset is read off the meter rather than off `row["wire"]` because
+    nothing has put a byte on the wire yet: `wire` is still null on every row
+    until the socket measurements land, and then this reads
+    `row["wire"]["engine_started_s"] >= 0` directly.
+    """
+    e = EngineHandle(M(), log_dir=tmp_path)
+    meter = WireMeter(make_completion_id())
+    asyncio.run(e.generate(_req(), meter=meter))
+    row = rows(tmp_path)[0]
+    assert "wire" in row and row["wire"] is None
+    meter.note_chunk(1)        # what `_sse` will do; `row()` is None without it
+    offset = meter.row()["engine_started_s"]
+    assert offset >= 0, "the engine cannot have started before the request arrived"
+    assert row["wall_s"] >= 0, "nothing to rebase onto"
+
+
+def test_a_library_caller_without_a_meter_still_streams_and_still_rows(tmp_path):
+    """`EngineHandle` is importable without a server, a route or a socket, so
+    `meter=None` must be a no-op on the generation path rather than an
+    AttributeError -- and the row is still written, with a null id."""
+    e = EngineHandle(M(), log_dir=tmp_path)
+
+    async def main():
+        return [x async for x in e.stream(_req())]       # no meter=
+
+    out = asyncio.run(main())
+    assert any(k == "delta" for k, _ in out)
+    row = rows(tmp_path)[0]
+    assert row["id"] is None and row["wire"] is None
