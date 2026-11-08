@@ -396,6 +396,29 @@ def test_an_engine_row_carries_the_completion_id_the_client_saw(tmp_path):
     assert row["cancel_reason"] is None
 
 
+def test_a_streaming_row_carries_the_wire_block_with_real_numbers(tmp_path):
+    """The file-level leg: a POPULATED `wire` block in `requests.jsonl`,
+    written by the real engine's row writer.
+
+    `tests/test_server_app.py` drives the route end to end, but behind
+    `FakeEngine`, which writes no row at all -- so without this every number
+    in the block is proved only against `meter.row()`, and nothing guards the
+    row actually carrying it. This is the one test where `_sse`, the real
+    engine's `_write_request_row` and the file meet.
+    """
+    e = EngineHandle(M(), log_dir=tmp_path)
+    _drive_sse(e, _req())
+    wire = rows(tmp_path)[0]["wire"]
+    # `_drive_sse` passes no keepalive, so the queue-position line is the only
+    # comment and no heartbeat can fire.
+    assert wire["chunks_sent"] >= 1 and wire["comments_sent"] == 1
+    assert wire["heartbeats_sent"] == 0 and wire["bytes_sent"] > 0
+    # Measured, not absent: the headline number and the date that places it.
+    assert wire["max_silence_s"] >= 0 and wire["max_silence_at_s"] >= 0
+    assert wire["first_chunk_s"] >= wire["first_byte_s"]
+    assert wire["engine_started_s"] >= 0
+
+
 def test_the_streamed_id_matches_the_row_id(tmp_path):
     """Minting before generation is the whole point: a second id would join
     nothing."""

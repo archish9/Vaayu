@@ -500,7 +500,9 @@ def test_the_row_reports_the_wire_silence_of_a_long_buffered_tool_call(
     assert engine.wire_row is not None, "a streaming row must carry a wire block"
     assert engine.wire_row["max_silence_s"] > 0
     assert engine.wire_row["chunks_sent"] >= 1
-    assert engine.wire_row["comments_sent"] >= 0
+    # >= 1, not >= 0: the queue-position line is already out by row time, and
+    # a non-negative counter cannot fail the weaker form.
+    assert engine.wire_row["comments_sent"] >= 1
     # The whole frame, against the body the client actually received. The fake
     # engine finishes before `_sse` drains it -- a real one is the slow part --
     # so the row-time snapshot above is early, and this is where every write

@@ -125,7 +125,6 @@ def test_bytes_and_the_first_and_last_markers():
     assert r["bytes_sent"] == 114
     assert r["comments_sent"] == 1 and r["chunks_sent"] == 2
     assert r["first_byte_s"] == 1 and r["first_chunk_s"] == 2
-    assert r["first_byte_s"] <= r["first_chunk_s"]
     assert r["last_chunk_s"] == 5
 
 
