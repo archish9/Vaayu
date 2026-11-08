@@ -21,7 +21,7 @@ from .schemas import (ChatCompletionChunk, ChatCompletionRequest,
                       ChatCompletionResponse, Choice, ChunkChoice, Delta,
                       ResponseMessage, Usage, make_completion_id)
 from .stopping import ContextTooLong
-from .wire import WireMeter, cancel_fields
+from .wire import WireMeter, cancel_fields, client_field, client_shape, FORWARDING_HEADERS
 from ..utils import freeze_after_load
 
 
@@ -428,7 +428,7 @@ def _refusal_row(engine, req, exc_type, message, *, stream: bool,
             # exists, so there is no stream to report on.
             "wire": meter.row() if meter is not None else None,
             **cancel_fields(meter),
-            "client": None,
+            "client": client_field(meter),
             "error": (None if exc_type is None else
                       {"type": exc_type, "message": message, "traceback": None}),
         })
@@ -722,7 +722,12 @@ def create_app(config: ServerConfig | None = None, engine=None) -> FastAPI:
         # holds both the `Request` and that id, so the meter is built here and
         # carried down -- it is also where the socket's own measurements will
         # be recorded.
-        meter = WireMeter(make_completion_id())
+        # Derived here, where the headers are, and the raw user-agent goes no
+        # further: only the family and the PRESENCE of a forwarding header.
+        shape = client_shape(
+            request.headers.get("user-agent"),
+            forwarded=any(h in request.headers for h in FORWARDING_HEADERS))
+        meter = WireMeter(make_completion_id(), client=shape)
         # Idempotent (BatchScheduler.start() no-ops once a dispatch task
         # exists): the lifespan already started it in real use. An engine
         # injected without ever running lifespan (TestClient used without

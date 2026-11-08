@@ -34,6 +34,7 @@ The clock is injected so tests can drive it, and it is read **once per
 event**: `tests/test_server_app.py::_TickingClock` advances one second per
 reading, so a method reading it twice would invent a second of silence.
 """
+import re
 import time
 
 
@@ -303,3 +304,54 @@ def cancel_fields(meter) -> dict:
     return {"cancel_reason": meter.cancel_reason,
             "cancel_detected_at_s": meter.cancel_detected_at_s,
             "s_since_last_chunk": meter.s_since_last_chunk}
+
+
+# Most specific first; the first probe that matches wins. The optional group
+# is the major version, taken from the digits right after the product name.
+_VER = r"(?:[/ ]v?(\d+))?"
+_CLIENT_PROBES = [(re.compile(p, re.I), fam) for p, fam in (
+    (r"\bopenai/python" + _VER, "openai-python"),
+    (r"\bopenai/js" + _VER, "openai-js"),
+    (r"\banthropic[/-]\w+" + _VER, "anthropic-sdk"),
+    (r"\bcurl" + _VER, "curl"),
+    (r"\bpython-httpx" + _VER, "httpx"),
+    (r"\bpython-requests" + _VER, "python-requests"),
+    (r"\baiohttp" + _VER, "aiohttp"),
+    (r"\bnode-fetch" + _VER, "node-fetch"),
+    (r"\bundici" + _VER, "undici"),
+    (r"\baxios" + _VER, "axios"),
+    (r"\bgo-http-client" + _VER, "go-http-client"),
+    (r"^mozilla/", "browser"),
+)]
+# Headers whose PRESENCE says a proxy hop sat in front. Their values are
+# addresses and are never read.
+FORWARDING_HEADERS = ("x-forwarded-for", "forwarded", "x-real-ip", "via")
+
+
+def client_shape(user_agent, *, forwarded: bool) -> dict:
+    """`{family, version, forwarded}` -- the coarse client, never the raw string.
+
+    A user-agent can carry a machine name or a build, and a mailed `logs/`
+    folder must not. Only a family from the fixed list above, a major version
+    number and whether a forwarding header was present are returned; the input
+    is discarded. Anything unrecognised, empty, non-string or enormous is
+    `unknown` -- a normal value, never an error (this runs on the logging path).
+    """
+    family, version = "unknown", None
+    try:
+        if isinstance(user_agent, str):
+            ua = user_agent[:256]
+            for rx, fam in _CLIENT_PROBES:
+                m = rx.search(ua)
+                if m:
+                    family = fam
+                    version = m.group(1) if m.groups() else None
+                    break
+    except Exception:                                   # noqa: BLE001
+        family, version = "unknown", None
+    return {"family": family, "version": version, "forwarded": bool(forwarded)}
+
+
+def client_field(meter):
+    """The row's `client` key: the meter's derived shape, null if none."""
+    return None if meter is None else meter.client

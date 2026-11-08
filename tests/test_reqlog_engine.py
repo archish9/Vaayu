@@ -557,3 +557,31 @@ def test_the_streamed_chunk_ids_are_the_row_id(tmp_path, monkeypatch):
     row = rows(run_dir)[-1]
     assert row["stream"] is True
     assert chunk_ids == {row["id"]}
+
+
+def test_the_row_records_the_client_shape_the_meter_was_given(tmp_path):
+    import vaayu.server.app as app_mod
+    from vaayu.server.scheduler import BatchScheduler
+    e = EngineHandle(M(), log_dir=tmp_path)
+    shape = {"family": "curl", "version": "8", "forwarded": True}
+
+    async def main():
+        sched = BatchScheduler(e, queue_depth=8, max_batch_size=1,
+                               prefill_chunk_size=512)
+        await sched.start()
+        try:
+            gen = app_mod._sse(e, _req(), "m", None, prepared=e.prepare(_req()),
+                               scheduler=sched,
+                               meter=WireMeter(make_completion_id(), client=shape))
+            return [line async for line in gen]
+        finally:
+            await sched.stop()
+
+    asyncio.run(main())
+    assert rows(tmp_path)[0]["client"] == shape
+
+
+def test_a_row_with_no_derived_shape_has_client_null(tmp_path):
+    e = EngineHandle(M(), log_dir=tmp_path)
+    _drive_sse(e, _req())
+    assert rows(tmp_path)[0]["client"] is None

@@ -3,7 +3,11 @@
 The object, the id it carries, and the `None` row that keeps `wire` honest on
 a request that never had a stream at all.
 """
-from vaayu.server.wire import WireMeter
+import json
+
+import pytest
+
+from vaayu.server.wire import WireMeter, client_shape
 
 
 def test_a_meter_that_recorded_nothing_has_no_row():
@@ -258,3 +262,37 @@ def test_s_since_last_chunk_falls_back_to_time_since_arrival_with_no_chunk():
     t[0] = 4.0
     m.note_cancel("abandoned_queued")
     assert m.s_since_last_chunk == 4.0
+
+
+@pytest.mark.parametrize("ua,family,version", [
+    ("OpenAI/Python 1.54.3", "openai-python", "1"),
+    ("curl/8.5.0", "curl", "8"),
+    ("python-httpx/0.27.2", "httpx", "0"),
+    ("node-fetch/1.0 (+https://github.com/bitinn/node-fetch)", "node-fetch", "1"),
+    ("Mozilla/5.0 (X11; Linux x86_64)", "browser", None),
+    ("", "unknown", None),
+    (None, "unknown", None),
+    ("x" * 100000, "unknown", None),
+    (b"curl/8", "unknown", None),
+])
+def test_the_client_family_is_derived(ua, family, version):
+    assert client_shape(ua, forwarded=False) == {
+        "family": family, "version": version, "forwarded": False}
+
+
+@pytest.mark.parametrize("ua", [
+    "curl/8.5.0 host=alice-laptop.local",
+    "my-secret-agent/3.1 alice-laptop.local build 9f3c",
+    "Mozilla/5.0 (X11; Linux x86_64) alice-laptop.local",
+])
+def test_the_raw_user_agent_is_never_in_the_shape(ua):
+    # Only the private tail is checked, so a family that happened to contain
+    # the UA's leading text cannot satisfy this; echoing the string back can't.
+    blob = json.dumps(client_shape(ua, forwarded=False))
+    assert "alice-laptop" not in blob and "9f3c" not in blob and "secret" not in blob
+
+
+def test_a_forwarded_request_records_the_fact_and_no_address():
+    shape = client_shape("curl/8.5.0", forwarded=True)
+    assert shape["forwarded"] is True
+    assert set(shape) == {"family", "version", "forwarded"}

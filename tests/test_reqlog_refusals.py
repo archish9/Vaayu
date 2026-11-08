@@ -718,3 +718,26 @@ def test_a_route_level_refusal_row_still_carries_an_id(client_requiring_session,
     assert r.status_code == 400
     row = rows(run_dir)[-1]
     assert row["id"].startswith("chatcmpl-") and row["wire"] is None
+
+
+def test_the_route_derives_the_client_shape_and_never_writes_the_raw_user_agent(
+        client, run_dir):
+    ua = "curl/8.5.0 host=alice-laptop.local"
+    r = client.post("/v1/chat/completions", json={
+        "model": "m", "session_id": "s", "stream": False,
+        "messages": [{"role": "user", "content": "hi"}]},
+        headers={"user-agent": ua, "x-forwarded-for": "203.0.113.9"})
+    assert r.status_code == 200
+    text = (run_dir / "requests.jsonl").read_text()
+    row = json.loads(text)
+    assert row["client"] == {"family": "curl", "version": "8", "forwarded": True}
+    assert "alice-laptop" not in text and "203.0.113.9" not in text
+
+
+def test_a_refusal_row_carries_the_client_shape_too(client_requiring_session, run_dir):
+    r = client_requiring_session.post("/v1/chat/completions", json={
+        "model": "m", "messages": [{"role": "user", "content": "hi"}]},
+        headers={"user-agent": "OpenAI/Python 1.54.3"})
+    assert r.status_code == 400
+    assert rows(run_dir)[0]["client"] == {
+        "family": "openai-python", "version": "1", "forwarded": False}

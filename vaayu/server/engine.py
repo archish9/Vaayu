@@ -30,7 +30,7 @@ from .logs import clear_current_session, session_event, set_current_session
 from .stopping import ContextTooLong, finish_reason, resolve_max_tokens
 from .tools import (declared_tool_names, declared_tool_schemas,
                     derive_tool_format, detect_tool_format, parse_tool_calls)
-from .wire import cancel_fields
+from .wire import cancel_fields, client_field
 
 
 # Keyword arguments vaayu.streaming.stream_generate constructs itself. Anything
@@ -466,7 +466,7 @@ class EngineHandle:
                 # request, or any caller with no `_sse` frame in front of it.
                 "wire": meter.row() if meter is not None else None,
                 **cancel_fields(meter),
-                "client": None,
+                "client": client_field(meter),
                 "error": reqlog.error_block(error),
             })
         except Exception:                            # noqa: BLE001 -- never displaces
