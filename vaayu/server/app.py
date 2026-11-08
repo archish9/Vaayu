@@ -1022,6 +1022,39 @@ async def _sse(engine, req, model_name, warning, cancel=None, session_id=None,
         if meter is not None:
             meter.note_chunk(len(s))
 
+    # The live warning: ONE per request, not per span -- a per-span line would
+    # become the flood it reports (`logs.session_event` warns once per process
+    # for the same reason). A print, so the stdout pump timestamps it, keeps it
+    # in server.log and `note_if_warning` harvests it into env.json. The floor
+    # on the threshold exists because `keepalive_s == 0` means "off", and
+    # `3 * 0` would warn on every span.
+    #
+    # BEST-EFFORT, NOT A WATCHDOG: it is only evaluated where this frame wakes
+    # -- the keepalive timeout and a token arriving inside a buffered tool
+    # call. With keepalive off `job.out.get()` has no timeout, so a silence
+    # with an empty queue has no wakeup to print from; only the buffered
+    # window can warn. That is a limit of the design, not a bug
+    # (tests/test_server_app.py pins it).
+    silence_warn_s = max(3 * (keepalive_s or 0.0), 45.0)
+    silence_warned = False
+
+    def _warn_if_silent():
+        nonlocal silence_warned
+        if silence_warned or meter is None:
+            return
+        try:
+            quiet_s, held = meter.open_silence()
+            if quiet_s >= silence_warn_s:
+                silence_warned = True
+                print(f"[Vaayu-Server] WARNING: the stream {meter.id} has sent "
+                      f"no data chunk for {quiet_s:.0f} s with {held} tokens "
+                      f"generated and held meanwhile (threshold "
+                      f"{silence_warn_s:.0f} s). Decode may be healthy; a "
+                      f"client with a chunk timeout shorter than this will "
+                      f"give up. This warning prints once per request.")
+        except Exception:                       # noqa: BLE001 -- logging only
+            pass
+
     # Everything already delivered as a content delta. The final event carries
     # the CLEANED text -- prose before the call plus whatever followed it -- and
     # the tail of that was never sent (B15), so the emitter needs to know where
@@ -1093,6 +1126,7 @@ async def _sse(engine, req, model_name, warning, cancel=None, session_id=None,
                 try:
                     item = await asyncio.wait_for(job.out.get(), keepalive_s)
                 except asyncio.TimeoutError:
+                    _warn_if_silent()
                     # A comment is enough while the client is still waiting for
                     # the answer to START -- but once a tool call is being
                     # buffered the client is mid-answer and counting CHUNKS, so
@@ -1161,6 +1195,9 @@ async def _sse(engine, req, model_name, warning, cancel=None, session_id=None,
                 # seconds" does not count SSE comments. Empty content, so it
                 # can neither end the stream (that shape is `delta == {}` plus
                 # a finish_reason) nor change the assembled answer.
+                # Before the heartbeat below: a heartbeat is a chunk and ends
+                # the span this reads.
+                _warn_if_silent()
                 if keepalive_s and keepalive_s > 0 \
                         and time.monotonic() - last_write >= keepalive_s:
                     beat = _chunk(cid, created, model_name,

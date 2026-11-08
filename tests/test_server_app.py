@@ -407,11 +407,12 @@ class _TickingClock:
     no time passing at all).
     """
 
-    def __init__(self):
+    def __init__(self, step=1.0):
         self._t = 0.0
+        self._step = step
 
     def monotonic(self):
-        self._t += 1.0
+        self._t += self._step
         return self._t
 
     def time(self):
@@ -464,7 +465,7 @@ def test_the_buffered_tool_call_heartbeat_is_off_when_keepalive_is_off(monkeypat
 # ── what the row says about the wire (run E's own numbers) ──────────────────
 
 
-def _metered_clock(monkeypatch):
+def _metered_clock(monkeypatch, step=1.0):
     """One ticking clock driving BOTH `app.time` and the route's `WireMeter`,
     and the list of meters the route minted.
 
@@ -481,7 +482,7 @@ def _metered_clock(monkeypatch):
     from vaayu.server import app as app_module
     from vaayu.server.wire import WireMeter
 
-    clock, meters = _TickingClock(), []
+    clock, meters = _TickingClock(step), []
 
     def mint(rid, **kw):
         meters.append(WireMeter(rid, clock=clock.monotonic, **kw))
@@ -1151,3 +1152,63 @@ def test_engine_handle_forwards_decode_top_k_status():
         "mode": "p", "value": 0.9, "cost": 0.0176, "source": "measured"})
     assert EngineHandle.decode_top_k_status(SimpleNamespace(model=model))["mode"] == "p"
     assert EngineHandle.decode_top_k_status(SimpleNamespace(model=object()))["mode"] == "off"
+
+
+# ── the live warning: a long silence is visible while it is happening ───────
+
+_SILENT = "WARNING: the stream "
+
+
+@pytest.mark.parametrize("fmt_key", sorted(_BUFFERING_FORMATS))
+def test_a_long_silence_warns_once_and_only_once(monkeypatch, capsys, fmt_key):
+    # 30 s per clock reading: the buffered body makes three checks, 60 s and
+    # 90 s of which are past the 45 s floor. Once per REQUEST, not per span or
+    # per check -- the count is the assertion that carries weight, and it is
+    # what goes red if the latch in `_sse` is dropped.
+    _metered_clock(monkeypatch, step=30.0)
+    with _live_client(engine=_buffered_tool_call_engine(fmt_key),
+                      sse_keepalive_s=0) as c:
+        r = c.post("/v1/chat/completions", json=_TOOL_BODY)
+    assert r.status_code == 200
+    out = capsys.readouterr().out
+    assert out.count(_SILENT) == 1
+    line = next(l for l in out.splitlines() if _SILENT in l)
+    assert line.startswith("[Vaayu-Server] WARNING:")   # what note_if_warning keys on
+    assert "no data chunk for" in line and " s with " in line
+    assert "tokens generated and held" in line
+
+
+@pytest.mark.parametrize("fmt_key", sorted(_BUFFERING_FORMATS))
+def test_a_healthy_stream_warns_not_at_all(monkeypatch, capsys, fmt_key):
+    # Same stream, 1 s per reading: the longest span is far under the floor.
+    _metered_clock(monkeypatch, step=1.0)
+    with _live_client(engine=_buffered_tool_call_engine(fmt_key),
+                      sse_keepalive_s=0) as c:
+        c.post("/v1/chat/completions", json=_TOOL_BODY)
+    assert "WARNING" not in capsys.readouterr().out
+
+
+def test_the_warning_also_fires_from_the_keepalive_timeout(monkeypatch, capsys):
+    # The other wakeup: an empty queue (prefill) with keepalive ON. The fake
+    # engine waits 0.3 s against a 0.05 s keepalive, so the timeout branch runs
+    # several times -- the clock, not the sleep, supplies the 45 s.
+    _metered_clock(monkeypatch, step=30.0)
+    with _live_client(sse_keepalive_s=0.05, delta_delay=0.3) as c:
+        r = c.post("/v1/chat/completions", json=dict(BODY, stream=True))
+    assert ": keepalive" in r.text
+    assert capsys.readouterr().out.count(_SILENT) == 1
+
+
+def test_with_keepalive_off_the_warning_can_only_come_from_the_buffered_window(
+        monkeypatch, capsys):
+    # With keepalive 0, _sse awaits job.out.get() with NO timeout: in an
+    # empty-queue silence there is no wakeup to print from. So this stream is
+    # "silent" for 90+ s on the meter's clock before its first chunk, and
+    # nothing is printed. A best-effort signal, not a watchdog -- pinned so
+    # nobody later files it as a bug.
+    meters = _metered_clock(monkeypatch, step=30.0)
+    with _live_client(sse_keepalive_s=0, delta_delay=0.1) as c:
+        r = c.post("/v1/chat/completions", json=dict(BODY, stream=True))
+    assert r.status_code == 200
+    assert meters[-1].row()["max_silence_s"] >= 45.0   # the silence was real
+    assert "WARNING" not in capsys.readouterr().out

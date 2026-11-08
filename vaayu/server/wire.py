@@ -220,6 +220,15 @@ class WireMeter:
         # `_silence_from` is the last data chunk, or arrival if none went out.
         self.s_since_last_chunk = now - self._silence_from
 
+    def open_silence(self):
+        """`(seconds, tokens)` of the span that is open NOW, for the live warning.
+
+        Reads the clock once. Never raises: a meter nothing has been recorded
+        on reports the wait since arrival, which is client-visible silence too.
+        """
+        return (self._clock() - self._silence_from,
+                self._tokens - self._silence_from_tokens)
+
     # ── the row ─────────────────────────────────────────────────────────────
 
     def row(self) -> dict | None:
