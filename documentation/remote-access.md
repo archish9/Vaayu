@@ -222,12 +222,17 @@ Vaayu is OpenAI-wire, but these keep long agentic streams healthy:
 - **`session_id` (or OpenAI `user`) on every request** — required (`REQUIRE_SESSION_ID`),
   and it drives the cross-turn prefix cache. Use a **stable id per conversation**, with the
   unchanging prompt prefix (system prompt, files) on top.
-- **Stream, and ignore SSE comment lines** — any line starting with `:` (e.g.
-  `: keepalive`) is a heartbeat the server sends during the silent prefill window so an
-  idle timer never fires. Standard SSE clients skip these; a hand-rolled parser must too.
-- **Read (inactivity) timeout ≥ 60 s**, comfortably above `SSE_KEEPALIVE_S` (15 s). Do
-  **not** set a tight total/overall timeout — a legitimate answer on a slow model runs
-  minutes.
+- **Stream, and tolerate both heartbeat shapes.** Any line starting with `:` (e.g.
+  `: keepalive`) is a comment the server sends during the silent prefill window; standard
+  SSE clients skip these, and a hand-rolled parser must too. Inside a **buffered tool
+  call** the heartbeat is instead a normal chunk whose `delta` is `{"content": ""}` —
+  append it and you append nothing; it is never the end of the stream (that is an empty
+  `delta` plus a `finish_reason`).
+- **Read (inactivity) timeout ≥ 60 s**, comfortably above `SSE_KEEPALIVE_S` (15 s). If
+  the client instead times out on *chunks received* (“no chunk for N s”), note that
+  comments are not chunks: keep N above `SSE_KEEPALIVE_S` and expect the empty-content
+  chunk above to be what resets it. Do **not** set a tight total/overall timeout — a
+  legitimate answer on a slow model runs minutes.
 - **`finish_reason == "length"` means incomplete** — the cap was hit or the stream was
   cut; do not treat it as a final answer.
 - **One request at a time.** Concurrent calls queue (503 past `QUEUE_DEPTH`). Keep an
@@ -245,6 +250,7 @@ gpt-oss-20b) finishes well inside any timeout. See `documentation/server.md` §7
 |---|---|
 | `curl http://100.94.62.117:9999/health` hangs from the client | Vaayu not bound to the tailnet (A1 `HOST` not set / not restarted), or Tailscale down on one side (`tailscale status`). |
 | `tailscale serve` → "HTTPS cert support is not enabled" | Enable HTTPS in the admin console DNS page (A2 step 1). |
+| Stream starts, emits a few chunks, then goes silent for minutes while TCP stays up | The model opened a **tool call** and the server buffers to the end of the answer. Fixed 2026-11-08: that window now gets an empty-content chunk every `SSE_KEEPALIVE_S`. If you still see it, `SSE_KEEPALIVE_S` is `0`, or the client's chunk timer is below it. |
 | Client reaches `/health` but streams still drop mid-answer | Not an idle timeout (keepalive covers that) — a **total-duration** limit on the client, or genuinely too-long generation. Raise/disable the client's overall timeout, or serve a faster model. |
 | Connection refused on the tailnet IP | Wrong IP (re-check `tailscale ip -4`), or Vaayu bound to `127.0.0.1` while using A1. |
 | Works on LAN, not from a remote network | That's fine for Tailscale — it routes over the internet. If it fails, one side's Tailscale is down or a key expired (`sudo tailscale up`). |

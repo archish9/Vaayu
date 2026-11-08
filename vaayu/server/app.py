@@ -945,6 +945,10 @@ async def _sse(engine, req, model_name, warning, cancel=None, session_id=None,
     # actually produced a call (B7). Held back rather than emitted so a real
     # call is never also delivered as prose.
     held, buffered, suppressing = "", "", False
+    # When this frame last put BYTES on the wire. Read only by the buffered
+    # tool-call heartbeat below, which is the one window where the engine is
+    # producing normally and the wire is nonetheless silent.
+    last_write = time.monotonic()
     # Everything already delivered as a content delta. The final event carries
     # the CLEANED text -- prose before the call plus whatever followed it -- and
     # the tail of that was never sent (B15), so the emitter needs to know where
@@ -1001,7 +1005,14 @@ async def _sse(engine, req, model_name, warning, cancel=None, session_id=None,
                 try:
                     item = await asyncio.wait_for(job.out.get(), keepalive_s)
                 except asyncio.TimeoutError:
-                    yield ": keepalive\n\n"
+                    # A comment is enough while the client is still waiting for
+                    # the answer to START -- but once a tool call is being
+                    # buffered the client is mid-answer and counting CHUNKS, so
+                    # the same silence has to be broken with one (see below).
+                    yield (_chunk(cid, created, model_name, session_id=session_id,
+                                  delta={"content": ""}) if suppressing
+                           else ": keepalive\n\n")
+                    last_write = time.monotonic()
                     continue
             else:
                 item = await job.out.get()
@@ -1039,6 +1050,22 @@ async def _sse(engine, req, model_name, warning, cancel=None, session_id=None,
                 break
             if suppressing:
                 buffered += payload
+                # From the open marker to the final event nothing above is
+                # yielded, so a tool call whose body takes minutes to generate
+                # leaves the wire silent for minutes while decode is healthy --
+                # run E: 629 tokens at 1.91 tok/s, io_wait 0.0 s, 10 chunks
+                # delivered, then 300 s of nothing and a client timeout. The
+                # keepalive above cannot cover it: it fires on an EMPTY
+                # job.out, and here tokens keep arriving. A CHUNK, not a
+                # comment -- a client that times out on "no chunk for N
+                # seconds" does not count SSE comments. Empty content, so it
+                # can neither end the stream (that shape is `delta == {}` plus
+                # a finish_reason) nor change the assembled answer.
+                if keepalive_s and keepalive_s > 0 \
+                        and time.monotonic() - last_write >= keepalive_s:
+                    yield _chunk(cid, created, model_name, session_id=session_id,
+                                 delta={"content": ""})
+                    last_write = time.monotonic()
                 continue
             held += payload
             if open_marker and open_marker in held:
@@ -1050,6 +1077,7 @@ async def _sse(engine, req, model_name, warning, cancel=None, session_id=None,
                     sent += held[:cut]
                     yield _chunk(cid, created, model_name, session_id=session_id,
                                  delta={"content": held[:cut]})
+                    last_write = time.monotonic()
                 held, buffered, suppressing = "", held[cut:], True
                 continue
             # Hold back a marker-length tail so an open marker split
@@ -1059,6 +1087,7 @@ async def _sse(engine, req, model_name, warning, cancel=None, session_id=None,
                 emit, held = held[:len(held) - keep], held[len(held) - keep:]
                 sent += emit
                 yield _chunk(cid, created, model_name, session_id=session_id, delta={"content": emit})
+                last_write = time.monotonic()
     except QueueFull as ex:
         # The route's eager depth check turns the ordinary full queue into a
         # real 503; this is the admission race it cannot see. The headers are

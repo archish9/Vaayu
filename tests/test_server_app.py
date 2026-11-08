@@ -2,6 +2,8 @@
 import asyncio
 import json
 
+import pytest
+
 from fastapi.testclient import TestClient
 
 from vaayu.server.app import create_app
@@ -281,10 +283,12 @@ def test_a_stream_emits_role_then_content_then_a_terminating_done():
     assert "".join(c for c in contents if c) == "hello"
 
 
-def _live_client(**cfg_overrides):
+def _live_client(engine=None, **cfg_overrides):
     """A TestClient whose lifespan is OPEN (scheduler running) for streaming."""
     from vaayu.server.app import ServerConfig, create_app
-    engine = FakeEngine(delta_delay=cfg_overrides.pop("delta_delay", 0.0))
+    if engine is None:
+        engine = FakeEngine(delta_delay=cfg_overrides.pop("delta_delay", 0.0))
+    cfg_overrides.pop("delta_delay", None)
     cfg_overrides.setdefault("require_session_id", False)
     cfg = ServerConfig(model_path="unused", **cfg_overrides)
     return TestClient(create_app(config=cfg, engine=engine))
@@ -319,6 +323,119 @@ def test_sse_keepalive_does_not_fire_when_tokens_flow():
     with _live_client(sse_keepalive_s=0.5, delta_delay=0.0) as c:
         r = c.post("/v1/chat/completions", json=dict(BODY, stream=True))
     assert ": keepalive" not in r.text
+
+
+def _minimax_fmt():
+    """MiniMax-M2.7's XML wrapper -- the format run E actually streamed."""
+    from vaayu.server.tools import ToolCallFormat
+    return ToolCallFormat(
+        name="minimax", grammar="xml",
+        open_marker="<minimax:tool_call>", close_marker="</minimax:tool_call>",
+        call_open_prefix='<invoke name="', call_open_suffix='">',
+        call_close="</invoke>", param_open_prefix='<parameter name="',
+        param_open_suffix='">', param_close="</parameter>")
+
+
+# The two grammars whose open marker the server buffers from: a JSON wrapper
+# and MiniMax's XML one. A heartbeat wired into one would silently no-op on
+# the other (CLAUDE.md section 5: prove it on more than one shape).
+_BUFFERING_FORMATS = {
+    "hermes": (_HERMES, ["<tool_call>", '{"name":"f",', '"arguments":', '{"a":1}}']),
+    "minimax_xml": (_minimax_fmt(), ["<minimax:", 'tool_call>\n<invoke name="f">',
+                                     '<parameter name="a">', "1</parameter>"]),
+}
+
+
+def _buffered_tool_call_engine(fmt_key="hermes", **kw):
+    """A stream that opens a tool call early and then keeps generating inside
+    it -- run E's shape: ~9 tokens of prose, the marker, then 600+ tokens of
+    tool-call body at 0.5 s/token."""
+    fmt, body = _BUFFERING_FORMATS[fmt_key]
+    call = ToolCall(id="call_x", function=ToolCallFunction(name="f", arguments='{"a":1}'))
+    engine = FakeEngine(
+        deltas=["ok "] + body,
+        result=GenerationResult(text="ok", prompt_tokens=3, completion_tokens=9,
+                                finish_reason="tool_calls", tool_calls=[call]),
+        **kw)
+    engine.tool_format = fmt
+    return engine
+
+
+_TOOL_BODY = dict(BODY, stream=True,
+                  tools=[{"type": "function", "function": {"name": "f"}}])
+
+
+def _span_between_prose_and_call(events):
+    """The events emitted while the tool call was being buffered."""
+    prose = max(i for i, e in enumerate(events)
+                if e["choices"][0]["delta"].get("content") == "ok ")
+    call = min(i for i, e in enumerate(events)
+               if e["choices"][0]["delta"].get("tool_calls"))
+    return events[prose + 1:call]
+
+
+class _TickingClock:
+    """Stands in for `app.time`: every reading is 1 s after the last.
+
+    The property under test is a RELATION between wire-silence and the
+    keepalive interval, so driving the clock tests it exactly, where sleeping
+    long enough only tests it when the machine cooperates (the engine can run
+    ahead and fill job.out, and the whole buffered span is then drained with
+    no time passing at all).
+    """
+
+    def __init__(self):
+        self._t = 0.0
+
+    def monotonic(self):
+        self._t += 1.0
+        return self._t
+
+    def time(self):
+        return 1_700_000_000.0
+
+    def sleep(self, _s):
+        raise AssertionError("no test here may really sleep")
+
+
+@pytest.mark.parametrize("fmt_key", sorted(_BUFFERING_FORMATS))
+def test_a_long_buffered_tool_call_still_sends_chunks(monkeypatch, fmt_key):
+    # Run E's PRIMARY failure. From the open marker to the final event _sse
+    # buffers every delta and emits NOTHING, so a tool call whose body takes
+    # minutes to generate sends zero bytes for minutes while decode is
+    # perfectly healthy (629 tokens at 1.91 tok/s, io_wait 0.0 s). A client
+    # that gives up after N seconds without a CHUNK cannot tell that from a
+    # hang -- and an SSE comment is not a chunk, so the keepalive comment that
+    # covers the prefill window does not reach it. The heartbeat in this
+    # window must therefore be a real chunk, carrying no content.
+    from vaayu.server import app as app_module
+    monkeypatch.setattr(app_module, "time", _TickingClock())
+    with _live_client(engine=_buffered_tool_call_engine(fmt_key),
+                      sse_keepalive_s=0.5) as c:
+        r = c.post("/v1/chat/completions", json=_TOOL_BODY)
+    events = _sse_events(r.text)
+    beats = _span_between_prose_and_call(events)
+    assert beats, "the wire was silent for the whole tool-call body"
+    assert all(e["choices"][0]["delta"] == {"content": ""} for e in beats)
+    # The raw markup stays out of `content` -- the heartbeat must not reopen
+    # the leak the buffering exists to prevent.
+    assert "<" not in _streamed_content(events)
+    # Not the terminating shape (`delta == {}` plus a finish_reason), and no
+    # text: a heartbeat may neither end the stream nor change the answer.
+    assert all(e["choices"][0].get("finish_reason") is None for e in beats)
+    assert _streamed_content(events) == "ok "
+    assert len([e for e in events if e["choices"][0]["delta"].get("tool_calls")]) == 1
+    assert events[-1]["choices"][0]["finish_reason"] == "tool_calls"
+
+
+def test_the_buffered_tool_call_heartbeat_is_off_when_keepalive_is_off(monkeypatch):
+    # 0 keeps the pre-fix contract: no heartbeat anywhere.
+    from vaayu.server import app as app_module
+    monkeypatch.setattr(app_module, "time", _TickingClock())
+    with _live_client(engine=_buffered_tool_call_engine(), sse_keepalive_s=0) as c:
+        r = c.post("/v1/chat/completions", json=_TOOL_BODY)
+    events = _sse_events(r.text)
+    assert _span_between_prose_and_call(events) == []
 
 
 def test_the_last_stream_event_carries_the_finish_reason():

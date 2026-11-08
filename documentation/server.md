@@ -725,6 +725,13 @@ Content arrives as OpenAI deltas. A **tool call is buffered and emitted once, co
 never as partial JSON, because partial tool-call JSON breaks clients that parse each
 delta. Do not expect incremental `function.arguments` fragments.
 
+Buffering starts at the tool-call open marker and ends with the answer, so **nothing
+reaches the client while the model generates inside the call** — minutes, on a
+disk-streamed MoE writing a file into an argument. A heartbeat chunk whose `delta` is
+`{"content": ""}` goes out every `SSE_KEEPALIVE_S` (default 15 s) through that window, so
+a client can tell a long call from a hang; it adds no text and never carries a
+`finish_reason`. Set `SSE_KEEPALIVE_S = 0` and the window is silent again.
+
 **Closing the connection stops generation** — client timeout, `Ctrl-C`, a cancelled task —
 on the streaming *and* non-streaming paths, within about a second. The slot frees for the
 next request and the server logs how many tokens it got through.

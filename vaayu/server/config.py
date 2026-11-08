@@ -92,25 +92,40 @@ ENABLE_THINKING = False
 # `"stream": false` in the request still wins.
 DEFAULT_STREAM = True
 
-# Seconds of silence on a stream before the server sends a `: keepalive` SSE
-# comment. The prefill/queue window is silent -- nothing reaches the client
-# between the opening role chunk and the first generated token: 26 s on a cold
-# MiniMax-M2.7 load, and MINUTES on a large agentic prompt (prefill scales with
-# prompt length). A reverse proxy or tunnel with an idle timeout (ngrok free,
-# most load balancers: 30-60 s) drops the connection during that silence, so
-# the client sees the stream die before any token -- the exact failure that
-# motivated this knob. A `: keepalive` comment is legal SSE, ignored by every
-# client, and resets the idle timer. It costs ~13 bytes per interval and fires
-# ONLY while output is stalled: once tokens flow (every ~0.5 s even on the
-# slowest target) they arrive inside the interval and no keepalive is sent.
+# Seconds of silence on a stream before the server breaks it with a heartbeat.
+# TWO windows are silent, and the heartbeat differs because what listens does.
+#
+# 1. PREFILL/QUEUE -- nothing reaches the client between the opening role chunk
+#    and the first generated token: 26 s on a cold
+#    MiniMax-M2.7 load, and MINUTES on a large agentic prompt (prefill scales
+#    with prompt length). A reverse proxy or tunnel with an idle timeout (ngrok
+#    free, most load balancers: 30-60 s) drops the connection during that
+#    silence, so the client sees the stream die before any token -- the failure
+#    that motivated this knob. Heartbeat: a `: keepalive` COMMENT, legal SSE,
+#    ignored by every client, ~13 bytes.
+#
+# 2. A BUFFERED TOOL CALL -- from the tool-call open marker to the end of the
+#    answer, `_sse` holds every delta back (partial tool-call JSON breaks
+#    clients that parse each delta), so the wire is silent for as long as the
+#    model keeps generating inside the call. Measured on a Rudra agent run
+#    (2026-11-08): 9 tokens of prose, then 620 tokens of tool-call body at 1.91
+#    tok/s = 300 s of silence with the engine perfectly healthy (io_wait 0.0 s),
+#    and the client gave up. Heartbeat: an empty-content CHUNK, because a client
+#    that times out on "no chunk for N seconds" does not count comments. It
+#    cannot end the stream (that shape is an empty delta plus a finish_reason)
+#    or change the assembled answer.
+#
+# Both fire ONLY while the wire is silent: once content flows (every ~0.5 s even
+# on the slowest target) nothing is sent.
 #
 # COST OF GETTING IT WRONG: too HIGH (or 0 = off) re-exposes the drop on any
-# prefill longer than the proxy's idle timeout -- a dropped request, retried
-# from scratch, is minutes of wasted compute on this hardware. Too LOW is
-# nearly free (a few extra comment bytes). It does NOT help a stream dropped by
-# a TOTAL-duration limit (bytes are flowing then); only model choice or a
-# shorter answer does. Default 15 s clears a cold MiniMax prefill with one or
-# two frames and sits well under a 30-60 s idle cutoff.
+# prefill longer than the proxy's idle timeout, AND leaves a long tool call
+# indistinguishable from a hang to its client -- a dropped request, retried from
+# scratch, is minutes of wasted compute on this hardware. Too LOW is nearly free
+# (a few extra bytes). It does NOT help a stream dropped by a TOTAL-duration
+# limit (bytes are flowing then); only model choice or a shorter answer does.
+# Default 15 s clears a cold MiniMax prefill with one or two frames and sits
+# well under a 30-60 s idle cutoff and under every client chunk timeout seen.
 SSE_KEEPALIVE_S = 15
 
 # Where logs are written. One directory per process, `<LOG_DIR>/run-<UTC>/`,
