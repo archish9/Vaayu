@@ -30,6 +30,7 @@ from .logs import clear_current_session, session_event, set_current_session
 from .stopping import ContextTooLong, finish_reason, resolve_max_tokens
 from .tools import (declared_tool_names, declared_tool_schemas,
                     derive_tool_format, detect_tool_format, parse_tool_calls)
+from .wire import cancel_fields
 
 
 # Keyword arguments vaayu.streaming.stream_generate constructs itself. Anything
@@ -52,10 +53,19 @@ class CancelToken:
     the GPU and the single slot with no connection left on the port.
     """
 
-    def __init__(self):
+    def __init__(self, meter=None):
         self._event = threading.Event()
+        # The request's WireMeter, so whoever cancels can say WHY (below).
+        self._meter = meter
 
-    def cancel(self) -> None:
+    def cancel(self, reason: str | None = None) -> None:
+        """`reason` is recorded on the meter (first write wins); a cancel with
+        none -- the normal end-of-request one -- records nothing."""
+        if reason is not None and self._meter is not None:
+            try:
+                self._meter.note_cancel(reason)
+            except Exception:                   # noqa: BLE001 -- logging only
+                pass
         self._event.set()
 
     @property
@@ -259,7 +269,7 @@ class EngineHandle:
     def cancel_all(self) -> None:
         """Stop whatever is generating. Idempotent, and a no-op when idle."""
         for token in list(self._live_cancels):
-            token.cancel()
+            token.cancel("shutdown")
 
     def quiesce(self) -> None:
         """Cancel the running generation and WAIT for its worker to exit.
@@ -455,7 +465,7 @@ class EngineHandle:
                 # Null when there was no stream at all -- a non-streaming
                 # request, or any caller with no `_sse` frame in front of it.
                 "wire": meter.row() if meter is not None else None,
-                "cancel_reason": None,
+                **cancel_fields(meter),
                 "client": None,
                 "error": reqlog.error_block(error),
             })

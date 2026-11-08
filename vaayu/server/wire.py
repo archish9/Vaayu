@@ -48,8 +48,8 @@ class WireMeter:
 
     The `note_*` methods record what the socket did; the fields they feed are
     published by `row()` as the measurements that need them land.
-    `tokens_held_at_max_silence` and `buffering` are published as None until
-    the tool-call buffer is measured -- every row keeps the same keys.
+    `tokens_held_at_max_silence` and `buffering` are None until a chunk or a
+    tool-call open marker is seen -- every row keeps the same keys.
     """
 
     def __init__(self, request_id: str, *, client: dict | None = None,
@@ -60,6 +60,10 @@ class WireMeter:
         # address, hostname or raw client string.
         self.client = client
         self.cancel_reason = None
+        # Seconds from arrival to the FIRST note_cancel, and how long the wire
+        # had been quiet at that moment -- both frozen there, not at row().
+        self.cancel_detected_at_s = None
+        self.s_since_last_chunk = None
         self._clock = clock
         # Request ARRIVAL. Every second `row()` reports is measured from here,
         # not from the engine's `started`: the queue wait is part of what the
@@ -200,8 +204,20 @@ class WireMeter:
         A top-level row field rather than part of `wire`, so it reaches a
         non-streaming row too -- which is why this does not give the request a
         `wire` block of its own.
+
+        First write wins: the first reason observed is the true one, and the
+        teardown a disconnect causes must not relabel it `stream_closed`. The
+        quiet span is measured NOW -- "it timed out" and "someone pressed
+        stop" differ by how long the wire had been silent when the cancel
+        landed, and `row()` time is later.
         """
+        if self.cancel_reason is not None:
+            return
+        now = self._clock()
         self.cancel_reason = reason
+        self.cancel_detected_at_s = now - self._t0
+        # `_silence_from` is the last data chunk, or arrival if none went out.
+        self.s_since_last_chunk = now - self._silence_from
 
     # ── the row ─────────────────────────────────────────────────────────────
 
@@ -276,3 +292,14 @@ class WireMeter:
             "engine_started_s": (None if self._engine_started is None
                                  else self._engine_started - self._t0),
         }
+
+
+def cancel_fields(meter) -> dict:
+    """The three top-level cancel keys of a row; null for a missing meter or a
+    request nothing cancelled. One place so both row writers keep one key set."""
+    if meter is None:
+        return {"cancel_reason": None, "cancel_detected_at_s": None,
+                "s_since_last_chunk": None}
+    return {"cancel_reason": meter.cancel_reason,
+            "cancel_detected_at_s": meter.cancel_detected_at_s,
+            "s_since_last_chunk": meter.s_since_last_chunk}

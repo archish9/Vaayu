@@ -11,6 +11,7 @@ from fastapi.testclient import TestClient
 
 from vaayu.server.app import ServerConfig, create_app
 from vaayu.server.engine import EngineHandle
+from vaayu.server.wire import WireMeter
 
 from .test_server_engine import FakeModel
 
@@ -506,7 +507,8 @@ def test_a_mid_stream_disconnect_still_writes_finish_cancelled(run_dir):
         await sched.start()
         req = _sse_req()
         gen = app_mod._sse(e, req, "m", None, cancel=cancel,
-                           prepared=e.prepare(req), scheduler=sched)
+                           prepared=e.prepare(req), scheduler=sched,
+                           meter=WireMeter("chatcmpl-mid"))
         seen = 0
         async for _ in gen:
             seen += 1
@@ -525,6 +527,10 @@ def test_a_mid_stream_disconnect_still_writes_finish_cancelled(run_dir):
     assert rs[0]["finish"] == "cancelled", (
         "a mid-stream disconnect must not read as an ordinary stop/length")
     assert rs[0]["error"] is None
+    # The engine owns this row, so it is the engine's writer that must carry
+    # the reason `_sse` noted when Starlette closed the generator.
+    assert rs[0]["cancel_reason"] == "stream_closed"
+    assert rs[0]["s_since_last_chunk"] >= 0 and rs[0]["cancel_detected_at_s"] > 0
 
 
 def test_a_disconnect_while_queued_still_writes_a_row(run_dir):
@@ -575,7 +581,7 @@ def test_a_disconnect_while_queued_still_writes_a_row(run_dir):
         await asyncio.sleep(0.05)
 
         gen_b = app_mod._sse(e, req_b, "m", None, prepared=e.prepare(req_b),
-                             scheduler=sched)
+                             scheduler=sched, meter=WireMeter("chatcmpl-b"))
         task_b = asyncio.create_task(drain(gen_b))
         await asyncio.sleep(0.05)           # let B reach submit() and sit in _waiting
         task_b.cancel()
@@ -595,6 +601,13 @@ def test_a_disconnect_while_queued_still_writes_a_row(run_dir):
     assert rs["b"]["finish"] == "cancelled", (
         "a client that vanished while queued left no row, or the wrong finish")
     assert rs["b"]["error"] is None
+    # The unowned window: `_sse` writes this row through `_refusal_row` and
+    # there is NO engine row, so a null `wire` here destroys the only evidence
+    # of what the client saw. The queue-position comment and the role chunk
+    # are already out by the time B reaches submit().
+    assert rs["b"]["cancel_reason"] == "abandoned_queued"
+    assert rs["b"]["wire"] is not None and rs["b"]["wire"]["chunks_sent"] >= 1
+    assert rs["a"]["cancel_reason"] is None
 
 
 def _dispatcher_drain(exc_text="the dispatcher stopped before this request "

@@ -21,7 +21,7 @@ from .schemas import (ChatCompletionChunk, ChatCompletionRequest,
                       ChatCompletionResponse, Choice, ChunkChoice, Delta,
                       ResponseMessage, Usage, make_completion_id)
 from .stopping import ContextTooLong
-from .wire import WireMeter
+from .wire import WireMeter, cancel_fields
 from ..utils import freeze_after_load
 
 
@@ -171,7 +171,7 @@ async def _watch_disconnect(request, cancel, poll_s: float = DISCONNECT_POLL_S):
     the token is cancelled by whoever owns it (generation finished)."""
     while not cancel.cancelled:
         if await request.is_disconnected():
-            cancel.cancel()
+            cancel.cancel("client_disconnected")
             return
         await asyncio.sleep(poll_s)
 
@@ -383,6 +383,11 @@ def _refusal_row(engine, req, exc_type, message, *, stream: bool,
     """
     try:
         from datetime import datetime, timezone
+        # A cancelled row written HERE is, by construction, a request the
+        # engine never owned -- queued, or dropped before it ran. A reason
+        # already on the meter (shutdown, a disconnect) is the truer one.
+        if finish == "cancelled" and meter is not None:
+            meter.note_cancel("abandoned_queued")
         # `thinking` is the one generation-time field that IS resolvable here.
         # Guarded separately: a refusal row is worth more than one field, and
         # the wrapper below would drop the whole row rather than this value.
@@ -417,7 +422,7 @@ def _refusal_row(engine, req, exc_type, message, *, stream: bool,
             # socket did -- a route-level refusal is answered before one
             # exists, so there is no stream to report on.
             "wire": meter.row() if meter is not None else None,
-            "cancel_reason": None,
+            **cancel_fields(meter),
             "client": None,
             "error": (None if exc_type is None else
                       {"type": exc_type, "message": message, "traceback": None}),
@@ -786,7 +791,7 @@ def create_app(config: ServerConfig | None = None, engine=None) -> FastAPI:
                              finish="error", meter=meter)
                 raise
             return StreamingResponse(
-                _sse(e, req, _served_name(app), warning, CancelToken(),
+                _sse(e, req, _served_name(app), warning, CancelToken(meter),
                      session_id=req.session_key, prepared=prepared,
                      scheduler=app.state.scheduler,
                      keepalive_s=getattr(cfg, "sse_keepalive_s", 0.0),
@@ -796,7 +801,7 @@ def create_app(config: ServerConfig | None = None, engine=None) -> FastAPI:
                          **_session_header(req)},
                 background=_after_response(e))
 
-        cancel = CancelToken()
+        cancel = CancelToken(meter)
         watchdog = asyncio.create_task(_watch_disconnect(request, cancel))
         result, error = None, None
         # Set once a real ENGINE item arrives. prepare() now runs directly
@@ -978,7 +983,7 @@ async def _sse(engine, req, model_name, warning, cancel=None, session_id=None,
     cid = meter.id if meter is not None else make_completion_id()
     created = int(time.time())
     if cancel is None:
-        cancel = CancelToken()
+        cancel = CancelToken(meter)
 
     fmt = engine.tool_format if req.tools else None
     open_marker = fmt.open_marker if fmt is not None else None
@@ -1230,6 +1235,11 @@ async def _sse(engine, req, model_name, warning, cancel=None, session_id=None,
                 "cancelled" if isinstance(ex, (GeneratorExit,
                                                asyncio.CancelledError))
                 else "error")
+        # Once the engine owns the row this frame will not write it, so the
+        # reason is noted here for ITS row to read. Before the handover
+        # `_refusal_row` notes `abandoned_queued` instead.
+        if owed[2] == "cancelled" and engine_owns_the_row and meter is not None:
+            meter.note_cancel("stream_closed")
         raise
     finally:
         # Starlette closes this generator when the client goes away, so this is

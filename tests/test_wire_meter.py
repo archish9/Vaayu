@@ -166,8 +166,8 @@ def test_a_wire_that_never_sent_a_chunk_reports_no_silence_rather_than_zero():
 def test_the_wire_block_has_every_key_the_row_promises():
     """Every row keeps the same keys, null where unknowable, so a reader never
     has to guess whether a field is missing or zero.
-    `tokens_held_at_max_silence` and `buffering` are published here and filled
-    by the task that measures the buffer."""
+    `tokens_held_at_max_silence` and `buffering` are None until a chunk or a
+    tool-call open marker is seen."""
     m = WireMeter("chatcmpl-x")
     m.note_chunk(1)
     assert set(m.row()) == {
@@ -226,3 +226,25 @@ def test_buffered_bytes_accumulate_and_a_chunkless_wire_holds_nothing():
     assert r["buffering"] == {"opened_at_token": 3, "tokens_buffered": 0,
                               "bytes_buffered": 15}
     assert r["tokens_held_at_max_silence"] is None
+
+
+def test_note_cancel_is_first_write_wins_and_measures_at_cancel_time():
+    t = [0.0]
+    m = WireMeter("chatcmpl-x", clock=lambda: t[0])
+    t[0] = 2.0
+    m.note_chunk(1)
+    t[0] = 9.0
+    m.note_cancel("client_disconnected")
+    t[0] = 50.0
+    m.note_cancel("stream_closed")
+    assert m.cancel_reason == "client_disconnected"
+    assert m.cancel_detected_at_s == 9.0
+    # 7 s since the chunk AT cancel time -- not 48, which is what reading the
+    # clock at row() time (or taking the later cancel) would give.
+    assert m.s_since_last_chunk == 7.0
+
+
+def test_note_cancel_alone_keeps_the_wire_block_null():
+    m = WireMeter("chatcmpl-x")
+    m.note_cancel("client_disconnected")
+    assert m.row() is None

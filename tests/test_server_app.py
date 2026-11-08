@@ -22,16 +22,12 @@ class FakeEngine:
     """Implements only what app.py touches."""
 
     def __init__(self, result=None, raises=None, deltas=None, delta_delay=0.0,
-                 tokens_per_delta=1, delta_gap=0.0):
+                 delta_gap=0.0):
         # Seconds between deltas. 0 lets this fake run ahead of `_sse`, so the
         # whole stream is produced before the first byte is parsed -- fine for
         # byte accounting, wrong for anything that needs to know how many
         # tokens existed WHEN the buffer opened.
         self.delta_gap = delta_gap
-        # Token ids the model produced per delta, which the real engine reads
-        # off `len(new_ids)`. 1 models plain decode; more models a speculative
-        # run delivered as one delta.
-        self.tokens_per_delta = tokens_per_delta
         # Seconds to sleep before the FIRST delta -- models the prefill gap
         # (TTFT) during which _sse waits on an empty job.out and must emit
         # keepalive comments so a proxy/tunnel idle timer does not fire.
@@ -97,7 +93,7 @@ class FakeEngine:
                 await asyncio.sleep(self.delta_delay)
             produced = 0
             for d in self._deltas:
-                produced += self.tokens_per_delta
+                produced += 1
                 if meter is not None:
                     # As engine.stream does, before the delta is yielded.
                     meter.note_tokens(produced)
@@ -494,6 +490,45 @@ def _metered_clock(monkeypatch):
     monkeypatch.setattr(app_module, "time", clock)
     monkeypatch.setattr(app_module, "WireMeter", mint)
     return meters
+
+
+def test_a_disconnect_says_client_disconnected_and_how_long_it_had_been_quiet():
+    # "It timed out" vs "someone pressed stop" is the whole point of the pair:
+    # the reason is the cause, the quiet span is the evidence. Driven through
+    # the real watcher and token with an injected clock, so no sleeping.
+    from vaayu.server.app import _watch_disconnect
+    from vaayu.server.engine import CancelToken
+    from vaayu.server.wire import WireMeter, cancel_fields
+
+    clock = _TickingClock()
+    meter = WireMeter("chatcmpl-x", clock=clock.monotonic)   # t0 = 1
+    meter.note_chunk(10)                                      # last chunk at 2
+    token = CancelToken(meter)
+
+    class _Gone:
+        async def is_disconnected(self):
+            return True
+
+    asyncio.run(_watch_disconnect(_Gone(), token))
+    assert token.cancelled
+    fields = cancel_fields(meter)
+    assert fields["cancel_reason"] == "client_disconnected"
+    assert fields["cancel_detected_at_s"] == 2.0     # arrival 1, cancel read 3
+    assert fields["s_since_last_chunk"] == 1.0       # chunk at 2, cancel at 3
+    # Later teardown of the abandoned stream must not relabel the cause.
+    meter.note_cancel("stream_closed")
+    assert cancel_fields(meter)["cancel_reason"] == "client_disconnected"
+
+
+def test_cancel_all_says_shutdown_on_the_meter():
+    from vaayu.server.engine import CancelToken, EngineHandle
+    from vaayu.server.wire import WireMeter
+
+    meter = WireMeter("chatcmpl-x")
+    e = EngineHandle.__new__(EngineHandle)
+    e._live_cancels = [CancelToken(meter)]
+    e.cancel_all()
+    assert meter.cancel_reason == "shutdown"
 
 
 @pytest.mark.parametrize("fmt_key", sorted(_BUFFERING_FORMATS))
