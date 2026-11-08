@@ -248,3 +248,13 @@ def test_note_cancel_alone_keeps_the_wire_block_null():
     m = WireMeter("chatcmpl-x")
     m.note_cancel("client_disconnected")
     assert m.row() is None
+
+
+def test_s_since_last_chunk_falls_back_to_time_since_arrival_with_no_chunk():
+    # Unlike `max_silence_s` (null on a wire that never sent a chunk), this is
+    # non-null there: the quiet span began at arrival.
+    t = [0.0]
+    m = WireMeter("chatcmpl-x", clock=lambda: t[0])
+    t[0] = 4.0
+    m.note_cancel("abandoned_queued")
+    assert m.s_since_last_chunk == 4.0

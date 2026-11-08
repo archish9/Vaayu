@@ -386,8 +386,13 @@ def _refusal_row(engine, req, exc_type, message, *, stream: bool,
         # A cancelled row written HERE is, by construction, a request the
         # engine never owned -- queued, or dropped before it ran. A reason
         # already on the meter (shutdown, a disconnect) is the truer one.
+        # Guarded on its own: a raise here would drop the whole row, and this
+        # may be the only row the request ever gets.
         if finish == "cancelled" and meter is not None:
-            meter.note_cancel("abandoned_queued")
+            try:
+                meter.note_cancel("abandoned_queued")
+            except Exception:                   # noqa: BLE001 -- field, not row
+                pass
         # `thinking` is the one generation-time field that IS resolvable here.
         # Guarded separately: a refusal row is worth more than one field, and
         # the wrapper below would drop the whole row rather than this value.
@@ -1238,8 +1243,12 @@ async def _sse(engine, req, model_name, warning, cancel=None, session_id=None,
         # Once the engine owns the row this frame will not write it, so the
         # reason is noted here for ITS row to read. Before the handover
         # `_refusal_row` notes `abandoned_queued` instead.
+        # Guarded: a raise here would replace the propagating GeneratorExit.
         if owed[2] == "cancelled" and engine_owns_the_row and meter is not None:
-            meter.note_cancel("stream_closed")
+            try:
+                meter.note_cancel("stream_closed")
+            except Exception:                   # noqa: BLE001 -- logging only
+                pass
         raise
     finally:
         # Starlette closes this generator when the client goes away, so this is
