@@ -184,15 +184,27 @@ arrive" gets answered, and they are the only record of a request that never reac
 **Nothing was changed.** Deciding between 1/2/3 is a user call about their own logs, and a review finding is
 not consent to change behaviour.
 
-## [bug] WIRE-BATCHED-ZERO — under N≥2 a batched streaming row's `wire` reads FALSE-HEALTHY zeros — LATENT, worth zero today
+## [bug] WIRE-BATCHED-ZERO — under N≥2 a batched streaming row's `wire` carries NO per-stream token numbers — the false-healthy zeros are FIXED; LATENT, worth zero today
 
 **Found 2026-11-08 by the WIRE-TELEMETRY Task 4 review.** `engine.py:1207` writes each batched job's row with
 that job's own meter, and `_sse` does record chunks for batched jobs — so a batched streaming request gets a
 **non-null** `wire` block. But the batched path never calls `note_engine_started` or `note_tokens` (only
-`engine.stream` does), so that row reads `engine_started_s: null` and
-**`tokens_held_at_max_silence: 0` with `buffering.tokens_buffered: 0`** even on a stream that held a whole tool
-call back. That is "the wire was quiet and nothing was generated" — the exact false-healthy reading these two
-fields exist to prevent, since the run-E class is "quiet wire, 620 tokens held".
+`engine.stream` does), so nothing feeds that row's per-stream token total.
+
+**The FALSE-HEALTHY half is FIXED (2026-11-09, `0adf669`, the whole-branch review's item I1 + its follow-up).**
+`tokens_held_at_max_silence`, `buffering.tokens_buffered` and `buffering.opened_at_token` used to read **`0`**
+on a batched stream that had held a whole tool call back — "the wire was quiet and nothing was generated", the
+exact reading those fields exist to prevent, since the run-E class is "quiet wire, 620 tokens held".
+`WireMeter._tokens_seen` now gates all three to **`null`**, so no batched row claims a measurement nobody took
+(spec §4: *zero is not null*). Guard: `tests/test_wire_meter.py::
+test_a_meter_the_engine_never_fed_reports_null_tokens_not_zero` — three mutants, one per guard, each reddens it.
+
+**WHAT REMAINS OPEN, and it is a GAP not a lie:** a batched row answers *nothing* about tokens. `engine_started_s`
+is `null` (the batched path never calls `note_engine_started`, so the row's `ttft_s`/`wall_s` cannot be rebased
+onto the wire's arrival clock) and the three token fields above are `null` too — so the run-E question "how many
+tokens sat in the buffer while the wire was quiet" has no answer on a batched row. `wire`'s chunk, comment, byte
+and silence numbers, `buffering.bytes_buffered`, `id`, `client` and `cancel_reason` are all real there; only the
+token/time-origin fields are missing.
 
 **Worth zero to a user today:** the server serialises to one request at a time under `engine.py`'s `slot()`
 (CLAUDE.md §8.3) and ships `MAX_BATCH_SIZE = 1`. It is reachable only once batching is turned on — which this

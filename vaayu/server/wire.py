@@ -50,7 +50,7 @@ class WireMeter:
     The `note_*` methods record what the socket did; the fields they feed are
     published by `row()` as the measurements that need them land.
     `tokens_held_at_max_silence` and `buffering` are None until a chunk or a
-    tool-call open marker is seen, and the two TOKEN counts stay None until
+    tool-call open marker is seen, and the three TOKEN counts stay None until
     the engine has fed `note_tokens` at all -- every row keeps the same keys.
     """
 
@@ -78,6 +78,11 @@ class WireMeter:
         # existed for this request" are the same condition -- which is what
         # makes `wire: null` the honest answer for a non-streaming request and
         # for a route-level refusal, with no second flag to keep in sync.
+        #
+        # The one streaming request this also makes `wire: null` is the one
+        # abandoned on `_sse`'s FIRST `yield`: the queue-position comment went
+        # out, but the `note_comment` after that `yield` never ran. See
+        # `row()`.
         #
         # `note_engine_started` deliberately does NOT set it: the engine's
         # start is a time ORIGIN for the fields below, not something the
@@ -250,6 +255,14 @@ class WireMeter:
         would instead claim "the wire sent nothing", which is a different
         statement about a request that did have a socket frame.
 
+        ONE streaming case lands here too, and its row says `stream: true`: a
+        client that vanished while `_sse` was suspended on its FIRST `yield`.
+        The frame was entered and the queue-position comment did go out, but
+        the `note_comment` AFTER that `yield` never ran, so nothing was ever
+        recorded. That row reads `finish: "cancelled"` with
+        `cancel_reason: "abandoned_queued"` -- "the client was gone before the
+        first byte was accounted for", not "no stream at all".
+
         Never raises on a half-filled meter: every field is a counter that
         started at zero or an explicit None.
         """
@@ -302,12 +315,16 @@ class WireMeter:
             "tokens_held_at_max_silence": (
                 None if silence_tokens is None or not self._tokens_seen
                 else silence_tokens[1] - silence_tokens[0]),
-            # None unless a tool-call open marker was seen. `tokens_buffered`
-            # is None on the same condition as the field above, and for the
-            # same reason; `opened_at_token` then reads 0 as part of that one
-            # "token counts unknown on this row" statement.
+            # None unless a tool-call open marker was seen. Both TOKEN
+            # fields are None on the same condition as the field above, and
+            # for the same reason: `opened_at_token` is the token counter read
+            # at the open marker, so on an unfed meter it is a `0` that claims
+            # "the call opened at token 0" -- a measurement nobody took. Only
+            # `bytes_buffered` is counted by this object itself, so it is
+            # always real.
             "buffering": (None if opened is None else {
-                "opened_at_token": opened,
+                "opened_at_token": (None if not self._tokens_seen
+                                    else opened),
                 "tokens_buffered": (None if not self._tokens_seen
                                     else self._tokens - opened),
                 "bytes_buffered": self._buffered_bytes,

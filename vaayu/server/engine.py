@@ -463,7 +463,8 @@ class EngineHandle:
                 "decode": decode,
                 # What the SOCKET did, from the frame that owns the bytes.
                 # Null when there was no stream at all -- a non-streaming
-                # request, or any caller with no `_sse` frame in front of it.
+                # request, or any caller with no `_sse` frame in front of it,
+                # plus the one streaming case `WireMeter.row()` documents.
                 "wire": meter.row() if meter is not None else None,
                 **cancel_fields(meter),
                 "client": client_field(meter),

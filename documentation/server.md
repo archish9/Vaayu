@@ -460,11 +460,14 @@ added to `vaayu/server/config.py` for them, and the only setting they read is
 
 **Under a batch (`batch.n` > 1) `wire` is partial**, in the same way `decode` is.
 The row still carries `id`, `client` and the socket's own chunk and byte counts,
-but the batched path does not feed it the per-stream token total: `engine_started_s`,
-`tokens_held_at_max_silence` and `buffering.tokens_buffered` all read `null`,
-including on a stream that held tokens back. They used to read `0` there, which
-claimed "the wire was quiet and nothing was generated" — the one false-healthy
-reading those two fields exist to prevent. N>1 accuracy was a stated
+but the batched path does not feed it the per-stream token total, so every
+field derived from that total reads `null`: `engine_started_s`,
+`tokens_held_at_max_silence`, `buffering.opened_at_token` and
+`buffering.tokens_buffered`, including on a stream that held tokens back. The
+three token fields used to read `0` there, which claimed "the wire was quiet and
+nothing was generated" — the one false-healthy reading they exist to prevent.
+`buffering.bytes_buffered` is counted by the socket's own frame and stays real.
+N>1 accuracy was a stated
 non-goal for these fields, and the server runs one request at a time by default
 (`MAX_BATCH_SIZE = 1`), so this only appears once batching is turned on.
 

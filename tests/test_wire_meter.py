@@ -227,8 +227,12 @@ def test_a_meter_the_engine_never_fed_reports_null_tokens_not_zero():
     false-healthy reading of the run-E class, where 620 tokens sat in the
     buffer while the wire was silent. Zero is not null (spec 4).
 
-    Reddened by `row()`'s two `self._tokens_seen` guards in `wire.py`: drop
-    either and the matching field reads `0` on a request nothing measured.
+    All three are token counters the ENGINE feeds, `opened_at_token` included
+    -- it is `_tokens` read at the open marker, so `0` there claims "the call
+    opened at token 0".
+
+    Reddened by `row()`'s three `self._tokens_seen` guards in `wire.py`: drop
+    any one and the matching field reads `0` on a request nothing measured.
     """
     m = WireMeter("chatcmpl-x", clock=_ticks(0.0, 1.0, 100.0))
     m.note_buffering_open()         # a tool call opened: text stops going out
@@ -239,7 +243,10 @@ def test_a_meter_the_engine_never_fed_reports_null_tokens_not_zero():
     # the TOKEN counts this meter was never told.
     assert r["max_silence_s"] == 99.0
     assert r["tokens_held_at_max_silence"] is None
+    assert r["buffering"]["opened_at_token"] is None
     assert r["buffering"]["tokens_buffered"] is None
+    # Counted by the meter itself, so still real: the block stays non-null and
+    # keeps its keys.
     assert r["buffering"]["bytes_buffered"] == 900
 
 
