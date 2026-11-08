@@ -1029,12 +1029,21 @@ async def _sse(engine, req, model_name, warning, cancel=None, session_id=None,
     # on the threshold exists because `keepalive_s == 0` means "off", and
     # `3 * 0` would warn on every span.
     #
-    # BEST-EFFORT, NOT A WATCHDOG: it is only evaluated where this frame wakes
-    # -- the keepalive timeout and a token arriving inside a buffered tool
-    # call. With keepalive off `job.out.get()` has no timeout, so a silence
-    # with an empty queue has no wakeup to print from; only the buffered
-    # window can warn. That is a limit of the design, not a bug
-    # (tests/test_server_app.py pins it).
+    # BEST-EFFORT, NOT A WATCHDOG: it is only evaluated where this frame wakes,
+    # and the silence it measures is the span since the last data CHUNK
+    # (comments do not end it). That leaves two places it can really fire:
+    #   (a) the prefill/queue window with keepalive ON -- the timeout branch
+    #       wakes every `keepalive_s` and writes only COMMENTS, so the span
+    #       keeps growing past the threshold;
+    #   (b) the buffered tool-call window with keepalive OFF -- each arriving
+    #       token wakes the check, and nothing writes a chunk.
+    # The buffered check does NOT fire with keepalive ON: heartbeat chunks reset
+    # the span every `keepalive_s`, and the threshold `max(3*keepalive_s, 45)`
+    # is always above that, so it is dead code in practice under the default
+    # config. Debug (a), not the buffered branch, for a keepalive-on warning.
+    # With keepalive off `job.out.get()` has no timeout, so an empty-queue
+    # silence has no wakeup to print from at all. That is a limit of the
+    # design, not a bug (tests/test_server_app.py pins it).
     silence_warn_s = max(3 * (keepalive_s or 0.0), 45.0)
     silence_warned = False
 
@@ -1196,7 +1205,8 @@ async def _sse(engine, req, model_name, warning, cancel=None, session_id=None,
                 # can neither end the stream (that shape is `delta == {}` plus
                 # a finish_reason) nor change the assembled answer.
                 # Before the heartbeat below: a heartbeat is a chunk and ends
-                # the span this reads.
+                # the span this reads -- which is also why this call can only
+                # fire with keepalive OFF (see the comment at `silence_warn_s`).
                 _warn_if_silent()
                 if keepalive_s and keepalive_s > 0 \
                         and time.monotonic() - last_write >= keepalive_s:

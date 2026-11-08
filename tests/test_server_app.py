@@ -365,7 +365,11 @@ def _minimax_fmt():
 _BUFFERING_FORMATS = {
     "hermes": (_HERMES, ["<tool_call>", '{"name":"f",', '"arguments":', '{"a":1}}']),
     "minimax_xml": (_minimax_fmt(), ["<minimax:", 'tool_call>\n<invoke name="f">',
-                                     '<parameter name="a">', "1</parameter>"]),
+                                     '<parameter name="a">', "1</parameter>",
+                                     # Filler: enough buffered deltas that a
+                                     # per-check warning is distinguishable
+                                     # from a per-request one on this grammar.
+                                     '<parameter name="b">', "2</parameter>"]),
 }
 
 
@@ -1161,8 +1165,9 @@ _SILENT = "WARNING: the stream "
 
 @pytest.mark.parametrize("fmt_key", sorted(_BUFFERING_FORMATS))
 def test_a_long_silence_warns_once_and_only_once(monkeypatch, capsys, fmt_key):
-    # 30 s per clock reading: the buffered body makes three checks, 60 s and
-    # 90 s of which are past the 45 s floor. Once per REQUEST, not per span or
+    # 30 s per clock reading: each buffered delta is one check, and every check
+    # from the second on (60 s, 90 s, ...) is past the 45 s floor, on both
+    # grammars -- so a warning per check prints more than once on either. Once per REQUEST, not per span or
     # per check -- the count is the assertion that carries weight, and it is
     # what goes red if the latch in `_sse` is dropped.
     _metered_clock(monkeypatch, step=30.0)
