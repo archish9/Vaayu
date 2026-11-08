@@ -28,7 +28,19 @@ Status keys: `[ ]` pending · `[~]` in progress · `[!]` blocked · `[bug]` open
 Protocol: `CLAUDE.md` §6 (this ledger), §7 (all plans / RESULTS go in `docs/`, gitignored — so every row carries its
 own numbers), §8 (every change must reach the server; say if it is banked).
 
-**Suite floor (CURRENT, after RUN-E-STALL, 2026-11-08): `4136 passed, 92 skipped, 1 failed`** (384.32 s,
+**Suite floor (CURRENT, after WIRE-TELEMETRY, 2026-11-09): `4220 passed, 92 skipped, 1 failed`** (359.57 s,
+FOREGROUND, `./venv/bin/python -m pytest -q`) = **4313 collected**. The 1 failure is the same pre-existing
+machine-local `config_local.py MAX_BATCH_SIZE=3` artifact (`test_max_batch_size_defaults_to_one`), excluded from
+what this floor means. **Reconciled by COLLECTED count at each commit, not assumed** (`pytest --collect-only -q`),
+which is why it closes exactly: base `8d2d827` **4230** + 3 (`d7bd103` T1 UTC stamp) + 14 (`ab19ee1` T2 request
+id + meter) + 15 (`1b777a0` T3 the `wire` block) + 7 (`5f69596` T4 tokens held) + 5 (`c46b689` T5
+`cancel_reason`) + 27 (`2d91f76` T6 `client` shape) + 6 (`e44ba5e` T7 live warning) + 6 (T8 the no-content
+canary) = **4313**, and the suite reported 4220 + 92 + 1 = 4313. Note for the record: the previous floor line
+below totals 4229 outcomes while its own base commit `8d2d827` collects **4230** — that row was one test short
+(the +1 anomaly Task 1 flagged mid-plan; a collection count, not a regression). `cargo test` not re-run: no Rust
+touched this session.
+
+**Prior floor (after RUN-E-STALL, 2026-11-08): `4136 passed, 92 skipped, 1 failed`** (384.32 s,
 FOREGROUND) = the 2026-11-02 floor of 4134 + RUN-E-STALL's 2 new tests in `tests/test_server_app.py` (3 cases:
 the heartbeat test is parametrized over two tool grammars). The 1 failure is the same pre-existing
 machine-local `config_local.py MAX_BATCH_SIZE=3` artifact. **Prior floor (after SVC-REGRESSION Bug 1 + the flush
@@ -64,7 +76,11 @@ running. Boot/kill a background server with the Bash tool; `pkill -9 -f "python 
 
 ## [bug] HARD-HANG 2026-11-08 — box hung mid Rudra run E; ROOT CAUSE = KERNEL blk-mq bug (CVE-2026-64017), NOT Vaayu. Fixed kernel already on disk, GRUB pinned to the broken one
 
-Full write-up + full oops text: `docs/2026-11-08-machine-hang-kernel-blk-mq-RESULTS.md`.
+**Two self-contained documents carry this work:** diagnosis + the kernel-upgrade path is
+`docs/2026-11-08-HANG-kernel-blk-mq-CVE-2026-64017.md` (full oops text, evidence commands, verified
+7.0.0-28 readiness, GRUB procedure with escape hatch); the engine-side workaround plan, to be executed
+in its OWN fresh session, is `docs/2026-11-08-SQE-PLUG-rust-mitigation-PLAN.md`. Each is written to be
+read with no memory of this session.
 
 **What happened.** 16:26:35 IST, inside the manual MiniMax-M2.7 server (pid 15948,
 `logs/run-2026-11-08T07-14-01Z`): `WARNING ... block/blk-mq.c:3081 blk_mq_submit_bio` immediately
@@ -95,20 +111,98 @@ installed AND has its `nvidia-595-open` module built. `7.0.0-38` is installed bu
 = 128 KiB, so every ~1 MiB chunk must split -> the blocking `GFP_NOIO` alloc the patch names. At crash
 time: ~0.5 s/token, 2.2-3.6 GB/token, 260-400 expert misses/token, 447 GB in one request.
 
+**Why GRUB pins 6.17.0-35 — INVESTIGATED 2026-11-08, NO reason recorded.** 2026-05-31 10:12:07 a
+user-initiated GUI update (`aptdaemon role='role-commit-packages'`) installed nvidia **595** (from 590)
+together with kernel 6.17.0-35 and its module; at **10:21**, nine minutes later, `/etc/default/grub` was
+pinned to it. Absent: `/var/crash` empty, no apt errors, no shell-history trace, no repo note — and the
+journal retains only back to 2026-09-18 (syslog to 2026-10-19), so May is unrecoverable. Best reading:
+locking the kernel/driver pair just verified by hand — inference, not evidence, so treat the pin as
+possibly encoding an undocumented bad experience. NOT an nvidia-module guard: 6.17.0-40 DID get a 595
+module and was blocked anyway, and the pin predates every 7.0 kernel by ~7 weeks. 33/33 identifiable
+boots ran 6.17.0-35.
+
+**USER DECISION 2026-11-08: a new kernel is too risky for them right now.** The kernel move is therefore
+DEFERRED, not refused, and the Rust workaround is wanted in parallel in its own fresh session.
+
 **Next steps:**
-1. [ ] **Ask the user why GRUB is pinned to 6.17.0-35** (deliberate pin — nvidia/CUDA 13.0/exllamav3?).
-   Do not repoint GRUB before that answer.
-2. [ ] Boot `7.0.0-28-generic` (`GRUB_DEFAULT` + `update-grub` + reboot), then verify `uname -r`,
-   `nvidia-smi`, and one MiniMax + one Qwen3-Next load (exllamav3/cu130 is what a kernel move risks).
-3. [ ] Only if 6.17 must stay: measure a mitigation — cap SQEs/enter at 2 (kills the plug, so no cached
-   rq and no `.queue_rqs` batch), or cap chunk len at 128 KiB (no split bio). Both are hot-read-path
-   changes with real perf cost; P8 says the drive plateaus at 2 readers, so (a) may be near-free. Measure,
-   don't ship blind. §9: either is a `vaayu_rust` change -> rebuild wheel + PyPI publish reminder.
+1. [!] Boot `7.0.0-28-generic` — **the real fix**. Blocked on the user deciding they are ready; do not do
+   it unasked. Readiness already verified on-device: Ubuntu-fixed version (CVE fixed in 7.0.0-28.28~24.04.1),
+   all 5 nvidia-595-open modules present, `modinfo version` 595.71.05 with the SAME `srcversion` and the same
+   `Canonical Ltd. Kernel Module Signing` signer as the running 6.17 modules (Secure Boot IS enabled),
+   `modules.dep` populated, no DKMS on this box. `7.0.0-38` is NOT usable as-is (0 nvidia modules; the
+   595 meta stops at 7.0.0-28, which is also the newest kernel here with a 595 module). Procedure +
+   escape hatch (`GRUB_TIMEOUT_STYLE=menu`, `GRUB_TIMEOUT=5`, back up `/etc/default/grub` first — there is
+   NO backup today) in doc §8.4. The real risk of the move is the CUDA 13.0 / exllamav3 stack, not the driver.
+   Canary after any long run: `journalctl -b -k | grep blk_mq_submit_bio` must stay empty.
+2. [ ] Rust workaround — OWN FRESH SESSION, plan in `docs/2026-11-08-SQE-PLUG-rust-mitigation-PLAN.md`.
+   Cap SQEs per `io_uring_enter` at 2 so io_uring never starts a block plug
+   (`io_submit_state_start`: `need_plug = max_ios > 2`), which removes the cached-request list the kernel
+   race corrupts AND stops us reaching `nvme_queue_rqs` at all. Submission granularity only — the wave
+   stays whole, so row 45's "all of an expert's groups in one wave" survives; cost is `ceil(N/2)` enters
+   per wave with device-side depth unchanged. Measure the zero-Rust upper bound first (`queue_depth=2`,
+   which degenerates to one round trip per expert group — no rebuild needed). Option C on paper only: cap
+   chunk at 128 KiB, killing the split-bio sleep instead (weaker guarantee, ~8x SQEs, fights the
+   whole-expert rule). Verify with `bpftrace kprobe:nvme_queue_rqs` → must hit 0 with the cap on and be
+   non-zero with it off; **never ptrace/strace/py-spy a live Vaayu, it corrupts io_uring**. Acceptance
+   <3 % on MiniMax AND dense with ids bit-identical, else ship the knob defaulting OFF and say so. §8 knob
+   in `server/config.py` + README same commit; §9 private repo commit + wheel-only PyPI upload.
+   **It is a workaround, not a fix** — revert it, or flip its default off, once the kernel moves.
 
 **Do NOT fold this into the run-E stall report.** `VAAYU-RUN-E-REPORT.md` §2.1 (stream starts, ~10 chunks,
 then 300 s silence) also happened at 13:11 **with no kernel fault in the log** — a separate Vaayu bug, since
 root-caused and fixed (see the `RUN-E-STALL` row: `_sse` goes silent for a buffered tool-call body). Only the
 16:26-onward wedge is this kernel bug.
+
+## [bug] LOG-FOLDER-PEER-IP — a mailed `logs/run-*/` folder contains PEER IP ADDRESSES — PRE-EXISTING, behaviour deliberately UNCHANGED, the choice is the USER's
+
+**Found 2026-11-08 by the WIRE-TELEMETRY Task 6 review; verified on the code, not inferred.** It contradicts
+the invariant the whole wire-telemetry plan rests on — `documentation/server.md` tells a user to zip
+`logs/run-<timestamp>/` and mail it, and that is only askable if the folder carries nothing personal.
+
+**The chain, three lines:** `vaayu/server/__main__.py:60` calls `uvicorn.run(..., log_level="info")` with **no
+`access_log=False`**; uvicorn's access line format includes the peer `client_addr` (IP:port); and
+`vaayu/server/config.py:140` `CAPTURE_STDIO = True` tees fds 1 and 2 into `server.log` (`logs.py
+capture_stdio`). Over Tailscale that address is the reporter's `100.x` tailnet address, i.e. a stable identifier
+for their machine on their own tailnet.
+
+**NOT caused by this plan** (it predates every commit on `wire-telemetry`), and **not catchable by the new
+canary test** — `tests/test_log_folder_carries_no_content.py` scans the whole folder for prompt, completion,
+user-agent-tail and `x-forwarded-for` canaries and is green, but no real uvicorn serves under pytest, so no
+access line is ever written for it to find. The test's docstring says so.
+
+**Three options; the user picks, because access logs are genuinely useful** (they are how "did the request even
+arrive" gets answered, and they are the only record of a request that never reached a route):
+1. `access_log=False` in `__main__.py` — one line, loses the arrival record entirely.
+2. Keep the access log and scrub the address — a uvicorn logging filter or formatter that replaces `client_addr`
+   with the derived `client.forwarded`-style shape Vaayu already records. More code, keeps the signal.
+3. Accept it, and document "strip `INFO:` access lines before sending" — which
+   `documentation/server.md` § Logs now says under `client` as the interim answer.
+
+**Nothing was changed.** Deciding between 1/2/3 is a user call about their own logs, and a review finding is
+not consent to change behaviour.
+
+## [bug] WIRE-BATCHED-ZERO — under N≥2 a batched streaming row's `wire` reads FALSE-HEALTHY zeros — LATENT, worth zero today
+
+**Found 2026-11-08 by the WIRE-TELEMETRY Task 4 review.** `engine.py:1207` writes each batched job's row with
+that job's own meter, and `_sse` does record chunks for batched jobs — so a batched streaming request gets a
+**non-null** `wire` block. But the batched path never calls `note_engine_started` or `note_tokens` (only
+`engine.stream` does), so that row reads `engine_started_s: null` and
+**`tokens_held_at_max_silence: 0` with `buffering.tokens_buffered: 0`** even on a stream that held a whole tool
+call back. That is "the wire was quiet and nothing was generated" — the exact false-healthy reading these two
+fields exist to prevent, since the run-E class is "quiet wire, 620 tokens held".
+
+**Worth zero to a user today:** the server serialises to one request at a time under `engine.py`'s `slot()`
+(CLAUDE.md §8.3) and ships `MAX_BATCH_SIZE = 1`. It is reachable only once batching is turned on — which this
+box's gitignored `config_local.py` does (`MAX_BATCH_SIZE = 3`), so it is reachable *here*.
+
+**Why it was not fixed:** the standing ruling is that `note_tokens` may be called ONLY from `engine.stream`,
+because it sets the meter's `_recorded` flag and calling it from `generate()` would give every non-streaming row
+a `wire` block it never earned (`test_a_non_streaming_row_has_an_id_and_a_null_wire` is the guard, and inserting
+`note_tokens(0)` into `generate()` was measured to turn 2 tests red). So the fix is not a one-liner in
+`run_batch`: it needs a second entry point that feeds the token total without claiming a socket.
+**Re-open condition:** anyone turning `MAX_BATCH_SIZE >= 2` on for real, or wiring `batched_generate` into the
+server. Documented meanwhile in `documentation/server.md` § Logs ("Under a batch (`batch.n` > 1) `wire` is
+partial").
 
 ## [~] OOMD-KILL — Vaayu SIGKILLed mid-session by systemd-oomd; ship it as a systemd service — DEPLOYED + installer made manual-start 2026-11-01; sustained-load verify still open
 
@@ -331,11 +425,54 @@ every 15 s between the prose and the `tool_calls` chunk.
 - **§5 `400`** (`MissingSessionId`) is correct `REQUIRE_SESSION_ID` behaviour; it is the only error row in the
   whole run (`requests.jsonl` row 21). Rudra-side (their OPEN-167).
 
-- [ ] **OPEN (not built): the request row records no WIRE SILENCE.** Everything needed to call the engine
-  healthy was already logged (tokens, wall, ttft, tok/s, `io_wait`, expert stalls) — the one failing quantity,
-  how long the client got nothing, was not. Recording the longest silent span and the tokens held per request
-  (`reqlog.py`) would make this class self-diagnosing instead of needing a 3-way log correlation. Report §3.3
-  asked for it. Cheap; no knob; do it the next time `reqlog` is touched.
+- [x] **BUILT 2026-11-09 — the request row now records WIRE SILENCE (WIRE-TELEMETRY, branch
+  `wire-telemetry`, `8d2d827..` T8).** Everything needed to call the engine healthy was already logged (tokens,
+  wall, ttft, tok/s, `io_wait`, expert stalls); the one failing quantity — how long the client got nothing —
+  was not. It is now a one-row diagnosis. Full results: `docs/2026-11-08-wire-telemetry-RESULTS.md`.
+  **What landed, with its own numbers so this row survives that file:**
+  - **`id`** (`9eb6dd5`/`ab19ee1`): one `chatcmpl-…`, minted in the route, on every row AND every
+    `sessions/<id>.log` line, so a reporter quoting their client's id joins to a row. Rows otherwise key on
+    `session` + a second-resolution `ts`, which under fan-out joins concurrent requests to each other.
+  - **`wire`** (`524d65a`/`1b777a0`): `chunks_sent`, `comments_sent`, `heartbeats_sent`, `bytes_sent`,
+    `first_byte_s`, `first_chunk_s`, `last_chunk_s`, **`max_silence_s`**, `max_silence_at_s`,
+    `engine_started_s`. **Counts data CHUNKS, not bytes** — a keepalive comment deliberately does NOT end the
+    span, because a client's timer counts chunks and in run E the comments *were* flowing (a byte-silence meter
+    would have read ~15 s and called it healthy). `null` when there was no stream at all; `max_silence_s` is
+    `null` not `0` when no chunk ever went out; the still-open span is closed at row time (run E's row was
+    written with its 322 s of quiet in flight).
+  - **tokens held** (`17965ce`/`5f69596`): `tokens_held_at_max_silence` + `buffering`
+    (`opened_at_token`, `tokens_buffered`, `bytes_buffered`) — **`tokens_buffered` is the field that reads 620
+    for run E** (629 − 9). With the heartbeat on, `tokens_held_at_max_silence` is the largest *inter-heartbeat*
+    count. Both approximate in both directions (3 threads; the streamer enqueues text before extending the id
+    sink), and the byte counts are CHARACTERS (`len()` on a `str`).
+  - **`cancel_reason`** (`272a97a`/`b3c8cdb`/`c46b689`) + `cancel_detected_at_s` + `s_since_last_chunk`, first
+    write wins. Four labels: `client_disconnected`, `stream_closed`, `abandoned_queued`, `shutdown`.
+    **Run E's own class — a streaming client timing out mid-answer — reports `stream_closed`, NOT
+    `client_disconnected`**: the disconnect watchdog is created only on the non-streaming route, after the
+    streaming branch has returned its response.
+  - **`client`** (`8846e34`/`2d91f76`): a derived `{family, version, forwarded}` — family from a fixed probe
+    list, MAJOR version only (5+ digits → `null`, the bound that keeps client-controlled characters out of a log
+    file), `forwarded` = PRESENCE of `x-forwarded-for`/`forwarded`/`x-real-ip`/`via` and never an address.
+    **The raw user-agent is never stored.**
+  - **a live WARNING** (`b757381`/`e44ba5e`): once per request, threshold `max(3 × SSE_KEEPALIVE_S, 45 s)`,
+    harvested into `env.json`'s `warnings`. **Best-effort, not a watchdog** — it can fire in the prefill/queue
+    window with keepalive ON and in the buffered window with keepalive OFF, and it CANNOT fire in the buffered
+    window with keepalive on (heartbeat chunks reset the chunk span below the threshold, which is correct: the
+    stall it would warn about cannot happen then).
+  - **no prompt or completion text in the folder** (T8): now a guard, not luck —
+    `tests/test_log_folder_carries_no_content.py` drives streaming + non-streaming + a refusal in a subprocess
+    with `CAPTURE_STDIO` on and scans every file in the run dir for 4 canaries (prompt, completion, a private
+    user-agent tail, an `x-forwarded-for` address). Green first run; 5 mutants each redden exactly one
+    assertion (the completion one is caught via `server.log`, which is why it runs in a subprocess).
+  - **§8: SHIPPED, not banked. No knob** — nothing added to `config.py`; the only setting read is the existing
+    `SSE_KEEPALIVE_S`, which the warning threshold derives from. Plumbed route → `Job` → scheduler →
+    `engine.stream`/`generate` → both row writers (`_refusal_row` too), reachable on every request at the N=1
+    default. Docs: `documentation/server.md` § Logs + `vaayu/server/README.md`.
+  - **§9 LIMITATION that stays:** bytes sent AFTER the row — the flush, the `tool_calls` chunk, `data: [DONE]` —
+    are unrecorded, because the engine's `finally` writes the row when GENERATION ends. `chunks_sent` is
+    therefore a few short of what the client received. Closing it means moving row ownership into `_sse`, which
+    would rewrite the "a request never ends without a row" contract; deliberately out of scope. Two open
+    `[bug]` rows came out of this work: `LOG-FOLDER-PEER-IP` and `WIRE-BATCHED-ZERO` (both above).
 
 ## [x] SSE keepalive for the prefill/queue silent window — DONE 2026-10-28
 

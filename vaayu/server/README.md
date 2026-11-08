@@ -200,13 +200,29 @@ logs/
 ```
 
 ```
-2026-08-22T16:57:11 REQ    prompt=3 cap=16 stream=False thinking=on
-2026-08-22T16:57:11 DONE   tokens=4 finish=stop prefix_hit=False wall=0.2s decode=14.8tok/s
+2026-11-08T16:57:11.204Z REQ    id=chatcmpl-9f1c0b2e74a5d3806b1f2c40 prompt=3 cap=16 stream=False thinking=on
+2026-11-08T16:57:11.418Z DONE   id=chatcmpl-9f1c0b2e74a5d3806b1f2c40 tokens=4 finish=stop prefix_hit=False wall=0.2s decode=14.800tok/s
 ```
 
 Streaming requests add a `TTFT at=…` line between the two. `prefix_hit` is the one to
 watch across turns of the same session: `False` on turn 2 means the prefix cache is not
 being reused and TTFT is paying full prefill.
+
+`id=` is the `chatcmpl-…` the client was given, and it is on every line of this request's
+session log and on its `requests.jsonl` row — which is what lets a reporter quoting their
+own client's id join to the right request. These stamps are UTC to the millisecond; before
+2026-11-08 these particular lines were written in local time with no `Z`, so an older run
+directory mixes two clocks (`env.json` carries `host.tz`/`host.tz_offset_s` to rebase it).
+
+Each row in `requests.jsonl` also carries a `wire` object — what the SOCKET did, as opposed
+to what the engine did: chunks and comments sent, and the longest run with no data chunk
+(`max_silence_s`). It is what diagnoses a stream the client stopped receiving while
+generation stayed healthy. **These fields need no knob and have none:** they are always on
+and cost integer counters plus one clock read per frame written. The only setting they read
+is `SSE_KEEPALIVE_S`, which the live `no data chunk for … s` warning derives its threshold
+from (`max(3 × SSE_KEEPALIVE_S, 45 s)`). Full field list, time origins and the
+`cancel_reason`/`client` vocabularies:
+[documentation/server.md](../../documentation/server.md) § Logs.
 
 `True` is not enough on its own: it is true for a one-token match. `requests.jsonl`
 carries `prefix_match_tokens` beside `prompt_tokens` — a turn that matched 44 of

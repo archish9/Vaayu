@@ -168,6 +168,14 @@ request from a client that sends neither `session_id` nor `user` lands.
 carries an ISO8601 UTC timestamp and a `session=` field (`-` while the engine
 is idle).
 
+**Since 2026-11-08 the `sessions/<id>.log` lifecycle lines carry that same UTC
+stamp, to milliseconds and with the trailing `Z`.** Before that date one of the
+two writers feeding those files stamped in local time with no `Z`, so a run
+directory produced by an older build mixes the two clocks — lines from the
+pump and lines from the lifecycle writer can be hours apart on the same event.
+`env.json` records `host.tz` and `host.tz_offset_s`, which is what lets an
+older folder's local stamps be rebased onto UTC.
+
 **Reporting a problem:** zip `logs/run-<timestamp>/` and attach it. That
 directory is self-contained — `env.json` records the commit, the library
 versions, the CPU/RAM/kernel, the GPU and its free VRAM, the NVMe devices with
@@ -185,6 +193,17 @@ under `config`.
 Absolute paths are redacted before they are written: a checkpoint path is
 recorded as its directory name plus a hash, never in full, so no username
 leaves your machine.
+
+**The folder carries no prompt text and no completion text.** Nothing in it
+records what you sent or what the model wrote — only counts, timings, outcomes
+and the derived client family described below. That is the property that makes
+"zip the run directory and send it" a reasonable thing to ask of someone else,
+and it is held by a test rather than by luck:
+`tests/test_log_folder_carries_no_content.py` drives a streaming request, a
+non-streaming one and a refusal whose prompt, reply and user-agent all carry
+canary strings, and fails if any of them turns up in any file the run wrote.
+The one thing it cannot cover is uvicorn's own access log, which records the
+connecting peer's address — see the caveat under `client` below.
 
 **`requests.jsonl`** is the per-request companion to `server.log`: one JSON
 object, appended when the request ends — whether it completed, was refused
@@ -226,13 +245,206 @@ files differ on a cancelled request, this is why.
 An `error`/`refused` row also carries an `error` object (`type`, `message`,
 `traceback`). A `refused` row has the **same keys** as every other row — the
 fields that are unknowable before generation starts (`prompt_tokens`, `cap`,
-`prefix_hit`, `prefix_match_tokens`, `ttft_s`, `decode_tok_s`, `decode`) are `null` rather than absent,
-so a script can index any field on any row without checking which kind of row it
-is.
+`prefix_hit`, `prefix_match_tokens`, `ttft_s`, `decode_tok_s`, `decode`, and
+`wire`, because a route-level refusal is answered before any stream exists) are
+`null` rather than absent, so a script can index any field on any row without
+checking which kind of row it is. `id` and `client` are **not** null on a
+refusal that came through the server: both are derived in the route, before the
+refusal is decided, which is what lets a reporter's quoted request id join to
+the row that rejected it. `cancel_reason` is null too, unless the refusal was a
+queued request whose client had already gone (`abandoned_queued`).
 
 Every row also carries `batch`: `null` for a request run on its own, or
 `{"n": <int>, "members": [<session_key>, ...]}` when the dispatcher (P10)
 ran it together with `n - 1` other requests as one batch.
+
+**`id`** is the `chatcmpl-...` string the client was given — on the row, and on
+every one of this request's `sessions/<id>.log` lines. Rows otherwise key on
+`session` plus a second-resolution `ts`, which under fan-out joins concurrent
+requests to each other; `id` is what a reporter quoting their own client's id
+joins to. It is `null` only for a library caller, which has no route to mint
+one.
+
+**`wire` — what the SOCKET did, as distinct from what the engine did.** Every
+other number on the row describes generation. This one describes delivery, and
+it exists because the two can disagree completely: a stream once delivered
+about ten chunks and then nothing for 300 s while the engine healthily produced
+629 tokens at 1.911 tok/s with `io_wait 0.0 s` on every token summary. Every
+engine-side field on that row read healthy. Nothing recorded that the client
+had received nothing.
+
+`wire` is `null` when there was **no stream at all** — a non-streaming request,
+or a refusal answered before the SSE frame was entered. A zero-filled block
+would instead claim "the socket sent nothing", which is a different statement
+about a request that did have a frame.
+
+| key | what it is |
+|---|---|
+| `chunks_sent` | `data:` frames written, heartbeats included |
+| `comments_sent` | `: ...` comment lines written (queue position, keepalive) |
+| `heartbeats_sent` | the subset of `chunks_sent` that were empty-content keepalive chunks |
+| `bytes_sent` | characters written, chunks and comments together |
+| `first_byte_s` | the first byte of any kind — usually the queue-position comment |
+| `first_chunk_s` | the first **data chunk**: the first thing a chunk-counting client sees |
+| `last_chunk_s` | the last data chunk |
+| `max_silence_s` | **the headline number**: the longest run with no data chunk |
+| `max_silence_at_s` | when that span started |
+| `tokens_held_at_max_silence` | tokens generated while that span was open |
+| `buffering` | `null`, or `{opened_at_token, tokens_buffered, bytes_buffered}` for a buffered tool call |
+| `engine_started_s` | request arrival → the engine's own `started` |
+
+**Every count is as of ROW time, not end of response.** The engine writes the
+row from its own `finally`, when *generation* ends — while the SSE frame still
+has the final chunk, any `tool_calls` chunk and `data: [DONE]` to send. Those
+are milliseconds and they are not counted here, so `chunks_sent` is typically a
+few short of what the client received. The silence this block measures happens
+during generation, which is why the row is written where it is.
+
+**`max_silence_s` counts data CHUNKS, not bytes.** A comment — including an
+`SSE_KEEPALIVE_S` keepalive comment — moves `bytes_sent`, `comments_sent` and
+`first_byte_s`, and deliberately does **not** end the span. That is the most
+consequential decision in the block: a client's timeout counts chunks, and in
+the incident above the keepalive comments *were* flowing and the client gave up
+anyway. A byte-silence meter would have reported about 15 s there and called it
+healthy.
+
+**A cold prefill legitimately registers as silence**, and that is not a defect:
+the span starts at request arrival, because the wait for the first chunk is
+client-visible silence exactly as a mid-answer stall is. Expect 26 s on a cold
+MiniMax-M2.7 load and minutes on a large agentic prompt. Tell the two cases
+apart by where the span started. `max_silence_at_s` at or near `0` with
+`tokens_held_at_max_silence: 0` is the prefill-or-queue case: the client was
+waiting for the answer to begin. A span that starts at `last_chunk_s` with
+tokens held is the mid-answer case: the client had begun receiving the answer
+and then stopped, which is the one worth chasing.
+
+**`max_silence_s` is `null`, never `0`, for a request whose socket never carried
+a data chunk** — the most stranded a chunk-counting client can be. A `0` there
+would be a measurement ("quiet for no time") and would read as a healthy wire on
+exactly the rows most likely to be broken; `tokens_held_at_max_silence` is
+`null` with it. The row still carries signal in that case: `first_byte_s` says
+whether anything at all reached the socket, and `comments_sent` says how many
+keepalives went out while the client got no chunk.
+
+**Time origins — read this before comparing two fields on one row.** Every `_s`
+inside `wire` is measured from request **arrival**. `ttft_s` and `wall_s` on the
+row are measured from the engine's own `started`, which is *after* admission.
+`wire.engine_started_s` is the offset between the two, and without adding it a
+reader comparing `wire.first_chunk_s` against `ttft_s` is wrong by however long
+the request sat in the queue.
+
+**`tokens_held_at_max_silence` vs `buffering.tokens_buffered` — which one
+answers "how many tokens sat in the buffer".** `buffering.tokens_buffered`
+does: it counts from the tool-call open marker to the end of generation, and for
+the incident above it is the field that reads 620. `tokens_held_at_max_silence`
+belongs to the longest *silence span*, and with the heartbeat on (the default)
+that span is broken every `SSE_KEEPALIVE_S` — so the field becomes the largest
+**inter-heartbeat** token count. A smaller number, and the right one for "how
+long was the client left with no chunk".
+
+**Both are approximate, in both directions.** The count is the engine's running
+token total as the SSE frame sees it, and generation, the streamer pump and the
+async frame are three separate threads: the streamer enqueues decoded text
+*before* the id sink is extended, so the total can lag the delta being written
+as easily as it can lead it. Read them as "about this many", not as exact
+boundaries.
+
+**`bytes_sent` and `buffering.bytes_buffered` count characters, not bytes** —
+`len()` on a `str` — so a non-ASCII answer under-reports.
+
+**`cancel_reason`** says which cancellation ended a request, in one word,
+alongside `cancel_detected_at_s` (arrival → the moment it was noticed) and
+`s_since_last_chunk` (how long the wire had been quiet at that moment: "it timed
+out" and "someone pressed stop" differ by exactly this). First write wins, so
+the teardown that a disconnect causes cannot relabel the real reason. All three
+are `null` on a request nothing cancelled.
+
+| `cancel_reason` | when |
+|---|---|
+| `client_disconnected` | the **non-streaming** disconnect watchdog saw the client go away |
+| `stream_closed` | the SSE frame was closed — a streaming client that disconnected or timed out |
+| `abandoned_queued` | a queued request was dropped because its client had already gone |
+| `shutdown` | SIGINT/SIGTERM cancelled a **live** generation |
+
+Two orderings surprise people. First, **a streaming client that times out
+mid-answer — the class this whole block was built for — reports
+`stream_closed`, not `client_disconnected`**: the disconnect watchdog is created
+only on the non-streaming route, after the streaming branch has already returned
+its response, so a streaming disconnect arrives as a closed generator instead.
+Second, on a **non-streaming** queued drop the watchdog has usually already
+written `client_disconnected` and first-write-wins keeps it — which makes
+`abandoned_queued` in practice the streaming/ASGI-cancel label. For the same
+reason a shutdown that cancels the ASGI task before the engine is reached reads
+`stream_closed` or `abandoned_queued`; only a request that was actually
+generating gets `shutdown`.
+
+**`s_since_last_chunk` falls back to the time since ARRIVAL** when no data chunk
+ever went out — the opposite of `max_silence_s`'s deliberate `null`, because the
+question it answers ("how long had this client been waiting") always has one.
+
+**`client` is a derived shape, never the client's own string:**
+`{"family": ..., "version": ..., "forwarded": true|false}`. `family` is one of
+`openai-python`, `openai-js`, `anthropic-sdk`, `curl`, `httpx`,
+`python-requests`, `aiohttp`, `node-fetch`, `undici`, `axios`,
+`go-http-client`, `browser` — or `unknown`, which is a normal value and not an
+error. `version` is the **major** number only. `forwarded` is the **presence**
+of a forwarding header (`x-forwarded-for`, `forwarded`, `x-real-ip`, `via`), so
+it says "a proxy hop sat in front of this request" and never says where: those
+header values are not read at all. **The raw user-agent is never stored**,
+because it can carry a machine name or a build string and a mailed folder must
+not. `client` is `null` only for a library caller.
+
+Two accepted quirks: a version of five or more digits reports `null` rather than
+a truncated number — that digit bound is the only channel through which
+client-controlled characters could reach a log file, so it is deliberately
+tight — and an `anthropic/v3`-style user-agent under-reports its version as
+`null`.
+
+**Caveat, and it is not Vaayu's own logging:** uvicorn's access log *does*
+record the connecting peer's address, and `CAPTURE_STDIO` tees it into
+`server.log`. Over a tunnel that is the tunnel's own address range. There is no
+knob for it today; if you are sending a folder to someone else and the address
+matters to you, strip uvicorn's `INFO:` access lines from `server.log` first.
+
+**A live warning in `server.log`, once per request.** While a stream is open the
+server also checks the span that is quiet *now*, and prints:
+
+```
+[Vaayu-Server] WARNING: the stream chatcmpl-… has sent no data chunk for 47 s
+with 0 tokens generated and held meanwhile (threshold 45 s). …
+```
+
+The threshold is `max(3 × SSE_KEEPALIVE_S, 45 s)` — derived, with no knob of its
+own — and the line is harvested into `env.json`'s `warnings` array, so it reaches
+you even from a pasted tail. It is **best-effort, not a watchdog**: it is
+evaluated only where the SSE frame happens to wake, which leaves two windows it
+can really fire in:
+
+- the **prefill/queue** window with keepalive on — that frame wakes every
+  `SSE_KEEPALIVE_S` and writes only comments, which do not reset a chunk-based
+  span, so the span keeps growing past the threshold;
+- the **buffered tool-call** window with keepalive **off** — each arriving token
+  wakes the check and nothing is writing chunks.
+
+It cannot fire in the buffered tool-call window with keepalive **on**: heartbeat
+chunks reset the span every `SSE_KEEPALIVE_S` and the threshold is always above
+that, so the span never reaches it. That is correct rather than broken — with
+the heartbeat on, the client is getting a chunk that often and the stall it
+would warn about cannot happen. With `SSE_KEEPALIVE_S = 0` there is no wakeup at
+all outside the token path, so a quiet queue has nothing to print from.
+
+**No knob.** `id`, `wire`, `cancel_reason` and `client` are always on and free —
+integer counters plus one monotonic clock read per frame written. Nothing was
+added to `vaayu/server/config.py` for them, and the only setting they read is
+`SSE_KEEPALIVE_S`, which the warning threshold above is derived from.
+
+**Under a batch (`batch.n` > 1) `wire` is partial**, in the same way `decode` is.
+The row still carries `id`, `client` and the socket's own chunk and byte counts,
+but the batched path does not feed it the per-stream token total: `engine_started_s`
+reads `null`, and `tokens_held_at_max_silence` and `buffering.tokens_buffered`
+read `0` even on a stream that held tokens back. N>1 accuracy was a stated
+non-goal for these fields, and the server runs one request at a time by default
+(`MAX_BATCH_SIZE = 1`), so this only appears once batching is turned on.
 
 Inside `decode`: `bytes_read_gb` and `gb_per_token` are this request's own NVMe
 traffic **when `batch` is `null`** — the difference between the persister's
