@@ -28,8 +28,11 @@ Status keys: `[ ]` pending · `[~]` in progress · `[!]` blocked · `[bug]` open
 Protocol: `CLAUDE.md` §6 (this ledger), §7 (all plans / RESULTS go in `docs/`, gitignored — so every row carries its
 own numbers), §8 (every change must reach the server; say if it is banked).
 
-**Suite floor (CURRENT, after SVC-REGRESSION Bug 1 + the flush fix, 2026-11-02): `4134 passed, 92 skipped, 1 failed`**
-(356.02 s). Reconciled, not assumed: 4124 pre-session + 10 new tests = 4134 — 9 in `tests/test_exclusive_gpu_wait.py`
+**Suite floor (CURRENT, after RUN-E-STALL, 2026-11-08): `4136 passed, 92 skipped, 1 failed`** (384.32 s,
+FOREGROUND) = the 2026-11-02 floor of 4134 + RUN-E-STALL's 2 new tests in `tests/test_server_app.py` (3 cases:
+the heartbeat test is parametrized over two tool grammars). The 1 failure is the same pre-existing
+machine-local `config_local.py MAX_BATCH_SIZE=3` artifact. **Prior floor (after SVC-REGRESSION Bug 1 + the flush
+fix, 2026-11-02): `4134 passed, 92 skipped, 1 failed`** (356.02 s). Reconciled, not assumed: 4124 pre-session + 10 new tests = 4134 — 9 in `tests/test_exclusive_gpu_wait.py`
 (7 from `4ec9c01`, +1 heredoc guard `b1d9ef8`, +1 flush-order `a1fc96a`) and 1 in `test_server_config_module.py`
 (the §8 forwarding test, added AFTER the 4131 interim run, which is why that figure looked 1 short). `cargo test`
 not re-run: no Rust touched this session.
@@ -58,6 +61,54 @@ running. Boot/kill a background server with the Bash tool; `pkill -9 -f "python 
 ---
 
 # OPEN
+
+## [bug] HARD-HANG 2026-11-08 — box hung mid Rudra run E; ROOT CAUSE = KERNEL blk-mq bug (CVE-2026-64017), NOT Vaayu. Fixed kernel already on disk, GRUB pinned to the broken one
+
+Full write-up + full oops text: `docs/2026-11-08-machine-hang-kernel-blk-mq-RESULTS.md`.
+
+**What happened.** 16:26:35 IST, inside the manual MiniMax-M2.7 server (pid 15948,
+`logs/run-2026-11-08T07-14-01Z`): `WARNING ... block/blk-mq.c:3081 blk_mq_submit_bio` immediately
+followed by `BUG: kernel NULL pointer dereference, address: 0xc8` at `RIP: nvme_queue_rqs+0x19a/0x1e0
+[nvme]`, via `blk_mq_dispatch_queue_requests <- blk_mq_flush_plug_list <- blk_add_rq_to_plug`, submitted
+from `io_uring_enter -> io_read -> ext4_file_read_iter -> iomap_dio_*` (O_DIRECT expert read). The oops
+landed **inside an RCU read-side critical section** (`Voluntary context switch within RCU read-side
+critical section!`), so: the RCU grace period never completed (stalls at 16:27:35 / 16:30:35 / 16:33:35 /
+16:36:35 / 16:39:35, same blocked task `P20373`), the dead task kept the io_uring ctx mutex forever
+(`io_ring_exit_work` WARN 16:34:27), nothing RCU-freed was ever reclaimed -> memory-pressure storm from
+16:40:46 -> desktop unusable -> power cut 16:41:54. **No OOM kill, no oomd kill** — memory pressure was
+the CONSEQUENCE. First occurrence on this box (boots -2..-7 clean).
+
+**Upstream.** Exact match to Keith Busch's linux-block report (2026-04-24): `blk_mq_submit_bio` peeks a
+cached plug request, sleeps in a blocking `GFP_NOIO` split-bio alloc, plug is flushed and `cached_rqs`
+freed under it, driver then gets a request with `mq_hctx == NULL`. Fix = `dc278e9bf2b9` "blk-mq: pop
+cached request if it is usable" = **CVE-2026-64017**. **Ubuntu lists `linux-hwe-6.17` on 24.04 as
+vulnerable with NO fixed version; fixed in `linux-hwe-7.0` >= 7.0.0-28.28~24.04.1.**
+
+**This box runs the broken one and already has the fixed one installed:** `/proc/cmdline` =
+6.17.0-35-generic; `GRUB_DEFAULT` pins it; `linux-image-7.0.0-28-generic` (7.0.0-28.28~24.04.1) is
+installed AND has its `nvidia-595-open` module built. `7.0.0-38` is installed but has **no** nvidia module
+(booting it = no GPU).
+
+**Why Vaayu triggers it** (not the defect, but a huge amplifier — both preconditions are ours):
+(a) io_uring only starts a block plug above 2 SQEs per enter, and the crashing frame shows `to_submit=32`
+(`plan_chunks` fills the ring, `vaayu_rust/src/lib.rs:349-377`); (b) `max_sectors_kb` = `max_hw_sectors_kb`
+= 128 KiB, so every ~1 MiB chunk must split -> the blocking `GFP_NOIO` alloc the patch names. At crash
+time: ~0.5 s/token, 2.2-3.6 GB/token, 260-400 expert misses/token, 447 GB in one request.
+
+**Next steps:**
+1. [ ] **Ask the user why GRUB is pinned to 6.17.0-35** (deliberate pin — nvidia/CUDA 13.0/exllamav3?).
+   Do not repoint GRUB before that answer.
+2. [ ] Boot `7.0.0-28-generic` (`GRUB_DEFAULT` + `update-grub` + reboot), then verify `uname -r`,
+   `nvidia-smi`, and one MiniMax + one Qwen3-Next load (exllamav3/cu130 is what a kernel move risks).
+3. [ ] Only if 6.17 must stay: measure a mitigation — cap SQEs/enter at 2 (kills the plug, so no cached
+   rq and no `.queue_rqs` batch), or cap chunk len at 128 KiB (no split bio). Both are hot-read-path
+   changes with real perf cost; P8 says the drive plateaus at 2 readers, so (a) may be near-free. Measure,
+   don't ship blind. §9: either is a `vaayu_rust` change -> rebuild wheel + PyPI publish reminder.
+
+**Do NOT fold this into the run-E stall report.** `VAAYU-RUN-E-REPORT.md` §2.1 (stream starts, ~10 chunks,
+then 300 s silence) also happened at 13:11 **with no kernel fault in the log** — a separate Vaayu bug, since
+root-caused and fixed (see the `RUN-E-STALL` row: `_sse` goes silent for a buffered tool-call body). Only the
+16:26-onward wedge is this kernel bug.
 
 ## [~] OOMD-KILL — Vaayu SIGKILLed mid-session by systemd-oomd; ship it as a systemd service — DEPLOYED + installer made manual-start 2026-11-01; sustained-load verify still open
 
@@ -217,6 +268,74 @@ cgroup OOM, peak 12.7 G vs `MemoryMax=28G`.
   It is the next action and belongs to the user (Rudra drives the load). **REJECTED as the fix** (user, 2026-11-02):
   "serve a smaller model" — 16 GB VRAM + 32 GB RAM must be used to the max and MiniMax-M2.7 is a deliberate stress
   target.
+
+## [x] RUN-E-STALL — "stream starts, 10 chunks, then 300 s of silence" — ROOT-CAUSED + FIXED 2026-11-08 (1 OPEN telemetry item)
+
+**Verdict:** the report's PRIMARY surface (`VAAYU-RUN-E-REPORT.md` §2.1) is a **Vaayu bug in `_sse`, now fixed**:
+a buffered tool call makes the WIRE silent for the whole call body while the engine runs normally, and
+`SSE_KEEPALIVE_S` structurally cannot cover that window. Full detail + the other two surfaces:
+`docs/2026-11-08-RUN-E-stream-stall-root-cause-RESULTS.md`.
+
+**Root cause.** `_sse` buffers from the tool-call open marker to the final event (right in itself — partial
+tool-call JSON breaks clients that parse each delta) and `suppressing` is never cleared, so **nothing is
+yielded for the rest of the answer**. The keepalive cannot help: it fires when `asyncio.wait_for(job.out.get(),
+keepalive_s)` TIMES OUT, i.e. on an empty queue, and in this window a token arrives every ~0.5 s. Wire silence
+= tokens-after-the-marker ÷ tok/s. Measured, `logs/run-2026-11-08T07-14-01Z` row 6 (MiniMax-M2.7,
+`64bc03dae287-architect`): `ttft 21.14s wall 328.66s tokens=629 decode 1.911 tok/s finish=cancelled`, every
+token `total=0.4-0.6s io_wait=0.0s` — **629 tokens produced, 10 chunks delivered.** Marker at ~token 9 ⇒ 620
+tokens × 0.52 s = **~322 s of silence vs the client's 300 s chunk timer.** At 1.9 tok/s **any tool-call body
+over ~570 tokens** trips a 300 s chunk timeout — a per-run certainty for a coding agent writing files into
+arguments, not bad luck. NOT disk, NOT routing, NOT SVC-REGRESSION Bug 2 (its signature `total=170.8s
+compute=170.3s rss=25.24GB` appears nowhere in this run).
+
+**Fix (3 edits, `vaayu/server/app.py`, no new knob).** On the same `SSE_KEEPALIVE_S` clock, the buffering branch
+emits a chunk whose delta is `{"content": ""}` after `keepalive_s` without bytes on the wire; `last_write` is
+stamped at every writing site. **A CHUNK, not a `: keepalive` comment** — the client times out on *chunks
+received*, and comments were already flowing in this run (through the 21 s prefill) without resetting its timer.
+It adds no text and is not the terminating shape (`delta == {}` + `finish_reason`). The empty-queue keepalive
+branch sends the same chunk **when it fires while suppressing**, so one rule holds in that window; the prefill
+window keeps its documented comment.
+
+**Evidence.** `tests/test_server_app.py`: `test_a_long_buffered_tool_call_still_sends_chunks[hermes]` +
+`[minimax_xml]` (parametrized over a JSON wrapper AND MiniMax's XML wrapper — the format run E streamed; a
+heartbeat wired into one grammar no-ops on the other) and
+`test_the_buffered_tool_call_heartbeat_is_off_when_keepalive_is_off`. Both arms **RED on `main`'s `_sse`, GREEN
+with the fix** (patch reverted and re-applied to prove it); mutants caught: heartbeat carrying text, heartbeat as
+a comment. Tests drive a **fake clock** (`_TickingClock` replaces `app.time`) — a sleep-based version passed and
+failed on the same code, because the engine can run ahead and fill `job.out` so the whole span drains with no
+time passing. Affected suites 98 passed + the 1 known artifact. Full suite FOREGROUND: **`1 failed, 4136 passed,
+92 skipped`** (384.32 s). No Rust (§9: no PyPI).
+
+**§8: SHIPPED, not banked.** No knob needed — reuses `SSE_KEEPALIVE_S`, already in `config.py`/`ServerConfig`/
+`__main__.py`/`server/README.md` and already plumbed route → `_sse`; reachable in the DEFAULT streaming mode at
+N=1, the only path Rudra uses. Docs updated in the same change: the knob comment in `config.py` (both silent
+windows + cost of getting it wrong), `server/README.md`'s row, `documentation/server.md` §6.7, and
+`documentation/remote-access.md` (both heartbeat shapes for clients + a troubleshooting row).
+**NOT verified on device** — no model was loaded; the tests run the real `create_app`/scheduler/route over a fake
+engine. To close that: one real tool-call stream on any model, watching for `"delta": {"content": ""}` about
+every 15 s between the prose and the `tool_calls` chunk.
+
+**The other two surfaces (no Vaayu change indicated):**
+- **§2.2 hard drop (`httpx.ReadError('')`, 75.2 s) was NOT Vaayu's socket close.** Matching request
+  `64bc03dae287-t1-a1-1` 13:35:08 → 13:36:38 **completed normally 15 s AFTER the client's socket died**
+  (`wall 90.2s tokens=67 finish=tool_calls`), no traceback anywhere, and the server therefore never saw a
+  disconnect — it does act on them (row 6 flipped to `cancelled` the instant that client gave up). Vaayu's error
+  path is already `_error_event(...)` + `data: [DONE]`, never a bare close, so a Vaayu fault cannot look like
+  this. `journalctl` puts a Tailscale path change inside the window (13:36:10 `magicsock: derp-6 does not know
+  about peer [7x9ja], removing route`, new direct path, then `removing route` every ~5 s from 13:37:19). Break
+  was client↔front-end. NOT the run-D oomd kill either (server stayed up, served 10 more requests). 2.1's
+  silence is the aggravating factor — fixing it puts bytes across that hop every 15 s.
+- **§2.3 latency (48–340 s/call)** is the documented model-choice cost of MiniMax-M2.7 at 1.8–1.9 tok/s
+  streaming 144 GB off NVMe; the lever is the model (Qwen3-Next-80B / gpt-oss-20b), and "serve a smaller model"
+  stays REJECTED by the user (2026-11-02) as a *fix*. Context, not a bug.
+- **§5 `400`** (`MissingSessionId`) is correct `REQUIRE_SESSION_ID` behaviour; it is the only error row in the
+  whole run (`requests.jsonl` row 21). Rudra-side (their OPEN-167).
+
+- [ ] **OPEN (not built): the request row records no WIRE SILENCE.** Everything needed to call the engine
+  healthy was already logged (tokens, wall, ttft, tok/s, `io_wait`, expert stalls) — the one failing quantity,
+  how long the client got nothing, was not. Recording the longest silent span and the tokens held per request
+  (`reqlog.py`) would make this class self-diagnosing instead of needing a 3-way log correlation. Report §3.3
+  asked for it. Cheap; no knob; do it the next time `reqlog` is touched.
 
 ## [x] SSE keepalive for the prefill/queue silent window — DONE 2026-10-28
 
