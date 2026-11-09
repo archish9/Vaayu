@@ -253,7 +253,8 @@ def session_event(log_dir, session_id, event: str, **fields) -> None:
     generation path. A lost log line is cheaper than a lost response.
     """
     path = session_log_path(log_dir, session_id)
-    stamp = datetime.now().isoformat(timespec="seconds")
+    stamp = (datetime.now(timezone.utc)
+             .strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z")
     body = " ".join(f"{k}={v}" for k, v in fields.items())
     try:
         path.parent.mkdir(parents=True, exist_ok=True)

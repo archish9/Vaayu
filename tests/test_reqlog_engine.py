@@ -5,6 +5,7 @@ Audit item 9: a failed request used to leave a REQ line with no DONE, and its
 traceback landed in server.log unattributed.
 """
 import asyncio
+import contextlib
 import json
 
 import pytest
@@ -12,7 +13,8 @@ import torch
 
 import vaayu.server.engine as engine_mod
 from vaayu.server.engine import EngineHandle
-from vaayu.server.schemas import ChatCompletionRequest
+from vaayu.server.schemas import ChatCompletionRequest, make_completion_id
+from vaayu.server.wire import WireMeter
 
 from .test_server_engine import FakeModel
 
@@ -347,3 +349,304 @@ def test_a_failed_request_still_records_what_it_matched(tmp_path):
         asyncio.run(e.generate(_req()))
     r = rows(tmp_path)[0]
     assert r["finish"] == "error" and r["prefix_match_tokens"] == 12
+
+
+# ── the one id that joins a row to the client's own log (G5) ─────────────────
+
+def _drive_sse(e, req):
+    """The SSE lines a client would get, with the meter the ROUTE mints.
+
+    The route is where the meter is created -- it is the one frame holding
+    both the `Request` and the completion id -- so a row carrying an `id`
+    exists only downstream of `_sse` plus the dispatcher. `e.stream()` on its
+    own is the library path, which has no meter by design (see the library
+    caller test below).
+    """
+    import vaayu.server.app as app_mod
+    from vaayu.server.scheduler import BatchScheduler
+
+    async def main():
+        sched = BatchScheduler(e, queue_depth=8, max_batch_size=1,
+                               prefill_chunk_size=512)
+        await sched.start()
+        try:
+            gen = app_mod._sse(e, req, "m", None, prepared=e.prepare(req),
+                               scheduler=sched,
+                               meter=WireMeter(make_completion_id()))
+            return [line async for line in gen]
+        finally:
+            await sched.stop()
+
+    return asyncio.run(main())
+
+
+def test_an_engine_row_carries_the_completion_id_the_client_saw(tmp_path):
+    """G5: the reporter quotes the id their client logged; the user finds the
+    row. Rows key on `session` plus a second-resolution `ts`, which joins a
+    fan-out workload's concurrent requests to each other."""
+    e = EngineHandle(M(), log_dir=tmp_path)
+    _drive_sse(e, _req())
+    row = rows(tmp_path)[0]
+    assert row["id"].startswith("chatcmpl-")
+    # Keys PRESENT, values deliberately not asserted here: the `wire` block is
+    # filled for exactly this (streaming) row by the task that measures the
+    # socket, so asserting null would make this test fail then. The null
+    # assertion belongs to the non-streaming row below.
+    assert {"wire", "cancel_reason", "client"} <= row.keys()
+    assert row["cancel_reason"] is None
+
+
+def test_the_session_log_lines_carry_the_same_id_as_the_row(tmp_path):
+    """Spec 5.5: the id is on all three of the `REQ`/`TTFT`/`DONE` session
+    lines, not just the row. That is the second of the three joins the id
+    exists to make -- a reporter's quoted id has to reach the token-by-token
+    story in `sessions/<id>.log`, where the original incident was read from.
+
+    Reddened by `_log`'s `fields = {"id": meter.id, **fields}` in
+    `engine.py`: it is the only line that puts the id there, and dropping it
+    left 258 tests passing.
+    """
+    e = EngineHandle(M(), log_dir=tmp_path)
+    _drive_sse(e, _req())
+    row = rows(tmp_path)[0]
+    lines = (tmp_path / "sessions" / "s.log").read_text().splitlines()
+    for event in ("REQ", "TTFT", "DONE"):
+        line = next((l for l in lines if f" {event} " in l), None)
+        assert line is not None, f"no {event} line to join on"
+        assert f"id={row['id']}" in line
+
+
+def test_a_streaming_row_carries_the_wire_block_with_real_numbers(tmp_path):
+    """The file-level leg: a POPULATED `wire` block in `requests.jsonl`,
+    written by the real engine's row writer.
+
+    `tests/test_server_app.py` drives the route end to end, but behind
+    `FakeEngine`, which writes no row at all -- so without this every number
+    in the block is proved only against `meter.row()`, and nothing guards the
+    row actually carrying it. This is the one test where `_sse`, the real
+    engine's `_write_request_row` and the file meet.
+    """
+    e = EngineHandle(M(), log_dir=tmp_path)
+    _drive_sse(e, _req())
+    wire = rows(tmp_path)[0]["wire"]
+    # `_drive_sse` passes no keepalive, so the queue-position line is the only
+    # comment and no heartbeat can fire.
+    assert wire["chunks_sent"] >= 1 and wire["comments_sent"] == 1
+    assert wire["heartbeats_sent"] == 0 and wire["bytes_sent"] > 0
+    # Measured, not absent: the headline number and the date that places it.
+    assert wire["max_silence_s"] >= 0 and wire["max_silence_at_s"] >= 0
+    assert wire["first_chunk_s"] >= wire["first_byte_s"]
+    assert wire["engine_started_s"] >= 0
+
+
+def test_the_streamed_id_matches_the_row_id(tmp_path):
+    """Minting before generation is the whole point: a second id would join
+    nothing."""
+    e = EngineHandle(M(), log_dir=tmp_path)
+    lines = _drive_sse(e, _req())
+    row = rows(tmp_path)[0]
+    chunk_ids = {json.loads(line[6:])["id"] for line in lines
+                 if line.startswith("data: {")}
+    assert chunk_ids == {row["id"]}
+
+
+def test_a_non_streaming_row_has_an_id_and_a_null_wire(tmp_path):
+    """`wire` is null where there was no stream at all. A zero-filled block
+    would read as "the socket sent nothing", which is a different claim from
+    "this request had no socket frame" -- and the engine start the meter
+    records on EVERY request must not be enough to invent one."""
+    e = EngineHandle(M(), log_dir=tmp_path)
+    asyncio.run(e.generate(_req(), meter=WireMeter(make_completion_id())))
+    row = rows(tmp_path)[0]
+    assert row["stream"] is False
+    assert row["id"].startswith("chatcmpl-") and row["wire"] is None
+
+
+def test_the_row_can_rebase_wire_times_onto_ttft(tmp_path):
+    """Wire times start at request ARRIVAL; `ttft_s`/`wall_s` start at the
+    engine's own `started`, after admission. Without the offset a reader
+    comparing them on one row is wrong by the queue wait.
+
+    The offset is read off the meter rather than off `row["wire"]` because
+    nothing has put a byte on the wire yet: `wire` is still null on every row
+    until the socket measurements land, and then this reads
+    `row["wire"]["engine_started_s"] >= 0` directly.
+    """
+    e = EngineHandle(M(), log_dir=tmp_path)
+    meter = WireMeter(make_completion_id())
+    asyncio.run(e.generate(_req(), meter=meter))
+    row = rows(tmp_path)[0]
+    assert "wire" in row and row["wire"] is None
+    meter.note_chunk(1)        # what `_sse` will do; `row()` is None without it
+    offset = meter.row()["engine_started_s"]
+    assert offset >= 0, "the engine cannot have started before the request arrived"
+
+
+def test_a_non_streaming_disconnect_labels_the_row_client_disconnected(
+        tmp_path, monkeypatch):
+    """The non-streaming route hands its `CancelToken` the meter, and that is
+    the ONLY thing that turns the disconnect watchdog's cancel into a label on
+    the row. `client_disconnected` is also the only reason that route can
+    produce, so this seam is the whole label.
+
+    Reddened by `app.py`'s `cancel = CancelToken(meter)` on the non-streaming
+    route: mutating it to `CancelToken()` left 166 tests passing, because
+    every other test builds the token by hand -- downstream of this seam.
+
+    Driven through the real route, the real scheduler and the real engine's
+    row writer, with a `Request` that reports itself disconnected. Which
+    branch then writes the row (the queued drop or the completed generation)
+    is a scheduling race and is deliberately not asserted; the label is not.
+    """
+    from fastapi.testclient import TestClient
+    from starlette.requests import Request
+
+    import vaayu.server.app as app_mod
+
+    async def _gone(self):
+        return True
+
+    monkeypatch.setattr(Request, "is_disconnected", _gone)
+    e = EngineHandle(M(), log_dir=tmp_path)
+    with TestClient(app_mod.create_app(engine=e)) as c:
+        c.post("/v1/chat/completions",
+               json={"model": "v", "session_id": "s", "max_tokens": 16,
+                     "stream": False,
+                     "messages": [{"role": "user", "content": "hi"}]})
+    row = rows(tmp_path)[0]
+    assert row["stream"] is False
+    assert row["cancel_reason"] == "client_disconnected"
+
+
+def test_a_library_caller_without_a_meter_still_streams_and_still_rows(tmp_path):
+    """`EngineHandle` is importable without a server, a route or a socket, so
+    `meter=None` must be a no-op on the generation path rather than an
+    AttributeError -- and the row is still written, with a null id."""
+    e = EngineHandle(M(), log_dir=tmp_path)
+
+    async def main():
+        return [x async for x in e.stream(_req())]       # no meter=
+
+    out = asyncio.run(main())
+    assert any(k == "delta" for k, _ in out)
+    row = rows(tmp_path)[0]
+    assert row["id"] is None and row["wire"] is None
+
+
+# ── the same id, through the REAL route ─────────────────────────────────────
+
+@contextlib.contextmanager
+def _route_client(log_dir, monkeypatch):
+    """A `TestClient` over the real `/v1/chat/completions`, with this file's
+    streaming fake behind it.
+
+    `_drive_sse` above enters at `_sse`, which is DOWNSTREAM of the frame that
+    mints the id -- so it cannot see the route failing to hand the meter over,
+    and three one-line route mutants (dropping `meter=` from the `_sse` call,
+    nulling `job.meter` on the non-streaming path, minting a second id for the
+    response body) all passed against it. These two tests post through the
+    route itself, which is the only place that hand-off exists.
+
+    `no_real_load`'s pattern, as `tests/test_reqlog_refusals.py` uses it:
+    without it `create_app`'s lifespan calls `AutoModel.from_pretrained` on a
+    checkpoint that is not here.
+    """
+    from fastapi.testclient import TestClient
+
+    from vaayu.server.app import ServerConfig, create_app
+
+    class FakeAutoModel:
+        @staticmethod
+        def from_pretrained(path, **kwargs):
+            return M()
+
+    import vaayu.auto_model as am
+    import vaayu.gpu_audit as ga
+    monkeypatch.setattr(am, "AutoModel", FakeAutoModel)
+    monkeypatch.setattr(ga, "audit", lambda **kw: [])
+
+    cfg = ServerConfig(model_path="/ckpt", log_dir=str(log_dir.parent),
+                       capture_stdio=False, default_stream=False)
+    app = create_app(cfg)
+    with TestClient(app) as c:
+        # Point the rows at the directory this test owns; the lifespan built
+        # its engine against its own new_run_dir(). The scheduler looks every
+        # attribute up on `self.engine` per dispatch, so repointing that one
+        # reference is enough.
+        app.state.engine = EngineHandle(M(), log_dir=log_dir)
+        app.state.scheduler.engine = app.state.engine
+        yield c
+
+
+def _run_dir(tmp_path):
+    d = tmp_path / "run-test"
+    (d / "sessions").mkdir(parents=True)
+    return d
+
+
+_ROUTE_BODY = {"model": "m", "session_id": "s", "max_tokens": 16,
+               "messages": [{"role": "user", "content": "hi"}]}
+
+
+def test_the_non_streaming_body_id_is_the_row_id(tmp_path, monkeypatch):
+    """The id the client keeps is the id the row carries. Minting a second one
+    for the response body is what made a reporter's quoted id join nothing."""
+    run_dir = _run_dir(tmp_path)
+    with _route_client(run_dir, monkeypatch) as c:
+        r = c.post("/v1/chat/completions", json={**_ROUTE_BODY, "stream": False})
+    assert r.status_code == 200
+    row = rows(run_dir)[-1]
+    assert row["stream"] is False
+    assert r.json()["id"] == row["id"]
+
+
+def test_the_streamed_chunk_ids_are_the_row_id(tmp_path, monkeypatch):
+    """Same property on the streaming path, where the id reaches the client as
+    every chunk's `id` and reaches the row through `job.meter`."""
+    run_dir = _run_dir(tmp_path)
+    with _route_client(run_dir, monkeypatch) as c:
+        r = c.post("/v1/chat/completions", json={**_ROUTE_BODY, "stream": True})
+    assert r.status_code == 200
+    chunk_ids = {json.loads(line[6:])["id"] for line in r.text.splitlines()
+                 if line.startswith("data: {")}
+    row = rows(run_dir)[-1]
+    assert row["stream"] is True
+    assert chunk_ids == {row["id"]}
+
+
+def test_the_row_records_the_client_shape_the_meter_was_given(tmp_path):
+    import vaayu.server.app as app_mod
+    from vaayu.server.scheduler import BatchScheduler
+    e = EngineHandle(M(), log_dir=tmp_path)
+    shape = {"family": "curl", "version": "8", "forwarded": True}
+
+    async def main():
+        sched = BatchScheduler(e, queue_depth=8, max_batch_size=1,
+                               prefill_chunk_size=512)
+        await sched.start()
+        try:
+            gen = app_mod._sse(e, _req(), "m", None, prepared=e.prepare(_req()),
+                               scheduler=sched,
+                               meter=WireMeter(make_completion_id(), client=shape))
+            return [line async for line in gen]
+        finally:
+            await sched.stop()
+
+    asyncio.run(main())
+    assert rows(tmp_path)[0]["client"] == shape
+
+
+def test_a_row_with_no_derived_shape_has_client_null(tmp_path):
+    e = EngineHandle(M(), log_dir=tmp_path)
+    _drive_sse(e, _req())
+    assert rows(tmp_path)[0]["client"] is None
+
+
+def test_a_streamed_row_through_the_route_carries_the_client_shape(tmp_path, monkeypatch):
+    run_dir = _run_dir(tmp_path)
+    with _route_client(run_dir, monkeypatch) as c:
+        r = c.post("/v1/chat/completions", json={**_ROUTE_BODY, "stream": True},
+                   headers={"user-agent": "curl/8.5.0 host=alice-laptop.local"})
+        assert r.status_code == 200
+    row = rows(run_dir)[0]
+    assert row["client"] == {"family": "curl", "version": "8", "forwarded": False}

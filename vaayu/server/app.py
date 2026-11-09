@@ -21,6 +21,7 @@ from .schemas import (ChatCompletionChunk, ChatCompletionRequest,
                       ChatCompletionResponse, Choice, ChunkChoice, Delta,
                       ResponseMessage, Usage, make_completion_id)
 from .stopping import ContextTooLong
+from .wire import WireMeter, cancel_fields, client_field, client_shape, FORWARDING_HEADERS
 from ..utils import freeze_after_load
 
 
@@ -170,7 +171,7 @@ async def _watch_disconnect(request, cancel, poll_s: float = DISCONNECT_POLL_S):
     the token is cancelled by whoever owns it (generation finished)."""
     while not cancel.cancelled:
         if await request.is_disconnected():
-            cancel.cancel()
+            cancel.cancel("client_disconnected")
             return
         await asyncio.sleep(poll_s)
 
@@ -345,7 +346,7 @@ def _error(status: int, message: str, kind: str, headers=None):
 
 
 def _refusal_row(engine, req, exc_type, message, *, stream: bool,
-                 finish: str = "refused") -> None:
+                 finish: str = "refused", meter=None) -> None:
     """A row for a request that ended BEFORE generation.
 
     The engine writes rows from its own `finally`, but these never reach it:
@@ -375,9 +376,23 @@ def _refusal_row(engine, req, exc_type, message, *, stream: bool,
     disconnected before the stream finished". Pass `exc_type=None` with it --
     that doc says only `error`/`refused` rows carry an `error` object, and
     `EngineHandle.stream` already nulls the error on its own GeneratorExit.
+
+    `meter` is this request's `WireMeter` when the route had already minted
+    one -- which is every route-level refusal. It is what puts the id the
+    client was given on a row the engine never wrote.
     """
     try:
         from datetime import datetime, timezone
+        # A cancelled row written HERE is, by construction, a request the
+        # engine never owned -- queued, or dropped before it ran. A reason
+        # already on the meter (shutdown, a disconnect) is the truer one.
+        # Guarded on its own: a raise here would drop the whole row, and this
+        # may be the only row the request ever gets.
+        if finish == "cancelled" and meter is not None:
+            try:
+                meter.note_cancel("abandoned_queued")
+            except Exception:                   # noqa: BLE001 -- field, not row
+                pass
         # `thinking` is the one generation-time field that IS resolvable here.
         # Guarded separately: a refusal row is worth more than one field, and
         # the wrapper below would drop the whole row rather than this value.
@@ -393,6 +408,10 @@ def _refusal_row(engine, req, exc_type, message, *, stream: bool,
         # only the engine row's shape.
         reqlog.write_row(getattr(engine, "log_dir", None), {
             "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            # The id the client was given, when the route had already minted
+            # one. Null for a caller with no meter -- the key is still here,
+            # per the same-keys-on-every-row rule below.
+            "id": meter.id if meter is not None else None,
             "session": getattr(req, "session_key", None),
             "batch": None,
             "prompt_tokens": None, "cap": None, "stream": stream,
@@ -404,6 +423,12 @@ def _refusal_row(engine, req, exc_type, message, *, stream: bool,
             "tokens": 0, "finish": finish,
             "decode_tok_s": None,
             "decode": None,
+            # `wire` is null unless an `_sse` frame recorded something the
+            # socket did -- a route-level refusal is answered before one
+            # exists, so there is no stream to report on.
+            "wire": meter.row() if meter is not None else None,
+            **cancel_fields(meter),
+            "client": client_field(meter),
             "error": (None if exc_type is None else
                       {"type": exc_type, "message": message, "traceback": None}),
         })
@@ -690,6 +715,19 @@ def create_app(config: ServerConfig | None = None, engine=None) -> FastAPI:
     @app.post("/v1/chat/completions")
     async def chat_completions(req: ChatCompletionRequest, request: Request):
         e = app.state.engine
+        # ONE id for this request, minted HERE rather than at the response:
+        # the row, this request's session-log lines and the `chatcmpl-...`
+        # the client logs must all be the same string, or a reporter quoting
+        # their client's id joins to nothing. This is the only frame that
+        # holds both the `Request` and that id, so the meter is built here and
+        # carried down -- it is also where the socket's own measurements will
+        # be recorded.
+        # Derived here, where the headers are, and the raw user-agent goes no
+        # further: only the family and the PRESENCE of a forwarding header.
+        shape = client_shape(
+            request.headers.get("user-agent"),
+            forwarded=any(h in request.headers for h in FORWARDING_HEADERS))
+        meter = WireMeter(make_completion_id(), client=shape)
         # Idempotent (BatchScheduler.start() no-ops once a dispatch task
         # exists): the lifespan already started it in real use. An engine
         # injected without ever running lifespan (TestClient used without
@@ -701,7 +739,7 @@ def create_app(config: ServerConfig | None = None, engine=None) -> FastAPI:
         if cfg is not None and cfg.require_session_id and not req.session_key:
             _refusal_row(e, req, "MissingSessionId",
                          "no session_id and REQUIRE_SESSION_ID is on",
-                         stream=resolve_stream(req, cfg))
+                         stream=resolve_stream(req, cfg), meter=meter)
             return _error(400,
                           "this request names no session. Send `session_id` (or "
                           "OpenAI's `user`, which is used as one). Without it the "
@@ -728,7 +766,7 @@ def create_app(config: ServerConfig | None = None, engine=None) -> FastAPI:
             if app.state.scheduler.depth >= e.queue_depth:
                 _refusal_row(e, req, "QueueFull",
                              f"{app.state.scheduler.depth} queued, depth "
-                             f"{e.queue_depth}", stream=True)
+                             f"{e.queue_depth}", stream=True, meter=meter)
                 return _error(503, f"{app.state.scheduler.depth} requests are "
                                    f"already queued (depth {e.queue_depth}). "
                                    f"This engine runs one request at a time.",
@@ -742,7 +780,8 @@ def create_app(config: ServerConfig | None = None, engine=None) -> FastAPI:
                 # result is handed to _sse so it is not built twice.
                 prepared = e.prepare(req)
             except (ContextTooLong, TemplateLacksToolSupport, NoChatTemplate) as ex:
-                _refusal_row(e, req, type(ex).__name__, str(ex), stream=True)
+                _refusal_row(e, req, type(ex).__name__, str(ex), stream=True,
+                             meter=meter)
                 return _error(400, str(ex), "invalid_request_error")
             except Exception as ex:                   # noqa: BLE001 -- re-raised
                 # prepare() raises more than those three. render_prompt runs the
@@ -759,19 +798,20 @@ def create_app(config: ServerConfig | None = None, engine=None) -> FastAPI:
                 # the default for exactly that reason, and generate() files
                 # this same failure as "error" on the non-streaming path (V1).
                 _refusal_row(e, req, type(ex).__name__, str(ex), stream=True,
-                             finish="error")
+                             finish="error", meter=meter)
                 raise
             return StreamingResponse(
-                _sse(e, req, _served_name(app), warning, CancelToken(),
+                _sse(e, req, _served_name(app), warning, CancelToken(meter),
                      session_id=req.session_key, prepared=prepared,
                      scheduler=app.state.scheduler,
-                     keepalive_s=getattr(cfg, "sse_keepalive_s", 0.0)),
+                     keepalive_s=getattr(cfg, "sse_keepalive_s", 0.0),
+                     meter=meter),
                 media_type="text/event-stream",
                 headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no",
                          **_session_header(req)},
                 background=_after_response(e))
 
-        cancel = CancelToken()
+        cancel = CancelToken(meter)
         watchdog = asyncio.create_task(_watch_disconnect(request, cancel))
         result, error = None, None
         # Set once a real ENGINE item arrives. prepare() now runs directly
@@ -794,6 +834,9 @@ def create_app(config: ServerConfig | None = None, engine=None) -> FastAPI:
                       prompt_ids=prepared[0], cap=prepared[1], cancel=cancel)
             job.prepared = prepared
             job.stream = False
+            # How the id and the meter reach generate()'s row: the serial hop
+            # passes `req`, `cancel` and `prepared`, not the Job itself.
+            job.meter = meter
             await app.state.scheduler.submit(job)
             # Consume to completion: a second admission path could run a
             # generation concurrently with the dispatcher's, on an engine that
@@ -827,13 +870,14 @@ def create_app(config: ServerConfig | None = None, engine=None) -> FastAPI:
             # no dispatcher is live to drain it (stopped, or its task died) --
             # either way the honest answer is the same 503 e.slot() used to
             # give for a full queue.
-            _refusal_row(e, req, "QueueFull", str(ex), stream=False)
+            _refusal_row(e, req, "QueueFull", str(ex), stream=False, meter=meter)
             return _error(503, str(ex), "server_busy", headers={"Retry-After": "5"})
         except (ContextTooLong, TemplateLacksToolSupport, NoChatTemplate) as ex:
             # Only prepare() raises these, and prepare() runs before submit() --
             # so `submitted` is always False here. This row is the only one
             # this request will ever get.
-            _refusal_row(e, req, type(ex).__name__, str(ex), stream=False)
+            _refusal_row(e, req, type(ex).__name__, str(ex), stream=False,
+                         meter=meter)
             return _error(400, str(ex), "invalid_request_error")
         except Exception as ex:                       # noqa: BLE001
             # `engine_owns_the_row` tells the three remaining sources apart:
@@ -847,7 +891,7 @@ def create_app(config: ServerConfig | None = None, engine=None) -> FastAPI:
             # second one here would double-count.
             if not engine_owns_the_row:
                 _refusal_row(e, req, type(ex).__name__, str(ex), stream=False,
-                             finish="error")
+                             finish="error", meter=meter)
             return _error(500, f"{type(ex).__name__}: {ex}", "internal_error")
         except BaseException as ex:                   # noqa: BLE001 -- re-raised
             # `_sse` has had this clause all along; this route did not, so a
@@ -863,7 +907,8 @@ def create_app(config: ServerConfig | None = None, engine=None) -> FastAPI:
                                             asyncio.CancelledError))
                 _refusal_row(e, req, None if cancelled else type(ex).__name__,
                              None if cancelled else str(ex), stream=False,
-                             finish="cancelled" if cancelled else "error")
+                             finish="cancelled" if cancelled else "error",
+                             meter=meter)
             raise
         finally:
             watchdog.cancel()
@@ -877,7 +922,8 @@ def create_app(config: ServerConfig | None = None, engine=None) -> FastAPI:
             # token count for. Nothing else ever ran for this job -- no
             # generate() call, no row -- so it is this frame's to write, same
             # as the streaming route's `_sse` does for the identical drop.
-            _refusal_row(e, req, None, None, stream=False, finish="cancelled")
+            _refusal_row(e, req, None, None, stream=False, finish="cancelled",
+                         meter=meter)
             print("[Vaayu-Server] client disconnected before this request ran")
             return _error(499, "client closed the connection; generation was "
                                "stopped", "client_closed_request")
@@ -891,7 +937,9 @@ def create_app(config: ServerConfig | None = None, engine=None) -> FastAPI:
                                "stopped", "client_closed_request")
 
         body = ChatCompletionResponse(
-            id=make_completion_id(), created=int(time.time()),
+            # The id the row and the session log already carry -- minting a
+            # second one here is what made the client's id join nothing.
+            id=meter.id, created=int(time.time()),
             model=_served_name(app),
             choices=[Choice(
                 index=0,
@@ -922,6 +970,11 @@ def _chunk(cid, created, model_name, *, delta, finish=None, usage=None,
     return f"data: {json.dumps(body)}\n\n"
 
 
+# The end-of-stream event, named because every exit yields it and each one
+# also records it on the meter.
+_DONE = "data: [DONE]\n\n"
+
+
 def _error_event(ex, kind: str = "internal_error") -> str:
     payload = {"error": {"message": f"{type(ex).__name__}: {ex}",
                          "type": kind}}
@@ -929,13 +982,18 @@ def _error_event(ex, kind: str = "internal_error") -> str:
 
 
 async def _sse(engine, req, model_name, warning, cancel=None, session_id=None,
-               prepared=None, scheduler=None, keepalive_s=0.0):
+               prepared=None, scheduler=None, keepalive_s=0.0, meter=None):
     """OpenAI-shaped SSE. Content streams; a tool call is BUFFERED and emitted
     once, complete -- partial tool-call JSON breaks clients that parse each
     delta, and the gain from streaming it is nil."""
-    cid, created = make_completion_id(), int(time.time())
+    # The id the ROUTE minted, so this request's chunks, its row and its
+    # session-log lines all carry one string. A caller with no meter (another
+    # caller of `_sse`, this file's own tests) still gets an id, but nothing
+    # joins to it.
+    cid = meter.id if meter is not None else make_completion_id()
+    created = int(time.time())
     if cancel is None:
-        cancel = CancelToken()
+        cancel = CancelToken(meter)
 
     fmt = engine.tool_format if req.tools else None
     open_marker = fmt.open_marker if fmt is not None else None
@@ -949,6 +1007,81 @@ async def _sse(engine, req, model_name, warning, cancel=None, session_id=None,
     # tool-call heartbeat below, which is the one window where the engine is
     # producing normally and the wire is nonetheless silent.
     last_write = time.monotonic()
+
+    def _wrote(s):
+        """Record one data chunk on the meter, AFTER the `yield` wrote it.
+
+        After, because a yield that never returns is a client that went away
+        mid-write, and those bytes never left this frame. One helper because
+        `meter=None` is legal -- `_sse` has callers with no socket -- and a
+        guard forgotten at one of fifteen chunk sites is an AttributeError on
+        the generation path. The comment and heartbeat sites guard inline:
+        which of the three a write is decides whether it ends a silence span,
+        so it is not a detail to hide behind a default.
+        """
+        if meter is not None:
+            meter.note_chunk(len(s))
+
+    # The live warning: ONE per request, not per span -- a per-span line would
+    # become the flood it reports (`logs.session_event` warns once per process
+    # for the same reason). A print, so the stdout pump timestamps it, keeps it
+    # in server.log and `note_if_warning` harvests its headline into env.json
+    # (see the two prints below for why only the headline). The floor
+    # on the threshold exists because `keepalive_s == 0` means "off", and
+    # `3 * 0` would warn on every span.
+    #
+    # BEST-EFFORT, NOT A WATCHDOG: it is only evaluated where this frame wakes,
+    # and the silence it measures is the span since the last data CHUNK
+    # (comments do not end it). That leaves two places it can really fire:
+    #   (a) the prefill/queue window with keepalive ON -- the timeout branch
+    #       wakes every `keepalive_s` and writes only COMMENTS, so the span
+    #       keeps growing past the threshold;
+    #   (b) the buffered tool-call window with keepalive OFF -- each arriving
+    #       token wakes the check, and nothing writes a chunk.
+    # The buffered check does NOT fire with keepalive ON: heartbeat chunks reset
+    # the span every `keepalive_s`, and the threshold `max(3*keepalive_s, 45)`
+    # is always above that, so it is dead code in practice under the default
+    # config. Debug (a), not the buffered branch, for a keepalive-on warning.
+    # With keepalive off `job.out.get()` has no timeout, so an empty-queue
+    # silence has no wakeup to print from at all. That is a limit of the
+    # design, not a bug (tests/test_server_app.py pins it).
+    silence_warn_s = max(3 * (keepalive_s or 0.0), 45.0)
+    silence_warned = False
+
+    def _warn_if_silent():
+        nonlocal silence_warned
+        if silence_warned or meter is None:
+            return
+        try:
+            quiet_s, held = meter.open_silence()
+            if quiet_s >= silence_warn_s:
+                silence_warned = True
+                # TWO lines, and the split is not cosmetic. `logs.note_if_warning`
+                # harvests every line containing "warning" into `env.json`,
+                # dedupes on the EXACT message and drops the NEWEST past
+                # `_WARNING_LIMIT` (200). A headline carrying `meter.id` and
+                # the elapsed seconds can never dedupe, so ~200 stalled
+                # requests would fill that buffer and no further warning of
+                # any kind -- APST, foreign-GPU, anything -- would be recorded
+                # for the rest of the run. So the harvested headline is
+                # request-INDEPENDENT (one entry however many requests stall),
+                # and the per-request numbers go on a second line that must
+                # NOT contain the word "warning", or it is harvested too. The
+                # id and the numbers are not lost: this line is stamped into
+                # `server.log` by the stdout pump, and the row carries
+                # `max_silence_s` and `tokens_held_at_max_silence`.
+                print(f"[Vaayu-Server] WARNING: a stream has sent no data "
+                      f"chunk for longer than the {silence_warn_s:.0f} s "
+                      f"threshold, max(3 x SSE_KEEPALIVE_S, 45 s). Decode may "
+                      f"be healthy; a client with a chunk timeout shorter "
+                      f"than this will give up. Printed once per request; the "
+                      f"line below names the request and its numbers.")
+                print(f"[Vaayu-Server] quiet stream {meter.id}: no data chunk "
+                      f"for {quiet_s:.0f} s with {held} tokens generated and "
+                      f"held meanwhile (threshold {silence_warn_s:.0f} s).")
+        except Exception:                       # noqa: BLE001 -- logging only
+            pass
+
     # Everything already delivered as a content delta. The final event carries
     # the CLEANED text -- prose before the call plus whatever followed it -- and
     # the tail of that was never sent (B15), so the emitter needs to know where
@@ -976,12 +1109,23 @@ async def _sse(engine, req, model_name, warning, cancel=None, session_id=None,
         # queued caller tell "waiting behind N requests" from "hung". These
         # three yields are INSIDE the try because a disconnect suspended on
         # any of them is exactly the unowned window described above.
-        yield f": vaayu queue position {scheduler.depth}\n\n"
+        pos = f": vaayu queue position {scheduler.depth}\n\n"
+        yield pos
+        # The FIRST write of the frame, and what gives this request a `wire`
+        # block at all -- including a request that dies in the unowned window
+        # below, whose row `_sse` itself writes.
+        if meter is not None:
+            meter.note_comment(len(pos))
         if warning:
-            yield f": warning {warning}\n\n"
+            warn_line = f": warning {warning}\n\n"
+            yield warn_line
+            if meter is not None:
+                meter.note_comment(len(warn_line))
 
-        yield _chunk(cid, created, model_name, session_id=session_id,
-                     delta={"role": "assistant"})
+        ev = _chunk(cid, created, model_name, session_id=session_id,
+                    delta={"role": "assistant"})
+        yield ev
+        _wrote(ev)
 
         # Submitted HERE, not in the route: this generator body runs after the
         # handler returned, so a job submitted around that return would sit
@@ -991,6 +1135,10 @@ async def _sse(engine, req, model_name, warning, cancel=None, session_id=None,
                   prompt_ids=prepared[0], cap=prepared[1], cancel=cancel)
         job.prepared = prepared
         job.stream = True
+        # Same hand-off as the non-streaming route's: the serial hop passes
+        # `req`, `cancel` and `prepared`, so the Job is how the meter reaches
+        # engine.stream() and the row it writes.
+        job.meter = meter
         await scheduler.submit(job)
         while True:
             if keepalive_s and keepalive_s > 0:
@@ -1005,14 +1153,25 @@ async def _sse(engine, req, model_name, warning, cancel=None, session_id=None,
                 try:
                     item = await asyncio.wait_for(job.out.get(), keepalive_s)
                 except asyncio.TimeoutError:
+                    _warn_if_silent()
                     # A comment is enough while the client is still waiting for
                     # the answer to START -- but once a tool call is being
                     # buffered the client is mid-answer and counting CHUNKS, so
                     # the same silence has to be broken with one (see below).
-                    yield (_chunk(cid, created, model_name, session_id=session_id,
-                                  delta={"content": ""}) if suppressing
-                           else ": keepalive\n\n")
+                    beat = (_chunk(cid, created, model_name,
+                                   session_id=session_id,
+                                   delta={"content": ""}) if suppressing
+                            else ": keepalive\n\n")
+                    yield beat
                     last_write = time.monotonic()
+                    if meter is not None:
+                        # A chunk mid-answer, a comment while the client is
+                        # still waiting for it to start -- and only the chunk
+                        # ends a silence span.
+                        if suppressing:
+                            meter.note_heartbeat(len(beat))
+                        else:
+                            meter.note_comment(len(beat))
                     continue
             else:
                 item = await job.out.get()
@@ -1050,6 +1209,8 @@ async def _sse(engine, req, model_name, warning, cancel=None, session_id=None,
                 break
             if suppressing:
                 buffered += payload
+                if meter is not None:
+                    meter.note_buffered_bytes(len(payload))
                 # From the open marker to the final event nothing above is
                 # yielded, so a tool call whose body takes minutes to generate
                 # leaves the wire silent for minutes while decode is healthy --
@@ -1061,11 +1222,18 @@ async def _sse(engine, req, model_name, warning, cancel=None, session_id=None,
                 # seconds" does not count SSE comments. Empty content, so it
                 # can neither end the stream (that shape is `delta == {}` plus
                 # a finish_reason) nor change the assembled answer.
+                # Before the heartbeat below: a heartbeat is a chunk and ends
+                # the span this reads -- which is also why this call can only
+                # fire with keepalive OFF (see the comment at `silence_warn_s`).
+                _warn_if_silent()
                 if keepalive_s and keepalive_s > 0 \
                         and time.monotonic() - last_write >= keepalive_s:
-                    yield _chunk(cid, created, model_name, session_id=session_id,
-                                 delta={"content": ""})
+                    beat = _chunk(cid, created, model_name,
+                                  session_id=session_id, delta={"content": ""})
+                    yield beat
                     last_write = time.monotonic()
+                    if meter is not None:
+                        meter.note_heartbeat(len(beat))
                 continue
             held += payload
             if open_marker and open_marker in held:
@@ -1075,10 +1243,15 @@ async def _sse(engine, req, model_name, warning, cancel=None, session_id=None,
                 cut = held.index(open_marker)
                 if held[:cut]:
                     sent += held[:cut]
-                    yield _chunk(cid, created, model_name, session_id=session_id,
-                                 delta={"content": held[:cut]})
+                    ev = _chunk(cid, created, model_name, session_id=session_id,
+                                delta={"content": held[:cut]})
+                    yield ev
                     last_write = time.monotonic()
+                    _wrote(ev)
                 held, buffered, suppressing = "", held[cut:], True
+                if meter is not None:
+                    meter.note_buffering_open()
+                    meter.note_buffered_bytes(len(buffered))
                 continue
             # Hold back a marker-length tail so an open marker split
             # across two chunks is still recognised.
@@ -1086,8 +1259,10 @@ async def _sse(engine, req, model_name, warning, cancel=None, session_id=None,
             if len(held) > keep:
                 emit, held = held[:len(held) - keep], held[len(held) - keep:]
                 sent += emit
-                yield _chunk(cid, created, model_name, session_id=session_id, delta={"content": emit})
+                ev = _chunk(cid, created, model_name, session_id=session_id, delta={"content": emit})
+                yield ev
                 last_write = time.monotonic()
+                _wrote(ev)
     except QueueFull as ex:
         # The route's eager depth check turns the ordinary full queue into a
         # real 503; this is the admission race it cannot see. The headers are
@@ -1100,21 +1275,30 @@ async def _sse(engine, req, model_name, warning, cancel=None, session_id=None,
         # runs. Without this row the request that lost the admission race is
         # the one kind of request that ends with no row at all.
         owed = ("QueueFull", str(ex), "refused")
-        yield _error_event(ex, "server_busy")
-        yield "data: [DONE]\n\n"
+        ev = _error_event(ex, "server_busy")
+        yield ev
+        _wrote(ev)
+        yield _DONE
+        _wrote(_DONE)
         return
     except (ContextTooLong, TemplateLacksToolSupport, NoChatTemplate) as ex:
         # Unreachable from the route, which now prepares before responding.
         # Kept for any other caller of _sse, and so this class of error is
         # never again reported as a fault of the server's.
         owed = (type(ex).__name__, str(ex), "refused")
-        yield _error_event(ex, "invalid_request_error")
-        yield "data: [DONE]\n\n"
+        ev = _error_event(ex, "invalid_request_error")
+        yield ev
+        _wrote(ev)
+        yield _DONE
+        _wrote(_DONE)
         return
     except Exception as ex:                            # noqa: BLE001
         owed = (type(ex).__name__, str(ex), "error")
-        yield _error_event(ex)
-        yield "data: [DONE]\n\n"
+        ev = _error_event(ex)
+        yield ev
+        _wrote(ev)
+        yield _DONE
+        _wrote(_DONE)
         return
     except BaseException as ex:                        # noqa: BLE001 -- re-raised
         # GeneratorExit (Starlette closing an abandoned stream) and
@@ -1126,11 +1310,23 @@ async def _sse(engine, req, model_name, warning, cancel=None, session_id=None,
                 "cancelled" if isinstance(ex, (GeneratorExit,
                                                asyncio.CancelledError))
                 else "error")
+        # Once the engine owns the row this frame will not write it, so the
+        # reason is noted here for ITS row to read. Before the handover
+        # `_refusal_row` notes `abandoned_queued` instead.
+        # Guarded: a raise here would replace the propagating GeneratorExit.
+        if owed[2] == "cancelled" and engine_owns_the_row and meter is not None:
+            try:
+                meter.note_cancel("stream_closed")
+            except Exception:                   # noqa: BLE001 -- logging only
+                pass
         raise
     finally:
         # Starlette closes this generator when the client goes away, so this is
         # where an abandoned SSE stream stops generating. Cancelling after a
         # normal finish is harmless -- the token is already spent.
+        # A reason passed here would be observable only on rows written AFTER
+        # this `finally`: an engine row for a run that finished is already on
+        # disk by now. Reasons belong at the cancel site, not here.
         cancel.cancel()
         # Guarded on the handover, not on the exception type: once
         # engine.stream owns the row, writing one here would DOUBLE-count the
@@ -1138,18 +1334,22 @@ async def _sse(engine, req, model_name, warning, cancel=None, session_id=None,
         # row is unaffected by moving it into this branch.
         if owed is not None and not engine_owns_the_row:
             _refusal_row(engine, req, owed[0], owed[1], stream=True,
-                         finish=owed[2])
+                         finish=owed[2], meter=meter)
 
     if held and not suppressing:
-        yield _chunk(cid, created, model_name, session_id=session_id, delta={"content": held})
+        ev = _chunk(cid, created, model_name, session_id=session_id, delta={"content": held})
+        yield ev
+        _wrote(ev)
 
     if suppressing and not (final is not None and final.tool_calls):
         # The marker did not open a tool call after all -- it was ordinary text
         # (a ```json code answer, or a marked block whose JSON did not parse,
         # which the non-streaming path also returns verbatim). Emitting it here
         # rather than dropping it is the whole point of buffering.
-        yield _chunk(cid, created, model_name, session_id=session_id,
-                     delta={"content": buffered})
+        ev = _chunk(cid, created, model_name, session_id=session_id,
+                    delta={"content": buffered})
+        yield ev
+        _wrote(ev)
 
     if final is not None and final.tool_calls:
         # The prose that FOLLOWED the call. It is in `final.text` -- which the
@@ -1167,19 +1367,26 @@ async def _sse(engine, req, model_name, warning, cancel=None, session_id=None,
         text = final.text or ""
         pending = text[len(head):] if text.startswith(head) else ""
         if pending:
-            yield _chunk(cid, created, model_name, session_id=session_id,
-                         delta={"content": pending})
-        yield _chunk(cid, created, model_name, session_id=session_id, delta={"tool_calls": final.tool_calls})
+            ev = _chunk(cid, created, model_name, session_id=session_id,
+                        delta={"content": pending})
+            yield ev
+            _wrote(ev)
+        ev = _chunk(cid, created, model_name, session_id=session_id, delta={"tool_calls": final.tool_calls})
+        yield ev
+        _wrote(ev)
 
     usage = None
     if final is not None and req.stream_options and req.stream_options.include_usage:
         usage = Usage(prompt_tokens=final.prompt_tokens,
                       completion_tokens=final.completion_tokens,
                       total_tokens=final.prompt_tokens + final.completion_tokens)
-    yield _chunk(cid, created, model_name, session_id=session_id, delta={},
-                 # No final event means the stream did not run to completion.
-                 # "stop" there would tell the client its truncated answer is
-                 # whole -- the same lie B5 fixed inside the engine.
-                 finish=(final.finish_reason if final is not None else "length"),
-                 usage=usage)
-    yield "data: [DONE]\n\n"
+    ev = _chunk(cid, created, model_name, session_id=session_id, delta={},
+                # No final event means the stream did not run to completion.
+                # "stop" there would tell the client its truncated answer is
+                # whole -- the same lie B5 fixed inside the engine.
+                finish=(final.finish_reason if final is not None else "length"),
+                usage=usage)
+    yield ev
+    _wrote(ev)
+    yield _DONE
+    _wrote(_DONE)

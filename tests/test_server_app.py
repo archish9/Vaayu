@@ -21,7 +21,13 @@ _PREPARE_ERRORS = (ContextTooLong, TemplateLacksToolSupport, NoChatTemplate)
 class FakeEngine:
     """Implements only what app.py touches."""
 
-    def __init__(self, result=None, raises=None, deltas=None, delta_delay=0.0):
+    def __init__(self, result=None, raises=None, deltas=None, delta_delay=0.0,
+                 delta_gap=0.0):
+        # Seconds between deltas. 0 lets this fake run ahead of `_sse`, so the
+        # whole stream is produced before the first byte is parsed -- fine for
+        # byte accounting, wrong for anything that needs to know how many
+        # tokens existed WHEN the buffer opened.
+        self.delta_gap = delta_gap
         # Seconds to sleep before the FIRST delta -- models the prefill gap
         # (TTFT) during which _sse waits on an empty job.out and must emit
         # keepalive comments so a proxy/tunnel idle timer does not fire.
@@ -42,6 +48,7 @@ class FakeEngine:
         self.tool_format = None
         self.cancel = None          # the CancelToken the route handed us
         self.cancelled_all = False  # set by shutdown
+        self.wire_row = None        # meter.row() as of row-writing time
         # BatchScheduler._run holds this for a whole batch/serial run -- the
         # real EngineHandle's own lock, which app.py's routes no longer touch
         # directly now that admission goes through the scheduler (P10).
@@ -71,21 +78,37 @@ class FakeEngine:
 
         return _Slot()
 
-    async def generate(self, req, cancel=None, prepared=None):
+    async def generate(self, req, cancel=None, prepared=None, meter=None):
         self.cancel = cancel
         if self._raises is not None and not isinstance(self._raises, QueueFull):
             raise self._raises
         return self._result
 
-    async def stream(self, req, cancel=None, prepared=None):
+    async def stream(self, req, cancel=None, prepared=None, meter=None):
         self.cancel = cancel
-        if self._raises is not None and not isinstance(self._raises, QueueFull):
-            raise self._raises
-        if self.delta_delay:
-            await asyncio.sleep(self.delta_delay)
-        for d in self._deltas:
-            yield ("delta", d)
-        yield ("final", self._result)
+        try:
+            if self._raises is not None and not isinstance(self._raises, QueueFull):
+                raise self._raises
+            if self.delta_delay:
+                await asyncio.sleep(self.delta_delay)
+            produced = 0
+            for d in self._deltas:
+                produced += 1
+                if meter is not None:
+                    # As engine.stream does, before the delta is yielded.
+                    meter.note_tokens(produced)
+                yield ("delta", d)
+                if self.delta_gap:
+                    await asyncio.sleep(self.delta_gap)
+            yield ("final", self._result)
+        finally:
+            # Where the REAL `EngineHandle.stream` writes its row: its own
+            # `finally` calls `_write_request_row(..., meter=meter)`, which
+            # reads `meter.row()`. Snapshotting the same call here is what
+            # lets a test below see the `wire` block as the row carries it --
+            # chunks after this point are the post-row tail the spec
+            # documents, and this fake writes no row of its own.
+            self.wire_row = meter.row() if meter is not None else None
 
     def cancel_all(self):
         self.cancelled_all = True
@@ -342,7 +365,11 @@ def _minimax_fmt():
 _BUFFERING_FORMATS = {
     "hermes": (_HERMES, ["<tool_call>", '{"name":"f",', '"arguments":', '{"a":1}}']),
     "minimax_xml": (_minimax_fmt(), ["<minimax:", 'tool_call>\n<invoke name="f">',
-                                     '<parameter name="a">', "1</parameter>"]),
+                                     '<parameter name="a">', "1</parameter>",
+                                     # Filler: enough buffered deltas that a
+                                     # per-check warning is distinguishable
+                                     # from a per-request one on this grammar.
+                                     '<parameter name="b">', "2</parameter>"]),
 }
 
 
@@ -384,11 +411,12 @@ class _TickingClock:
     no time passing at all).
     """
 
-    def __init__(self):
+    def __init__(self, step=1.0):
         self._t = 0.0
+        self._step = step
 
     def monotonic(self):
-        self._t += 1.0
+        self._t += self._step
         return self._t
 
     def time(self):
@@ -436,6 +464,234 @@ def test_the_buffered_tool_call_heartbeat_is_off_when_keepalive_is_off(monkeypat
         r = c.post("/v1/chat/completions", json=_TOOL_BODY)
     events = _sse_events(r.text)
     assert _span_between_prose_and_call(events) == []
+
+
+# ── what the row says about the wire (run E's own numbers) ──────────────────
+
+
+def _metered_clock(monkeypatch, step=1.0):
+    """One ticking clock driving BOTH `app.time` and the route's `WireMeter`,
+    and the list of meters the route minted.
+
+    `wire.WireMeter` binds `time.monotonic` as a DEFAULT ARGUMENT and the
+    route constructs it with no `clock=`, so patching neither `app.time` nor
+    `wire.time` reaches the meter -- and production must not grow a test hook
+    to make this easier. The route looks the CLASS up as a module global, so
+    replacing that name is where a test clock gets in.
+
+    Driving the clock rather than sleeping is what makes these tests
+    deterministic: the fake engine runs ahead and the whole buffered span
+    drains with no wall time passing at all (`_TickingClock`'s docstring).
+    """
+    from vaayu.server import app as app_module
+    from vaayu.server.wire import WireMeter
+
+    clock, meters = _TickingClock(step), []
+
+    def mint(rid, **kw):
+        meters.append(WireMeter(rid, clock=clock.monotonic, **kw))
+        return meters[-1]
+
+    monkeypatch.setattr(app_module, "time", clock)
+    monkeypatch.setattr(app_module, "WireMeter", mint)
+    return meters
+
+
+def test_a_disconnect_says_client_disconnected_and_how_long_it_had_been_quiet():
+    # "It timed out" vs "someone pressed stop" is the whole point of the pair:
+    # the reason is the cause, the quiet span is the evidence. Driven through
+    # the real watcher and token with an injected clock, so no sleeping.
+    from vaayu.server.app import _watch_disconnect
+    from vaayu.server.engine import CancelToken
+    from vaayu.server.wire import WireMeter, cancel_fields
+
+    clock = _TickingClock()
+    meter = WireMeter("chatcmpl-x", clock=clock.monotonic)   # t0 = 1
+    meter.note_chunk(10)                                      # last chunk at 2
+    token = CancelToken(meter)
+
+    class _Gone:
+        async def is_disconnected(self):
+            return True
+
+    asyncio.run(_watch_disconnect(_Gone(), token))
+    assert token.cancelled
+    fields = cancel_fields(meter)
+    assert fields["cancel_reason"] == "client_disconnected"
+    assert fields["cancel_detected_at_s"] == 2.0     # arrival 1, cancel read 3
+    assert fields["s_since_last_chunk"] == 1.0       # chunk at 2, cancel at 3
+    # Later teardown of the abandoned stream must not relabel the cause.
+    meter.note_cancel("stream_closed")
+    assert cancel_fields(meter)["cancel_reason"] == "client_disconnected"
+
+
+def test_cancel_all_says_shutdown_on_the_meter():
+    from vaayu.server.engine import CancelToken, EngineHandle
+    from vaayu.server.wire import WireMeter
+
+    meter = WireMeter("chatcmpl-x")
+    e = EngineHandle.__new__(EngineHandle)
+    e._live_cancels = [CancelToken(meter)]
+    e.cancel_all()
+    assert meter.cancel_reason == "shutdown"
+
+
+@pytest.mark.parametrize("fmt_key", sorted(_BUFFERING_FORMATS))
+def test_the_row_reports_the_wire_silence_of_a_long_buffered_tool_call(
+        monkeypatch, fmt_key):
+    """The run-E acceptance test.
+
+    That request's row read healthy on every engine-side number -- 629 tokens,
+    1.911 tok/s, `io_wait` 0.0 s per token -- while the client got nothing for
+    300 s and timed out. The row must now carry what the SOCKET did, and the
+    counts must match the bytes that actually went out: a `yield` whose
+    recording was forgotten shows up here as an off-by-one.
+    """
+    meters = _metered_clock(monkeypatch)
+    engine = _buffered_tool_call_engine(fmt_key)
+    with _live_client(engine=engine, sse_keepalive_s=0.5) as c:
+        r = c.post("/v1/chat/completions", json=_TOOL_BODY)
+    assert r.status_code == 200
+    # As of ROW time, which is what reaches `requests.jsonl`. The fake engine
+    # snapshots `meter.row()` where the real one writes its row.
+    assert engine.wire_row is not None, "a streaming row must carry a wire block"
+    assert engine.wire_row["max_silence_s"] > 0
+    assert engine.wire_row["chunks_sent"] >= 1
+    # >= 1, not >= 0: the queue-position line is already out by row time, and
+    # a non-negative counter cannot fail the weaker form.
+    assert engine.wire_row["comments_sent"] >= 1
+    # The whole frame, against the body the client actually received. The fake
+    # engine finishes before `_sse` drains it -- a real one is the slow part --
+    # so the row-time snapshot above is early, and this is where every write
+    # site is accounted for.
+    wire = meters[-1].row()
+    lines = r.text.splitlines()
+    assert wire["chunks_sent"] == len([l for l in lines if l.startswith("data: ")])
+    assert wire["comments_sent"] == len([l for l in lines if l.startswith(": ")])
+    assert wire["bytes_sent"] == len(r.text)
+    assert wire["heartbeats_sent"] == len(
+        _span_between_prose_and_call(_sse_events(r.text)))
+    # Dated, so a reader can place the span against `first_chunk_s`.
+    assert wire["max_silence_at_s"] is not None
+    assert wire["last_chunk_s"] >= wire["first_chunk_s"]
+
+
+@pytest.mark.parametrize("fmt_key", sorted(_BUFFERING_FORMATS))
+def test_the_row_says_how_many_tokens_sat_in_the_buffer(monkeypatch, fmt_key):
+    """Run E's other half: not just that the wire went quiet, but that
+    620 tokens sat in the buffer while it did. 24 more deltas arrive inside
+    the buffer here, one token each, and no heartbeat breaks the span.
+
+    The engine is paced (`delta_gap`): an unpaced fake finishes before `_sse`
+    reads its first delta, so every token already exists when the buffer
+    opens and the held count is a vacuous 0."""
+    meters = _metered_clock(monkeypatch)
+    engine = _buffered_tool_call_engine(fmt_key, delta_gap=0.02)
+    engine._deltas = engine._deltas + ["tok"] * 24
+    with _live_client(engine=engine, sse_keepalive_s=100) as c:
+        r = c.post("/v1/chat/completions", json=_TOOL_BODY)
+    assert r.status_code == 200
+    wire = meters[-1].row()
+    buf = wire["buffering"]
+    assert wire["heartbeats_sent"] == 0
+    # Properties, not boundaries: `note_tokens` runs on the engine side and
+    # `note_buffering_open` on the `_sse` side, so under load the engine can
+    # push more deltas before the marker is handled. The exact token
+    # semantics are pinned deterministically in tests/test_wire_meter.py.
+    assert buf is not None
+    assert 1 <= buf["opened_at_token"] < 10
+    assert buf["tokens_buffered"] > 0
+    assert wire["tokens_held_at_max_silence"] > 0
+    assert buf["bytes_buffered"] > 0
+
+
+def test_tokens_held_follows_the_token_ids_not_the_delta_count():
+    """Speculative / prompt-lookup decode (`use_prompt_lookup` defaults to
+    auto) delivers a whole accepted run as ONE delta, so counting deltas
+    under-reports. Through the REAL `EngineHandle.stream`: 3 deltas whose
+    `new_ids` advance 4 at a time must read 12 held, not 3."""
+    import itertools
+
+    import vaayu.streaming as streaming_mod
+    from vaayu.server.engine import EngineHandle
+    from vaayu.server.schemas import ChatCompletionRequest
+    from vaayu.server.wire import WireMeter
+    from .test_server_engine import FakeModel, _CountingTokenizer, _Config
+
+    model = FakeModel(max_seq_len=100)
+    model.tokenizer = _CountingTokenizer()
+    model.config = _Config(2)
+
+    def fake(m, input_ids, max_new_tokens=None, token_ids_out=None, **kw):
+        for i in range(3):
+            token_ids_out.extend([10 + 4 * i + j for j in range(4)])
+            yield "a b c d "
+
+    real = streaming_mod.stream_generate
+    streaming_mod.stream_generate = fake
+    try:
+        ticks = itertools.count()
+        meter = WireMeter("chatcmpl-x", clock=lambda: float(next(ticks)))
+        meter.note_chunk(10)    # the wire is quiet from here (tokens: 0)
+
+        async def run():
+            req = ChatCompletionRequest(
+                model="v", max_tokens=50,
+                messages=[{"role": "user", "content": "hi"}])
+            return [k async for k, _ in EngineHandle(model).stream(req, meter=meter)]
+
+        kinds = asyncio.run(run())
+    finally:
+        streaming_mod.stream_generate = real
+    assert kinds.count("delta") == 3
+    assert meter.row()["tokens_held_at_max_silence"] == 12
+
+
+@pytest.mark.parametrize("fmt_key", sorted(_BUFFERING_FORMATS))
+def test_the_quiet_the_row_reports_is_the_buffered_one_not_the_startup_wait(
+        monkeypatch, fmt_key):
+    """Run E's signature: a span that begins AFTER the answer started.
+
+    A cold prefill is legitimately silence too (the run-D class, 26 s on a
+    cold MiniMax load), so a row that only ever reported the wait for the
+    first chunk would describe every slow load and never this. The keepalive
+    interval here is longer than the whole buffered body, so no heartbeat
+    intervenes -- the pre-`656e3e2` wire, which is what run E had.
+    """
+    meters = _metered_clock(monkeypatch)
+    engine = _buffered_tool_call_engine(fmt_key)
+    # Run E's shape: 620 more tokens generated INSIDE the buffer. Each delta
+    # there costs a clock reading and emits nothing, so the span grows exactly
+    # as that one did. They are discarded with the rest of the buffer once the
+    # final event says a tool call was parsed, so the answer is unchanged.
+    engine._deltas = engine._deltas + ["tok"] * 24
+    with _live_client(engine=engine, sse_keepalive_s=100) as c:
+        r = c.post("/v1/chat/completions", json=_TOOL_BODY)
+    assert r.status_code == 200
+    wire = meters[-1].row()
+    assert wire["heartbeats_sent"] == 0, "no beat may break the span under test"
+    assert wire["max_silence_at_s"] >= wire["first_chunk_s"]
+    assert wire["max_silence_s"] > wire["first_chunk_s"]
+    assert _streamed_content(_sse_events(r.text)) == "ok "
+
+
+@pytest.mark.parametrize("fmt_key", sorted(_BUFFERING_FORMATS))
+def test_silence_is_still_measured_when_keepalive_is_off(monkeypatch, fmt_key):
+    """`SSE_KEEPALIVE_S = 0` turns the heartbeat off. It must not turn
+    MEASUREMENT off, or the one configuration most likely to strand a client
+    is the one whose rows say nothing about it (Review Focus 2)."""
+    meters = _metered_clock(monkeypatch)
+    engine = _buffered_tool_call_engine(fmt_key)
+    with _live_client(engine=engine, sse_keepalive_s=0) as c:
+        r = c.post("/v1/chat/completions", json=_TOOL_BODY)
+    assert r.status_code == 200
+    wire = meters[-1].row()
+    assert wire["heartbeats_sent"] == 0 and wire["max_silence_s"] > 0
+    # The queue-position line is the only comment with the keepalive off --
+    # and it is the FIRST write of the frame, which is what gives even a
+    # request that dies before its first chunk a wire block at all.
+    assert wire["comments_sent"] == 1
+    assert engine.wire_row is not None
 
 
 def test_the_last_stream_event_carries_the_finish_reason():
@@ -899,3 +1155,106 @@ def test_engine_handle_forwards_decode_top_k_status():
         "mode": "p", "value": 0.9, "cost": 0.0176, "source": "measured"})
     assert EngineHandle.decode_top_k_status(SimpleNamespace(model=model))["mode"] == "p"
     assert EngineHandle.decode_top_k_status(SimpleNamespace(model=object()))["mode"] == "off"
+
+
+# ── the live warning: a long silence is visible while it is happening ───────
+
+# The HARVESTED headline: request-independent on purpose, so `note_if_warning`
+# collapses it to one `env.json` entry however many requests stall. The
+# per-request numbers are on the second line, which carries no "warning".
+_SILENT = "WARNING: a stream has sent no data chunk"
+_SILENT_DETAIL = "[Vaayu-Server] quiet stream "
+
+
+@pytest.mark.parametrize("fmt_key", sorted(_BUFFERING_FORMATS))
+def test_a_long_silence_warns_once_and_only_once(monkeypatch, capsys, fmt_key):
+    # 30 s per clock reading: each buffered delta is one check, and every check
+    # from the second on (60 s, 90 s, ...) is past the 45 s floor, on both
+    # grammars -- so a warning per check prints more than once on either. Once per REQUEST, not per span or
+    # per check -- the count is the assertion that carries weight, and it is
+    # what goes red if the latch in `_sse` is dropped.
+    _metered_clock(monkeypatch, step=30.0)
+    with _live_client(engine=_buffered_tool_call_engine(fmt_key),
+                      sse_keepalive_s=0) as c:
+        r = c.post("/v1/chat/completions", json=_TOOL_BODY)
+    assert r.status_code == 200
+    out = capsys.readouterr().out
+    assert out.count(_SILENT) == 1
+    line = next(l for l in out.splitlines() if _SILENT in l)
+    assert line.startswith("[Vaayu-Server] WARNING:")   # what note_if_warning keys on
+    # The numbers live on the companion line, which must stay unharvestable.
+    detail = next(l for l in out.splitlines() if _SILENT_DETAIL in l)
+    assert out.count(_SILENT_DETAIL) == 1
+    assert "no data chunk for" in detail and " s with " in detail
+    assert "tokens generated and held" in detail
+    assert "chatcmpl-" in detail
+    assert "warning" not in detail.lower()
+
+
+def test_the_silence_warning_collapses_to_one_env_json_entry(monkeypatch, capsys):
+    """`note_if_warning` dedupes on the EXACT message and drops the NEWEST
+    past `_WARNING_LIMIT` (200). A headline carrying the request id and the
+    elapsed seconds can never dedupe, so ~200 stalled requests would fill
+    `env.json`'s buffer and no further warning of ANY kind would be recorded
+    for the rest of the run -- every other warning in this codebase collapses
+    to one entry.
+
+    Reddened by either half of the split in `_sse`'s `_warn_if_silent`: put
+    the id or the seconds back on the headline and the two requests below
+    leave two entries; let the word "warning" into the detail line and it is
+    harvested per request too.
+    """
+    from vaayu.server import logs
+
+    _metered_clock(monkeypatch, step=30.0)
+    for _ in range(2):
+        with _live_client(engine=_buffered_tool_call_engine("hermes"),
+                          sse_keepalive_s=0) as c:
+            assert c.post("/v1/chat/completions", json=_TOOL_BODY).status_code == 200
+    lines = capsys.readouterr().out.splitlines()
+    headlines = [l for l in lines if _SILENT in l]
+    details = [l for l in lines if _SILENT_DETAIL in l]
+    assert len(headlines) == 2 and len(details) == 2    # one pair per request
+    assert len(set(headlines)) == 1, "the harvested text varies per request"
+    assert len(set(details)) == 2, "the detail must still name each request"
+    # Through the real harvester, as the pump feeds it: `<stamp> session=<id> `.
+    monkeypatch.setattr(logs, "_warnings", [])
+    for line in headlines + details:
+        logs.note_if_warning(f"2026-11-09T00:00:00.000Z session=s {line}\n")
+    assert logs.collected_warnings() == [headlines[0]]
+
+
+@pytest.mark.parametrize("fmt_key", sorted(_BUFFERING_FORMATS))
+def test_a_healthy_stream_warns_not_at_all(monkeypatch, capsys, fmt_key):
+    # Same stream, 1 s per reading: the longest span is far under the floor.
+    _metered_clock(monkeypatch, step=1.0)
+    with _live_client(engine=_buffered_tool_call_engine(fmt_key),
+                      sse_keepalive_s=0) as c:
+        c.post("/v1/chat/completions", json=_TOOL_BODY)
+    assert "WARNING" not in capsys.readouterr().out
+
+
+def test_the_warning_also_fires_from_the_keepalive_timeout(monkeypatch, capsys):
+    # The other wakeup: an empty queue (prefill) with keepalive ON. The fake
+    # engine waits 0.3 s against a 0.05 s keepalive, so the timeout branch runs
+    # several times -- the clock, not the sleep, supplies the 45 s.
+    _metered_clock(monkeypatch, step=30.0)
+    with _live_client(sse_keepalive_s=0.05, delta_delay=0.3) as c:
+        r = c.post("/v1/chat/completions", json=dict(BODY, stream=True))
+    assert ": keepalive" in r.text
+    assert capsys.readouterr().out.count(_SILENT) == 1
+
+
+def test_with_keepalive_off_the_warning_can_only_come_from_the_buffered_window(
+        monkeypatch, capsys):
+    # With keepalive 0, _sse awaits job.out.get() with NO timeout: in an
+    # empty-queue silence there is no wakeup to print from. So this stream is
+    # "silent" for 90+ s on the meter's clock before its first chunk, and
+    # nothing is printed. A best-effort signal, not a watchdog -- pinned so
+    # nobody later files it as a bug.
+    meters = _metered_clock(monkeypatch, step=30.0)
+    with _live_client(sse_keepalive_s=0, delta_delay=0.1) as c:
+        r = c.post("/v1/chat/completions", json=dict(BODY, stream=True))
+    assert r.status_code == 200
+    assert meters[-1].row()["max_silence_s"] >= 45.0   # the silence was real
+    assert "WARNING" not in capsys.readouterr().out

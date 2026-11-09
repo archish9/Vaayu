@@ -11,6 +11,7 @@ from fastapi.testclient import TestClient
 
 from vaayu.server.app import ServerConfig, create_app
 from vaayu.server.engine import EngineHandle
+from vaayu.server.wire import WireMeter
 
 from .test_server_engine import FakeModel
 
@@ -506,7 +507,8 @@ def test_a_mid_stream_disconnect_still_writes_finish_cancelled(run_dir):
         await sched.start()
         req = _sse_req()
         gen = app_mod._sse(e, req, "m", None, cancel=cancel,
-                           prepared=e.prepare(req), scheduler=sched)
+                           prepared=e.prepare(req), scheduler=sched,
+                           meter=WireMeter("chatcmpl-mid"))
         seen = 0
         async for _ in gen:
             seen += 1
@@ -525,6 +527,10 @@ def test_a_mid_stream_disconnect_still_writes_finish_cancelled(run_dir):
     assert rs[0]["finish"] == "cancelled", (
         "a mid-stream disconnect must not read as an ordinary stop/length")
     assert rs[0]["error"] is None
+    # The engine owns this row, so it is the engine's writer that must carry
+    # the reason `_sse` noted when Starlette closed the generator.
+    assert rs[0]["cancel_reason"] == "stream_closed"
+    assert rs[0]["s_since_last_chunk"] >= 0 and rs[0]["cancel_detected_at_s"] > 0
 
 
 def test_a_disconnect_while_queued_still_writes_a_row(run_dir):
@@ -564,8 +570,9 @@ def test_a_disconnect_while_queued_still_writes_a_row(run_dir):
                 pass
 
         await e._lock.acquire()             # A will block here once picked up
+        meter_a = WireMeter("chatcmpl-a")
         gen_a = app_mod._sse(e, req_a, "m", None, prepared=e.prepare(req_a),
-                             scheduler=sched)
+                             scheduler=sched, meter=meter_a)
         task_a = asyncio.create_task(drain(gen_a))
         # Long enough for A's job to be submitted, picked up by `_form`, and
         # blocked inside `_run` on `engine._lock`. From this point on the
@@ -575,7 +582,7 @@ def test_a_disconnect_while_queued_still_writes_a_row(run_dir):
         await asyncio.sleep(0.05)
 
         gen_b = app_mod._sse(e, req_b, "m", None, prepared=e.prepare(req_b),
-                             scheduler=sched)
+                             scheduler=sched, meter=WireMeter("chatcmpl-b"))
         task_b = asyncio.create_task(drain(gen_b))
         await asyncio.sleep(0.05)           # let B reach submit() and sit in _waiting
         task_b.cancel()
@@ -587,6 +594,10 @@ def test_a_disconnect_while_queued_still_writes_a_row(run_dir):
         # generator, own writing their rows.
         await sched.stop()
         await task_a
+        # A reason noted by `_sse`'s `finally` lands AFTER A's engine row is
+        # already on disk, so it is observable only on the meter -- the row
+        # assertion below cannot see it.
+        assert meter_a.cancel_reason is None
 
     asyncio.run(main())
     rs = {r["session"]: r for r in rows(run_dir)}
@@ -595,6 +606,14 @@ def test_a_disconnect_while_queued_still_writes_a_row(run_dir):
     assert rs["b"]["finish"] == "cancelled", (
         "a client that vanished while queued left no row, or the wrong finish")
     assert rs["b"]["error"] is None
+    # The unowned window: `_sse` writes this row through `_refusal_row` and
+    # there is NO engine row, so a null `wire` here destroys the only evidence
+    # of what the client saw. The queue-position comment and the role chunk
+    # are already out by the time B reaches submit().
+    assert rs["b"]["cancel_reason"] == "abandoned_queued"
+    assert rs["b"]["wire"] is not None and rs["b"]["wire"]["chunks_sent"] >= 1
+    # Guards the engine row writer itself noting a reason on a normal finish.
+    assert rs["a"]["cancel_reason"] is None
 
 
 def _dispatcher_drain(exc_text="the dispatcher stopped before this request "
@@ -683,3 +702,42 @@ def test_a_cancelled_dispatch_error_still_writes_a_row_non_streaming(
     assert len(rs) == 1, "a cancelled dispatcher left no row"
     assert rs[0]["finish"] == "cancelled"
     assert rs[0]["error"] is None
+
+
+def test_a_route_level_refusal_row_still_carries_an_id(client_requiring_session,
+                                                      run_dir):
+    """The error body carries no id -- the OpenAI error shape has no room for
+    one -- but the internal join row <-> session lines <-> server.log is what
+    a mailed folder needs, and a present id costs nothing.
+
+    `wire` is null: this request is refused before `_sse` is ever entered, so
+    no socket frame existed for it.
+    """
+    r = client_requiring_session.post("/v1/chat/completions", json={
+        "model": "m", "messages": [{"role": "user", "content": "hi"}]})
+    assert r.status_code == 400
+    row = rows(run_dir)[-1]
+    assert row["id"].startswith("chatcmpl-") and row["wire"] is None
+
+
+def test_the_route_derives_the_client_shape_and_never_writes_the_raw_user_agent(
+        client, run_dir):
+    ua = "curl/8.5.0 host=alice-laptop.local"
+    r = client.post("/v1/chat/completions", json={
+        "model": "m", "session_id": "s", "stream": False,
+        "messages": [{"role": "user", "content": "hi"}]},
+        headers={"user-agent": ua, "x-forwarded-for": "203.0.113.9"})
+    assert r.status_code == 200
+    text = (run_dir / "requests.jsonl").read_text()
+    row = json.loads(text)
+    assert row["client"] == {"family": "curl", "version": "8", "forwarded": True}
+    assert "alice-laptop" not in text and "203.0.113.9" not in text
+
+
+def test_a_refusal_row_carries_the_client_shape_too(client_requiring_session, run_dir):
+    r = client_requiring_session.post("/v1/chat/completions", json={
+        "model": "m", "messages": [{"role": "user", "content": "hi"}]},
+        headers={"user-agent": "OpenAI/Python 1.54.3"})
+    assert r.status_code == 400
+    assert rows(run_dir)[0]["client"] == {
+        "family": "openai-python", "version": "1", "forwarded": False}

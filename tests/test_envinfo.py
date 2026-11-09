@@ -708,3 +708,10 @@ def test_other_forwards_and_dense_report_no_delivery():
     dense = envinfo.collect(_model(is_moe=False), _config())
     assert moe["model"]["forward_delivery"] is None
     assert dense["model"]["forward_delivery"] is None
+
+
+def test_env_json_records_the_timezone():
+    # A mailed folder's local-time screenshots cannot be lined up without it.
+    env = envinfo.collect(_model(is_moe=False), _config())
+    assert "tz" in env["host"] and "tz_offset_s" in env["host"]
+    assert env["host"]["tz_offset_s"] is None or isinstance(env["host"]["tz_offset_s"], int)

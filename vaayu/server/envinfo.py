@@ -52,6 +52,7 @@ import platform
 import re
 import subprocess
 import sys
+from datetime import datetime
 from dataclasses import fields as dc_fields, is_dataclass
 from pathlib import Path
 
@@ -262,6 +263,9 @@ def _host_section(c):
     return c.section("host", {
         "kernel": lambda: platform.release(),
         "platform": lambda: platform.platform(),
+        "tz": lambda: datetime.now().astimezone().tzname(),
+        "tz_offset_s": lambda: int(datetime.now().astimezone()
+                                   .utcoffset().total_seconds()),
         "cpu": cpu_model,
         "cpu_count": lambda: os.cpu_count(),
         "ram_total_gb": lambda: round(meminfo("MemTotal:") / _GB, 2),

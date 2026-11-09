@@ -8,13 +8,16 @@ what the disk-streaming path is debugged with. So the capture is at fd level.
 `session_id` arrives from an HTTP body, so it is untrusted input that becomes a
 FILENAME. That is the sharpest edge in this file.
 """
+import re
 import subprocess
+from datetime import datetime, timezone
 import sys
 from pathlib import Path
 
 import pytest
 
-from vaayu.server.logs import (UNNAMED, sanitize_session, session_event,
+from vaayu.server.logs import (UNNAMED, format_line, sanitize_session,
+                               session_event,
                                session_log_path)
 
 
@@ -993,3 +996,22 @@ def test_a_default_config_does_not_write_run_dirs_into_the_repo():
     # ... by logging somewhere else, NOT by turning logging off -- a fixture
     # that returned None here would hide every bug in the run-dir path.
     assert app.state.run_dir is not None
+
+
+def test_session_event_stamps_utc_in_the_pump_format(tmp_path):
+    # One file, two writers: a REQ line and a pump line sat 5.5 h apart in
+    # text because this one used naive local time (RUN-E-STALL).
+    session_event(tmp_path, "s", "REQ", prompt=3)
+    line = (tmp_path / "sessions" / "s.log").read_text()
+    stamp = line.split()[0]
+    assert stamp.endswith("Z")
+    parsed = datetime.strptime(stamp, "%Y-%m-%dT%H:%M:%S.%fZ")
+    assert abs((parsed - datetime.now(timezone.utc).replace(tzinfo=None)).total_seconds()) < 60
+
+
+def test_a_session_log_uses_one_stamp_format_for_both_writers(tmp_path):
+    session_event(tmp_path, "s", "REQ", prompt=3)
+    pumped = format_line("hello", session="s")
+    assert re.match(r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z ", pumped)
+    first = (tmp_path / "sessions" / "s.log").read_text().split()[0]
+    assert re.match(r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z$", first)
