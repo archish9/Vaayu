@@ -28,8 +28,10 @@ Status keys: `[ ]` pending · `[~]` in progress · `[!]` blocked · `[bug]` open
 Protocol: `CLAUDE.md` §6 (this ledger), §7 (all plans / RESULTS go in `docs/`, gitignored — so every row carries its
 own numbers), §8 (every change must reach the server; say if it is banked).
 
-**Suite floor (CURRENT, after WIRE-TELEMETRY + its review fix wave, 2026-11-09): `4224 passed, 92 skipped,
-1 failed`** (359.92 s, FOREGROUND, `./venv/bin/python -m pytest -q`) = **4317 collected**. The 1 failure is
+**Suite floor (CURRENT, after WIRE-TELEMETRY + its review fix wave + LOG-FOLDER-PEER-IP, 2026-11-09):
+`4242 passed, 92 skipped, 1 failed`** (361.62 s, FOREGROUND, `./venv/bin/python -m pytest -q`) =
+**4335 collected** = the 4317 below + **18** (`tests/test_access_log_scrub.py`, the uvicorn access-line
+peer-address scrub). The 1 failure is
 the same pre-existing machine-local `config_local.py MAX_BATCH_SIZE=3` artifact
 (`test_max_batch_size_defaults_to_one`), excluded from what this floor means.
 **Reconciled by COLLECTED count at each commit, not assumed** (`pytest --collect-only -q`), which is why it
@@ -156,7 +158,7 @@ then 300 s silence) also happened at 13:11 **with no kernel fault in the log** �
 root-caused and fixed (see the `RUN-E-STALL` row: `_sse` goes silent for a buffered tool-call body). Only the
 16:26-onward wedge is this kernel bug.
 
-## [bug] LOG-FOLDER-PEER-IP — a mailed `logs/run-*/` folder contains PEER IP ADDRESSES — PRE-EXISTING, behaviour deliberately UNCHANGED, the choice is the USER's
+## [x] LOG-FOLDER-PEER-IP — a mailed `logs/run-*/` folder carried PEER IP ADDRESSES — FIXED 2026-11-09 by option 2 (access log kept, address scrubbed)
 
 **Found 2026-11-08 by the WIRE-TELEMETRY Task 6 review; verified on the code, not inferred.** It contradicts
 the invariant the whole wire-telemetry plan rests on — `documentation/server.md` tells a user to zip
@@ -184,8 +186,28 @@ arrive" gets answered, and they are the only record of a request that never reac
 3. Accept it, and document "strip `INFO:` access lines before sending" — which
    `documentation/server.md` § Logs now says under `client` as the interim answer.
 
-**Nothing was changed.** Deciding between 1/2/3 is a user call about their own logs, and a review finding is
-not consent to change behaviour.
+**USER CHOSE OPTION 2 on 2026-11-09, and it is DONE.** `logs.ScrubPeerAddr`, a `logging.Filter` on the
+`uvicorn.access` logger, replaces `client_addr` with `local` (loopback — what a `tailscale serve` front-end
+looks like) / `remote` / `-` before the record is formatted, so the address reaches no file, formatter or
+handler. Wired by `logs.uvicorn_log_config()` — uvicorn's own `LOGGING_CONFIG` deep-copied with one `filters`
+entry — which `__main__.py` passes as `log_config=`. A filter, not a formatter, so it covers both of uvicorn's
+HTTP implementations (h11 and httptools emit the identical record); attached BY CONFIG because `uvicorn.run`
+calls `dictConfig` itself inside `run()`, after any hand-added filter. Access log stays **ON**: the arrival
+record is why option 1 was rejected. Lines look like `remote - "POST /v1/chat/completions HTTP/1.1" 200`.
+
+**§8: SHIPPED, not banked. No knob** — a folder you can mail must not depend on remembering a setting, and
+`tests/test_access_log_scrub.py::test_the_server_entrypoint_passes_the_scrubbing_log_config` is what stops it
+being decoration: it asserts `main()` hands uvicorn the config, because `uvicorn.run` otherwise builds its own
+logging and the filter would never run. Reachable on every served request.
+
+**Evidence:** 18 tests in `tests/test_access_log_scrub.py` (parametrized over tailnet/private/public/loopback/
+IPv6/empty addresses, the non-access-line record shapes, a `__str__` that raises, the config wiring, the dotted
+path resolving, end-to-end through `dictConfig`, and the entrypoint). Four mutants each RED then reverted:
+drop `log_config=` from `__main__.py` (1 failed); filter returns the raw address (7); filter attached to
+`uvicorn` instead of `uvicorn.access` (3); filter returns False and drops the record (13).
+
+**What this does NOT fix:** log folders written before 2026-11-09 still contain the addresses — `logs/` is not
+rewritten. `documentation/server.md` § Logs says so under `client`.
 
 ## [bug] WIRE-BATCHED-ZERO — under N≥2 a batched streaming row's `wire` carries NO per-stream token numbers — the false-healthy zeros are FIXED; LATENT, worth zero today
 
@@ -496,9 +518,10 @@ every 15 s between the prose and the `tool_calls` chunk.
     with `CAPTURE_STDIO` on and scans every file in the run dir for 4 canaries (prompt, completion, a private
     user-agent tail, an `x-forwarded-for` address). Green first run; 5 mutants each redden exactly one
     assertion (the completion one is caught via `server.log`, which is why it runs in a subprocess).
-    **G7 is MITIGATED, not MET, while `LOG-FOLDER-PEER-IP` (above) is open:** the spec's §4 anti-goal list names
-    "an IP … in the folder" explicitly, and uvicorn's access log still writes the peer address into
-    `server.log`. This closed row must not be read as G7 closed.
+    **G7 is now MET (2026-11-09):** it was MITIGATED-not-met while `LOG-FOLDER-PEER-IP` was open, because the
+    spec's §4 anti-goal list names "an IP … in the folder" explicitly and uvicorn's access log still wrote the
+    peer address into `server.log`. That row is now `[x]` — the user chose option 2 and the address is scrubbed
+    at the source. Folders written before that date still carry the addresses.
   - **§8: SHIPPED, not banked. No knob** — nothing added to `config.py`; the only setting read is the existing
     `SSE_KEEPALIVE_S`, which the warning threshold derives from. Plumbed route → `Job` → scheduler →
     `engine.stream`/`generate` → both row writers (`_refusal_row` too), reachable on every request at the N=1

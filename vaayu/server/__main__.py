@@ -8,7 +8,7 @@ One model, loaded once at boot. There is no hot-swap: a Vaayu load costs minutes
 process restart. This is the one thing exllamav3-server.py does that must not be
 copied.
 """
-from . import config
+from . import config, logs
 from .app import ServerConfig, create_app
 
 
@@ -57,7 +57,16 @@ def main() -> int:
                           else int(config.RAM_CACHE_BUDGET_GB * 1024 ** 3)))
 
     import uvicorn
-    uvicorn.run(create_app(cfg), host=cfg.host, port=cfg.port, log_level="info")
+
+    # `log_config=` and not the default: uvicorn's access line carries the
+    # PEER's address, `capture_stdio` tees it into server.log, and
+    # documentation/server.md tells users to zip that folder and mail it.
+    # `uvicorn_log_config()` is uvicorn's own config plus one filter that
+    # replaces the address with `local`/`remote` (todo.md LOG-FOLDER-PEER-IP).
+    # The access log itself stays ON -- it is the only record of a request that
+    # never reached a route.
+    uvicorn.run(create_app(cfg), host=cfg.host, port=cfg.port,
+                log_level="info", log_config=logs.uvicorn_log_config())
     return 0
 
 

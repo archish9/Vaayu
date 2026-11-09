@@ -15,6 +15,7 @@ terminal. Nothing that was visible before becomes invisible.
 sanitized rather than trusted -- `"../../etc/cron.d/x"` must not be a path.
 """
 import hashlib
+import logging
 import os
 import re
 import sys
@@ -383,6 +384,89 @@ def collected_warnings() -> list:
     """
     drain()
     return list(_warnings)
+
+
+# uvicorn logs every served request as
+# `'%s - "%s %s HTTP/%s" %d' % (client_addr, method, path, http_version, status)`
+# and `client_addr` is `"host:port"` -- the PEER's address. `capture_stdio`
+# below tees fd 1/2 into `server.log`, and documentation/server.md tells a user
+# to zip the run directory and mail it, so over Tailscale every access line
+# carried the reporter's stable `100.x` tailnet address out of their machine.
+# Found by the WIRE-TELEMETRY review (todo.md `LOG-FOLDER-PEER-IP`); the user
+# chose to keep the access log and scrub the address, because the arrival
+# record is the only trace of a request that never reached a route.
+#
+# A logger FILTER rather than a formatter: it is independent of which HTTP
+# implementation uvicorn picked (h11 and httptools emit the identical record),
+# and it rewrites the argument itself, so no later formatter or handler can see
+# the address either.
+_LOOPBACK = frozenset({"127.0.0.1", "::1", "localhost"})
+
+# The one bit of the address worth keeping: a request arriving through the
+# Tailscale front-end (`tailscale serve` -> 127.0.0.1) is loopback, a direct
+# tailnet bind is not. That distinction is diagnostic; the address is not.
+_PEER_LOCAL, _PEER_REMOTE, _PEER_UNKNOWN = "local", "remote", "-"
+
+
+def peer_token(client_addr) -> str:
+    """`"host:port"` -> `local` / `remote` / `-`. Never raises, never leaks."""
+    try:
+        addr = str(client_addr)
+    except Exception:                   # noqa: BLE001 -- a token, not a path
+        return _PEER_UNKNOWN
+    if not addr:
+        return _PEER_UNKNOWN
+    # uvicorn builds this as `"%s:%d" % client`, so the port is after the LAST
+    # colon -- an IPv6 host keeps its own colons and is not bracketed.
+    host = addr.rsplit(":", 1)[0]
+    if host in _LOOPBACK or host.startswith("127."):
+        return _PEER_LOCAL
+    return _PEER_REMOTE
+
+
+class ScrubPeerAddr(logging.Filter):
+    """Replace the peer address in a `uvicorn.access` record with a token.
+
+    Returns True unconditionally: the access line is the arrival record, and
+    dropping it would cost exactly what option 1 (`access_log=False`) would
+    have cost. Only the one known five-argument shape is touched, so a future
+    uvicorn line of a different shape passes through unmangled rather than
+    being corrupted by a filter that assumed too much.
+    """
+
+    def filter(self, record) -> bool:
+        try:
+            args = record.args
+            if isinstance(args, tuple) and len(args) == 5:
+                record.args = (peer_token(args[0]),) + args[1:]
+        except Exception:               # noqa: BLE001 -- never on this path
+            pass
+        return True
+
+
+def uvicorn_log_config() -> dict:
+    """uvicorn's own logging config with the peer-address scrub added.
+
+    A copy, not a mutation of `uvicorn.config.LOGGING_CONFIG`: that dict is
+    module-global and importing Vaayu must not change how an unrelated uvicorn
+    app in the same process logs. Everything else -- handlers, formatters,
+    levels -- is uvicorn's, because the goal is one filter, not our own
+    logging stack.
+
+    The filter is attached BY CONFIG rather than with
+    `logging.getLogger("uvicorn.access").addFilter(...)`, because uvicorn runs
+    `dictConfig` itself inside `run()`, after any filter we could have added by
+    hand.
+    """
+    import copy
+
+    import uvicorn.config
+
+    cfg = copy.deepcopy(uvicorn.config.LOGGING_CONFIG)
+    cfg.setdefault("filters", {})["scrub_peer_addr"] = {
+        "()": f"{ScrubPeerAddr.__module__}.{ScrubPeerAddr.__qualname__}"}
+    cfg["loggers"]["uvicorn.access"]["filters"] = ["scrub_peer_addr"]
+    return cfg
 
 
 def capture_stdio(log_path, rotate_mb: int = 50):

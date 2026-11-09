@@ -202,8 +202,9 @@ and it is held by a test rather than by luck:
 `tests/test_log_folder_carries_no_content.py` drives a streaming request, a
 non-streaming one and a refusal whose prompt, reply and user-agent all carry
 canary strings, and fails if any of them turns up in any file the run wrote.
-The one thing it cannot cover is uvicorn's own access log, which records the
-connecting peer's address — see the caveat under `client` below.
+The one thing that test cannot cover is uvicorn's own access log — no real
+uvicorn serves under pytest — so the address it used to record is scrubbed at
+the source instead; see `client` below.
 
 **`requests.jsonl`** is the per-request companion to `server.log`: one JSON
 object, appended when the request ends — whether it completed, was refused
@@ -411,11 +412,26 @@ client-controlled characters could reach a log file, so it is deliberately
 tight — and an `anthropic/v3`-style user-agent under-reports its version as
 `null`.
 
-**Caveat, and it is not Vaayu's own logging:** uvicorn's access log *does*
-record the connecting peer's address, and `CAPTURE_STDIO` tees it into
-`server.log`. Over a tunnel that is the tunnel's own address range. There is no
-knob for it today; if you are sending a folder to someone else and the address
-matters to you, strip uvicorn's `INFO:` access lines from `server.log` first.
+**uvicorn's access log is scrubbed too, since 2026-11-09.** It used to record
+the connecting peer's address, and `CAPTURE_STDIO` tees it into `server.log` —
+over Tailscale that is a stable identifier for the sender's machine. The access
+log stays **on**, because it is the only record of a request that never reached
+a route; the address is replaced before the line is formatted, so it reaches no
+file, formatter or handler:
+
+```
+remote - "POST /v1/chat/completions HTTP/1.1" 200
+local - "GET /health HTTP/1.1" 200
+```
+
+`local` means loopback — which is what a request through a `tailscale serve`
+front-end looks like — `remote` means anything else, and `-` means uvicorn
+reported no peer at all. That distinction is the diagnostic part (front-end
+versus a direct tailnet bind); the address itself is not. It is one logging
+filter on `uvicorn.access` (`logs.ScrubPeerAddr`, wired through
+`logs.uvicorn_log_config()`), **no knob** — a folder you can mail should not
+depend on remembering to set one. Logs written before that date still contain
+the addresses.
 
 **A live warning in `server.log`, once per request.** While a stream is open the
 server also checks the span that is quiet *now*, and prints a **pair** of lines:
