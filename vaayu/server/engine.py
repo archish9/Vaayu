@@ -382,11 +382,13 @@ class EngineHandle:
         if self.log_dir is None:
             return
         if meter is not None:
-            # The id the client was given, first on every line of this
-            # request's session log: it is what joins these lines to the
-            # request's row and to the id the reporter's own client logged.
-            # A library caller has no meter, and the field is then absent
-            # rather than `id=None`.
+            # The id the client was given, first on each of THIS request's
+            # `REQ`/`TTFT`/`DONE` lines -- not on every line of the file,
+            # which also carries the stdout pump's token summaries, written
+            # with no `id=` and joined on `session=` plus the stamp. It is
+            # what joins these lines to the request's row and to the id the
+            # reporter's own client logged. A library caller has no meter, and
+            # the field is then absent rather than `id=None`.
             fields = {"id": meter.id, **fields}
         session_event(self.log_dir, getattr(req, "session_key", None),
                       event, **fields)

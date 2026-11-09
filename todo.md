@@ -28,15 +28,18 @@ Status keys: `[ ]` pending · `[~]` in progress · `[!]` blocked · `[bug]` open
 Protocol: `CLAUDE.md` §6 (this ledger), §7 (all plans / RESULTS go in `docs/`, gitignored — so every row carries its
 own numbers), §8 (every change must reach the server; say if it is banked).
 
-**Suite floor (CURRENT, after WIRE-TELEMETRY, 2026-11-09): `4220 passed, 92 skipped, 1 failed`** (359.57 s,
-FOREGROUND, `./venv/bin/python -m pytest -q`) = **4313 collected**. The 1 failure is the same pre-existing
-machine-local `config_local.py MAX_BATCH_SIZE=3` artifact (`test_max_batch_size_defaults_to_one`), excluded from
-what this floor means. **Reconciled by COLLECTED count at each commit, not assumed** (`pytest --collect-only -q`),
-which is why it closes exactly: base `8d2d827` **4230** + 3 (`d7bd103` T1 UTC stamp) + 14 (`ab19ee1` T2 request
+**Suite floor (CURRENT, after WIRE-TELEMETRY + its review fix wave, 2026-11-09): `4224 passed, 92 skipped,
+1 failed`** (359.92 s, FOREGROUND, `./venv/bin/python -m pytest -q`) = **4317 collected**. The 1 failure is
+the same pre-existing machine-local `config_local.py MAX_BATCH_SIZE=3` artifact
+(`test_max_batch_size_defaults_to_one`), excluded from what this floor means.
+**Reconciled by COLLECTED count at each commit, not assumed** (`pytest --collect-only -q`), which is why it
+closes exactly: base `8d2d827` **4230** + 3 (`d7bd103` T1 UTC stamp) + 14 (`ab19ee1` T2 request
 id + meter) + 15 (`1b777a0` T3 the `wire` block) + 7 (`5f69596` T4 tokens held) + 5 (`c46b689` T5
 `cancel_reason`) + 27 (`2d91f76` T6 `client` shape) + 6 (`e44ba5e` T7 live warning) + 6 (T8 the no-content
-canary) = **4313**, and the suite reported 4220 + 92 + 1 = 4313. Note for the record: the previous floor line
-below totals 4229 outcomes while its own base commit `8d2d827` collects **4230** — that row was one test short
+canary) = 4313 + 4 (`0adf669` the whole-branch review's fix wave: one test each for I1, I2, I4 and M10) =
+**4317**, and the suite reported 4224 + 92 + 1 = 4317. The wave's second commit (`4963a96`) adds no test.
+Note for the record: the previous floor line below totals 4229 outcomes while its own base commit `8d2d827`
+collects **4230** — that row was one test short
 (the +1 anomaly Task 1 flagged mid-plan; a collection count, not a regression). `cargo test` not re-run: no Rust
 touched this session.
 
@@ -205,6 +208,15 @@ onto the wire's arrival clock) and the three token fields above are `null` too �
 tokens sat in the buffer while the wire was quiet" has no answer on a batched row. `wire`'s chunk, comment, byte
 and silence numbers, `buffering.bytes_buffered`, `id`, `client` and `cancel_reason` are all real there; only the
 token/time-origin fields are missing.
+
+**Also still open, same class, on the WARNING path (recorded 2026-11-09, code deliberately NOT changed):**
+`WireMeter.open_silence()` (`wire.py`) returns `self._tokens - self._silence_from_tokens` with **no
+`_tokens_seen` gate**, so on a batched stream `app.py`'s live warning prints "with **0** tokens generated and
+held meanwhile" — a measurement nobody took, in `server.log`, about the very stall it is reporting. Pre-existing
+(the single-line warning carried the same `{held}` before M10 split it) and worth zero at the shipped
+`MAX_BATCH_SIZE = 1`, but reachable on this box's `config_local.py`. Fix it with the same `_tokens_seen` gate
+whenever this row is re-opened; it needs a wording decision for the printed line ("tokens held unknown"), which
+is why it was not folded into the fix wave.
 
 **Worth zero to a user today:** the server serialises to one request at a time under `engine.py`'s `slot()`
 (CLAUDE.md §8.3) and ships `MAX_BATCH_SIZE = 1`. It is reachable only once batching is turned on — which this
@@ -469,9 +481,14 @@ every 15 s between the prose and the `tool_calls` chunk.
     list, MAJOR version only (5+ digits → `null`, the bound that keeps client-controlled characters out of a log
     file), `forwarded` = PRESENCE of `x-forwarded-for`/`forwarded`/`x-real-ip`/`via` and never an address.
     **The raw user-agent is never stored.**
-  - **a live WARNING** (`b757381`/`e44ba5e`): once per request, threshold `max(3 × SSE_KEEPALIVE_S, 45 s)`,
-    harvested into `env.json`'s `warnings`. **Best-effort, not a watchdog** — it can fire in the prefill/queue
-    window with keepalive ON and in the buffered window with keepalive OFF, and it CANNOT fire in the buffered
+  - **a live WARNING** (`b757381`/`e44ba5e`, split in two by the review's M10 `0adf669`): once per request,
+    threshold `max(3 × SSE_KEEPALIVE_S, 45 s)`. **Since M10 it is TWO lines in `server.log` per stalled
+    request** — a generic harvested headline plus a detail line carrying the id, the elapsed silence and the
+    tokens held — and **`env.json`'s `warnings` therefore gets ONE generic entry for the whole run, not one
+    per request**: `note_if_warning` dedupes on the exact message and drops the newest past 200, so a headline
+    carrying the id and the seconds would have crowded out every other warning after ~200 stalls. The
+    per-request numbers live in `server.log` and on the row. **Best-effort, not a watchdog** — it can fire in
+    the prefill/queue window with keepalive ON and in the buffered window with keepalive OFF, and it CANNOT fire in the buffered
     window with keepalive on (heartbeat chunks reset the chunk span below the threshold, which is correct: the
     stall it would warn about cannot happen then).
   - **no prompt or completion text in the folder** (T8): now a guard, not luck —

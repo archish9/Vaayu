@@ -397,10 +397,10 @@ def test_an_engine_row_carries_the_completion_id_the_client_saw(tmp_path):
 
 
 def test_the_session_log_lines_carry_the_same_id_as_the_row(tmp_path):
-    """Spec 5.5: the id is on the `REQ`/`TTFT`/`DONE` session lines too, not
-    just the row. That is the second of the three joins the id exists to make
-    -- a reporter's quoted id has to reach the token-by-token story in
-    `sessions/<id>.log`, which is where the original incident was read from.
+    """Spec 5.5: the id is on all three of the `REQ`/`TTFT`/`DONE` session
+    lines, not just the row. That is the second of the three joins the id
+    exists to make -- a reporter's quoted id has to reach the token-by-token
+    story in `sessions/<id>.log`, where the original incident was read from.
 
     Reddened by `_log`'s `fields = {"id": meter.id, **fields}` in
     `engine.py`: it is the only line that puts the id there, and dropping it
@@ -410,7 +410,7 @@ def test_the_session_log_lines_carry_the_same_id_as_the_row(tmp_path):
     _drive_sse(e, _req())
     row = rows(tmp_path)[0]
     lines = (tmp_path / "sessions" / "s.log").read_text().splitlines()
-    for event in ("REQ", "DONE"):
+    for event in ("REQ", "TTFT", "DONE"):
         line = next((l for l in lines if f" {event} " in l), None)
         assert line is not None, f"no {event} line to join on"
         assert f"id={row['id']}" in line
