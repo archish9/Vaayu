@@ -181,3 +181,19 @@ def test_batch_wait_ms_reaches_the_server_config(monkeypatch, launched):
     assert main() == 0
 
     assert launched["cfg"].batch_wait_ms == 120
+
+
+def test_the_nvme_submission_caps_reach_the_server_config(monkeypatch, launched):
+    """SQE-PLUG, the workaround for the CVE-2026-64017 hard-hang. The caps are
+    applied to the persister during the load, so main() is the only path that
+    can carry an operator's config.py value to them; unforwarded, a box the
+    operator believes is mitigated runs uncapped (CLAUDE.md section 8)."""
+    monkeypatch.setattr(config, "MODEL_PATH", "/ckpt")
+    monkeypatch.setattr(config, "NVME_MAX_SQES_PER_ENTER", 2)
+    monkeypatch.setattr(config, "NVME_MAX_CHUNKS_PER_WAVE", 2)
+
+    from vaayu.server.__main__ import main
+    assert main() == 0
+
+    cfg = launched["cfg"]
+    assert (cfg.nvme_max_sqes_per_enter, cfg.nvme_max_chunks_per_wave) == (2, 2)

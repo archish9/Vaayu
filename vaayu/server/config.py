@@ -312,6 +312,46 @@ KV_PERSIST_SYNC = False
 ENABLE_EXPERT_USAGE = False
 
 # --------------------------------------------------------------------------
+# NVMe submission caps -- the SQE-PLUG workaround for CVE-2026-64017
+# --------------------------------------------------------------------------
+
+# On 2026-11-08 this box HARD-HUNG mid-run: a kernel blk-mq race
+# (CVE-2026-64017) oopsed inside `nvme_queue_rqs`, in one of Vaayu's io_uring
+# reader threads, inside an RCU read-side critical section -- so the grace period
+# never ended, the dead task held the io_uring context mutex forever, and the
+# machine had to be power-cycled. The defect is the KERNEL's and is fixed
+# upstream (`dc278e9bf2b9`, in linux-hwe-7.0 >= 7.0.0-28); booting a patched
+# kernel is the REAL fix and these two knobs are a WORKAROUND. Turn them back off
+# once the kernel moves.
+#
+# Vaayu is the trigger because both of the race's preconditions are ours, run
+# hundreds of times per token:
+#   A  a plug carrying a batch of cached requests. io_uring starts one only when
+#      a single `io_uring_enter` submits MORE than 2 SQEs
+#      (`io_submit_state_start`: `need_plug = max_ios > 2`). The crashing frame
+#      had `to_submit = 32`.
+#   B  a blocking `GFP_NOIO` allocation inside the submit. This drive's
+#      `max_hw_sectors_kb` is 128 -- a HARDWARE limit that cannot be raised -- so
+#      every chunk above that must split a bio. Unavoidable.
+# Removing A closes the window, and also takes us out of the batch-dispatch
+# function that oopsed.
+#
+#   NVME_MAX_SQES_PER_ENTER   SQEs per `io_uring_enter`. 2 removes the plug.
+#                             0 = unlimited = pre-workaround behaviour.
+#   NVME_MAX_CHUNKS_PER_WAVE  chunks one read is cut into, i.e. how many SQEs the
+#                             wave needs at all. Bounding it is what makes the
+#                             first cap cheap: with it, one expert read is 2-6
+#                             enters instead of 16. 0 = fill the ring (32).
+#                             Floored at the read's segment count -- a chunk may
+#                             never cross a segment.
+# The wave itself is unchanged either way: every chunk of an expert is still in
+# flight together, and the device still sees the same N reads.
+#
+# MEASURED COST OF GETTING IT WRONG: see the todo.md SQE-PLUG row.
+NVME_MAX_SQES_PER_ENTER = 0
+NVME_MAX_CHUNKS_PER_WAVE = 0
+
+# --------------------------------------------------------------------------
 # Keep-awake (row 27)
 # --------------------------------------------------------------------------
 

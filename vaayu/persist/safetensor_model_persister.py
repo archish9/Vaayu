@@ -347,11 +347,82 @@ def _ensure_executor():
         _EXECUTOR = ThreadPoolExecutor(max_workers=_NUM_IO_THREADS)
 
 
+# SQE-PLUG, the engine-side workaround for CVE-2026-64017 (a kernel blk-mq race
+# that hard-hung this box on 2026-11-08; fixed upstream by dc278e9bf2b9, and
+# booting a patched kernel is the REAL fix). io_uring starts a block plug only
+# when one io_uring_enter submits MORE THAN 2 SQEs (`io_submit_state_start`:
+# `need_plug = max_ios > 2`), and the plug's cached-request list is what the race
+# corrupts, so capping what one enter carries removes the window and keeps us out
+# of `nvme_queue_rqs` entirely. `_MAX_CHUNKS_PER_WAVE` bounds how many SQEs a
+# wave needs at all, which is what makes the first cap cheap.
+#
+# 0 = unlimited = the behaviour before this knob existed, on both. The server
+# sets them from `config.py` before the load (`set_sqe_caps`); the two env vars
+# override that, so a probe can re-arm a booted server's config.
+_MAX_SQES_PER_ENTER = 0
+_MAX_CHUNKS_PER_WAVE = 0
+
+
+def _valid_cap(name: str, value, default: int) -> int:
+    """A cap is a non-negative count. Anything else is IGNORED, not clamped.
+
+    Clamping would be the dangerous direction: 0 means *unlimited*, so a typo
+    like `-1` would silently switch the mitigation OFF on a box whose operator
+    had asked for it.
+    """
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        n = -1
+    if n < 0:
+        print(f"[VAAYU-IO] WARNING: {name}={value!r} is not a count — ignoring it and "
+              f"keeping {default}. 0 means UNLIMITED (no cap), not 'off by default'.")
+        return default
+    return n
+
+
+def set_sqe_caps(max_sqes_per_enter: int, max_chunks_per_wave: int) -> None:
+    """Set the module defaults the next `init_ring_pool()` is built with.
+
+    Must be called BEFORE the model loads — the rings are built once, during the
+    load, and `init_ring_pool` is a no-op afterwards.
+    """
+    global _MAX_SQES_PER_ENTER, _MAX_CHUNKS_PER_WAVE
+    _MAX_SQES_PER_ENTER = _valid_cap(
+        "NVME_MAX_SQES_PER_ENTER", max_sqes_per_enter, _MAX_SQES_PER_ENTER)
+    _MAX_CHUNKS_PER_WAVE = _valid_cap(
+        "NVME_MAX_CHUNKS_PER_WAVE", max_chunks_per_wave, _MAX_CHUNKS_PER_WAVE)
+
+
+def _sqe_caps() -> tuple:
+    """Effective (SQEs per enter, chunks per wave). Env wins over set_sqe_caps."""
+    def _one(name: str, default: int) -> int:
+        raw = os.environ.get(name)
+        if not raw:
+            return default
+        return _valid_cap(name, raw, default)
+    return (_one("VAAYU_MAX_SQES_PER_ENTER", _MAX_SQES_PER_ENTER),
+            _one("VAAYU_MAX_CHUNKS_PER_WAVE", _MAX_CHUNKS_PER_WAVE))
+
+
 def _init_iouring_ring(pool_size: int, queue_depth: int = 32) -> bool:
+    per_enter, chunks = _sqe_caps()
     try:
         n = pool_size
-        vaayu_rust.init_ring_pool(n, queue_depth)
-        print(f"[VAAYU-IO] persistent ring pool initialized  n={n}  qd={queue_depth}")
+        try:
+            vaayu_rust.init_ring_pool(n, queue_depth, per_enter, chunks)
+        except TypeError:
+            # A wheel older than the caps. They are a kernel workaround, not a
+            # correctness requirement, so load anyway — but say so loudly,
+            # because the box stays exposed to the hang.
+            if per_enter or chunks:
+                print("[VAAYU-IO] WARNING: the installed vaayu_rust predates the SQE/chunk "
+                      f"caps — max_sqes_per_enter={per_enter} max_chunks_per_wave={chunks} "
+                      "are INERT and this run is exposed to CVE-2026-64017. "
+                      "Upgrade vaayu-rust to apply them.")
+            vaayu_rust.init_ring_pool(n, queue_depth)
+        print(f"[VAAYU-IO] persistent ring pool initialized  n={n}  qd={queue_depth}"
+              f"  max_sqes_per_enter={per_enter}  max_chunks_per_wave={chunks}")
         return True
     except Exception as e:
         print(f"[VAAYU-IO] init_ring_pool failed: {e} — per-call ring fallback active")

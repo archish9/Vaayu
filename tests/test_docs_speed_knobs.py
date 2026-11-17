@@ -29,3 +29,21 @@ def test_readme_keepawake_row_is_not_stale():
     text = (ROOT / "vaayu" / "server" / "README.md").read_text()
     assert "server-level A/B is pending" not in text
     assert "+23.1 % decode tok/s on Qwen3-235B" in text
+
+
+@pytest.mark.parametrize("knob", ["NVME_MAX_SQES_PER_ENTER", "NVME_MAX_CHUNKS_PER_WAVE"])
+@pytest.mark.parametrize("doc", ["documentation/server.md", "vaayu/server/README.md"])
+def test_the_nvme_submission_caps_have_a_row_in_both_docs(knob, doc):
+    """SQE-PLUG. A workaround for a kernel bug that can hard-hang the box is the
+    LAST knob an operator should have to find by reading config.py."""
+    text = (ROOT / doc).read_text()
+    assert f"\n| `{knob}` |" in text, f"no {doc} row for {knob}"
+
+
+@pytest.mark.parametrize("doc", ["documentation/server.md", "vaayu/server/README.md"])
+def test_the_nvme_cap_rows_name_the_real_fix(doc):
+    """It is a WORKAROUND. A row that does not say the kernel upgrade is the
+    actual fix invites someone to treat the hang as solved."""
+    text = (ROOT / doc).read_text()
+    assert "CVE-2026-64017" in text, doc
+    assert "The real fix is a patched kernel" in text, doc

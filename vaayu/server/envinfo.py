@@ -65,6 +65,7 @@ _GIB = 1024 ** 3                # binary, to match the VRAM plan's own units
 # same to whoever reads the bundle.
 _KNOWN_VAAYU_VARS = (
     "VAAYU_CACHE_BIAS", "VAAYU_LOOKAHEAD", "VAAYU_NO_WARMUP",
+    "VAAYU_MAX_CHUNKS_PER_WAVE", "VAAYU_MAX_SQES_PER_ENTER",
     "VAAYU_OVERLAP_TRACE", "VAAYU_RING_POOL_N", "VAAYU_TRACE_ACT",
     "VAAYU_TRACE_EXPERT", "VAAYU_VRAM_DIAG",
 )
@@ -375,7 +376,8 @@ def _storage_section(c):
     }
 
     smp_fields = ("o_direct", "io_uring", "ring_initialized", "ring_pool_n",
-                  "nvme_read_concurrency", "files_registered")
+                  "nvme_read_concurrency", "files_registered",
+                  "max_sqes_per_enter", "max_chunks_per_wave")
 
     def import_smp():
         from ..persist import safetensor_model_persister as smp
@@ -395,6 +397,11 @@ def _storage_section(c):
             "ring_pool_n": lambda: smp._ring_pool_size(),
             "nvme_read_concurrency": lambda: smp._NVME_READ_CONCURRENCY,
             "files_registered": lambda: bool(smp._FILES_REGISTERED),
+            # SQE-PLUG (CVE-2026-64017): the EFFECTIVE caps, i.e. env over
+            # config, so a bundle says what the rings were actually built with.
+            # 0 = unlimited = pre-workaround behaviour.
+            "max_sqes_per_enter": lambda: smp._sqe_caps()[0],
+            "max_chunks_per_wave": lambda: smp._sqe_caps()[1],
         }))
     return result
 

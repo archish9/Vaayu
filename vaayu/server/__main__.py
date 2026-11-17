@@ -53,6 +53,8 @@ def main() -> int:
         enable_thinking=config.ENABLE_THINKING,
         default_stream=config.DEFAULT_STREAM,
         sse_keepalive_s=config.SSE_KEEPALIVE_S,
+        nvme_max_sqes_per_enter=config.NVME_MAX_SQES_PER_ENTER,
+        nvme_max_chunks_per_wave=config.NVME_MAX_CHUNKS_PER_WAVE,
         ram_cache_budget=(None if config.RAM_CACHE_BUDGET_GB is None
                           else int(config.RAM_CACHE_BUDGET_GB * 1024 ** 3)))
 

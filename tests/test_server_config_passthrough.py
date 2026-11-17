@@ -21,7 +21,11 @@ NOT_MODEL_KWARGS = {"model_path", "queue_depth", "max_batch_size", "batch_wait_m
                     "exclusive_gpu_wait_s",
                     "enable_thinking", "default_stream", "sse_keepalive_s",
                     "log_dir", "capture_stdio", "log_rotate_mb",
-                    "require_session_id"}
+                    "require_session_id",
+                    # SQE-PLUG: applied to the persister module before the load
+                    # (the io_uring rings are built during it), not as a model
+                    # kwarg. See tests/test_sqe_caps.py.
+                    "nvme_max_sqes_per_enter", "nvme_max_chunks_per_wave"}
 
 
 @pytest.fixture

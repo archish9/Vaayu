@@ -148,6 +148,12 @@ class ServerConfig:
     # prompt. That silence trips an idle-timeout proxy/tunnel (e.g. ngrok) and
     # drops the connection before the first token. 0 disables it. See config.py.
     sse_keepalive_s: float = 15.0
+    # SQE-PLUG: caps on io_uring submission granularity that keep the kernel from
+    # starting a block plug, working around CVE-2026-64017 (see config.py). 0 =
+    # unlimited = pre-workaround behaviour. Applied to the persister BEFORE the
+    # load, because the rings are built once during it.
+    nvme_max_sqes_per_enter: int = 0
+    nvme_max_chunks_per_wave: int = 0
 
 
 # Seconds between disconnect polls on a non-streaming request. Server policy,
@@ -496,6 +502,11 @@ def create_app(config: ServerConfig | None = None, engine=None) -> FastAPI:
                       f"logs/latest points here)")
             if engine is None:
                 _check_gpu_is_exclusive(config)
+                # Before the load: init_ring_pool() runs during it and is a
+                # no-op afterwards, so a cap set later would be inert.
+                from ..persist import safetensor_model_persister as _smp
+                _smp.set_sqe_caps(config.nvme_max_sqes_per_enter,
+                                  config.nvme_max_chunks_per_wave)
                 from ..auto_model import AutoModel
                 if config.delete_original:
                     print("[Vaayu-Server] DELETE_ORIGINAL is ON: the source shards "

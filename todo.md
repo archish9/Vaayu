@@ -139,18 +139,72 @@ DEFERRED, not refused, and the Rust workaround is wanted in parallel in its own 
    escape hatch (`GRUB_TIMEOUT_STYLE=menu`, `GRUB_TIMEOUT=5`, back up `/etc/default/grub` first — there is
    NO backup today) in doc §8.4. The real risk of the move is the CUDA 13.0 / exllamav3 stack, not the driver.
    Canary after any long run: `journalctl -b -k | grep blk_mq_submit_bio` must stay empty.
-2. [ ] Rust workaround — OWN FRESH SESSION, plan in `docs/2026-11-08-SQE-PLUG-rust-mitigation-PLAN.md`.
-   Cap SQEs per `io_uring_enter` at 2 so io_uring never starts a block plug
-   (`io_submit_state_start`: `need_plug = max_ios > 2`), which removes the cached-request list the kernel
-   race corrupts AND stops us reaching `nvme_queue_rqs` at all. Submission granularity only — the wave
-   stays whole, so row 45's "all of an expert's groups in one wave" survives; cost is `ceil(N/2)` enters
-   per wave with device-side depth unchanged. Measure the zero-Rust upper bound first (`queue_depth=2`,
-   which degenerates to one round trip per expert group — no rebuild needed). Option C on paper only: cap
-   chunk at 128 KiB, killing the split-bio sleep instead (weaker guarantee, ~8x SQEs, fights the
-   whole-expert rule). Verify with `bpftrace kprobe:nvme_queue_rqs` → must hit 0 with the cap on and be
-   non-zero with it off; **never ptrace/strace/py-spy a live Vaayu, it corrupts io_uring**. Acceptance
-   <3 % on MiniMax AND dense with ids bit-identical, else ship the knob defaulting OFF and say so. §8 knob
-   in `server/config.py` + README same commit; §9 private repo commit + wheel-only PyPI upload.
+2. [~] Rust workaround — **BUILT AND MEASURED 2026-11-17; blocked only on the bpftrace proof (needs
+   your `sudo`) and the PyPI release.** Plan `docs/2026-11-08-SQE-PLUG-rust-mitigation-PLAN.md`, results
+   `docs/2026-11-17-SQE-PLUG-rust-mitigation-RESULTS.md`. **Two knobs, both shipping `0` = unlimited =
+   bit-for-bit the old behaviour:** `NVME_MAX_SQES_PER_ENTER` (SQEs per `io_uring_enter`; `2` means
+   `need_plug = max_ios > 2` is false, so io_uring never starts the block plug whose cached-request list
+   the race corrupts, and we never reach `nvme_queue_rqs`) and `NVME_MAX_CHUNKS_PER_WAVE` (chunks one read
+   is cut into, i.e. how many SQEs the wave needs at all; floored at the segment count since a chunk may
+   not cross a segment). Env: `VAAYU_MAX_SQES_PER_ENTER` / `VAAYU_MAX_CHUNKS_PER_WAVE`, which override
+   config so an arm needs no edit. Rust: `SqeCaps` on `RingState`, seeded from globals set by
+   `init_ring_pool(n, qd, per_enter, chunks)`; the wave loop pushes and `submit()`s every `per_enter`
+   pushes, then one `submit_and_wait(wave)` — **the wave stays whole**, so row 45 survives and the device
+   sees the same reads. `legacy_read` (the pool-init-failed per-call ring) takes the caps too: it submits
+   the same way and was exposed the same way.
+   **MEASURED through the SERVER, mirrored arms (`off,cap,capchunk,capchunk,cap,off`) after a dropped
+   warm-up, decode by DIFFERENCE so prefill cancels (the token summaries print `total=%.1f` = 100 ms
+   resolution, useless at this scale), `o_direct=True` in every arm, harness
+   `plans/probes/sqe_plug_ab.py`:**
+   **MiniMax-M2.7 EXL3** (7 arms, 1937-tok prompt) `off` **518.86 ms/token** → `cap` 519.60 (**+0.14 %**),
+   `capchunk` 515.25 (**−0.70 %**); cold wall 28.25 s → −0.39 % / −0.65 %; `expert_disk` 23.2–23.7 s in
+   every arm, so all arms really streamed. **Llama-3.3-70B EXL3 dense** (13 arms) splits into two
+   disk-work regimes because the pinning plan differed between boots — 12.52 vs 11.62 GB/token — and each
+   arm is compared only against the `off` arms reading the same bytes: regime A `off` 3108.2 → `cap`
+   −0.21 %, `capchunk` +0.71 %; regime B `off` 3002.1 → −0.11 % / +0.39 %; **both regimes agree: `cap`
+   −0.16 %, `capchunk` +0.55 %.** **Output BIT-IDENTICAL in all 20 arms of both models.** Enter cost from
+   the real segment layouts: MiniMax 32 chunks/17 enters → 3/2 with the chunk cap (Qwen3-Next 31/16 → 3/2,
+   DeepSeek-V4 31/16 → 2/2, gpt-oss 31/16 → 6/4). Chunk cap's drive-level cost in isolation (real byte
+   ranges, O_DIRECT, one ring, ABBA warm block): 2×4 MiB vs 32×256 KiB = **5.61/5.60 vs 5.62/5.62 GiB/s,
+   Δ −0.3 %, inside noise.**
+   **VERDICT: both arms clear the <3 % bar on both models with margin — the effects are at or below this
+   box's arm-to-arm noise. RECOMMENDED default `NVME_MAX_SQES_PER_ENTER = 2`, `NVME_MAX_CHUNKS_PER_WAVE = 0`:**
+   `cap` alone is dead neutral (+0.14 % / −0.16 %) and leaves chunk geometry untouched, so it does not
+   disturb what P8 and the NVMe-knee work settled; the chunk cap's 16→2 syscall saving measured as nothing,
+   so it buys no throughput for that extra risk and stays a reachable knob.
+   **§8: knob, plumbed, reachable.** `config.py` → `__main__.py` → `app.py`'s lifespan calls
+   `safetensor_model_persister.set_sqe_caps()` **BEFORE** `from_pretrained` (the rings are built during the
+   load; `init_ring_pool` is a no-op after, so a later cap is inert — `test_the_caps_are_applied_before_the_model_loads`
+   asserts the order). Rows in BOTH `vaayu/server/README.md` and `documentation/server.md`. `envinfo`
+   reports the EFFECTIVE pair in `env.json` and both env names are in `_KNOWN_VAAYU_VARS`. An older wheel
+   raises `TypeError` on the 4-arg call → falls back to the old arity and WARNS, naming `CVE-2026-64017`
+   and `INERT`, because silently dropping the caps leaves an operator believing a box is mitigated.
+   **Floors: `cargo test` 38 → `46 passed, 0 failed, 1 ignored`; pytest 4242 → `4264 passed, 92 skipped,
+   1 failed` (396.16 s, FOREGROUND), reconciled 4357 collected = 4335 + 22 new (15 `test_sqe_caps.py`,
+   1 `test_server_config_module.py`, 6 `test_docs_speed_knobs.py`); the 1 failure is the pre-existing
+   `config_local MAX_BATCH_SIZE=3` artifact.** All 8 new Rust tests passed first run, so they were
+   MUTATION-CHECKED — 5 mutants (unlimited→2, off-by-one grouping, dropped per-segment floor, ignored
+   chunk cap, error accounting forgetting `handed`) each caught. One real defect found by the new Python
+   tests and fixed: a negative env value parsed and clamped to `0` = *unlimited*, so
+   `VAAYU_MAX_SQES_PER_ENTER=-3` would have silently DISABLED a configured cap; invalid values are now
+   ignored, never clamped.
+   **STILL OPEN, in order:**
+   a. [ ] **bpftrace proof — needs the USER's `sudo` (password required in-session).**
+      `sudo bash plans/probes/bpf_premise.sh` — model-free, sweeps `idle / 32 / 3 / cap2 / cap2+chunk2 /
+      qd1` against the real O_DIRECT read path; expect `nvme_queue_rqs` NON-ZERO at `to_submit` 3 and 32
+      and **ZERO** at 1 and 2. **Until this is recorded the mitigation is REASONED, NOT PROVED** — the
+      claim is about kernel-internal behaviour and the perf numbers say nothing about it. Never
+      ptrace/strace/py-spy a live Vaayu; kprobes are safe.
+   b. [ ] **Flip the default?** Both knobs still ship `0`. Turning `NVME_MAX_SQES_PER_ENTER` to `2` is a
+      behaviour change for every user on every kernel — the user's call, measurement above.
+   c. [ ] **§9 release.** Committed in the private `vaayu_rust` repo; **NOT released.** Bump the version in
+      BOTH `Cargo.toml` and `pyproject.toml`, `maturin build --release --zig`, `maturin upload … *.whl` —
+      **wheel ONLY, never `maturin publish`** (it uploads an sdist and leaks the source); then verify
+      `https://pypi.org/simple/vaayu-rust/` lists no `.tar.gz`. Until then the knob works only on this
+      box's `maturin develop` build and every other machine takes the stale-wheel WARNING path.
+   d. [ ] Not measured: Qwen3-Next-80B (plan called it optional, least disk-bound) and the fused-EXL3
+      gate (`FUSED_EXL3_CKPT=`, model `darkbit1001--Qwen3.6-35B-A3B-EXL3-6.00bpw-hb6`) — worth a run since
+      this touches shared I/O infra, but outside the plan's stated scope.
    **It is a workaround, not a fix** — revert it, or flip its default off, once the kernel moves.
 
 **Do NOT fold this into the run-E stall report.** `VAAYU-RUN-E-REPORT.md` §2.1 (stream starts, ~10 chunks,
