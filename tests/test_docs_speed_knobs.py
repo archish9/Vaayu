@@ -47,3 +47,22 @@ def test_the_nvme_cap_rows_name_the_real_fix(doc):
     text = (ROOT / doc).read_text()
     assert "CVE-2026-64017" in text, doc
     assert "The real fix is a patched kernel" in text, doc
+
+
+@pytest.mark.parametrize("doc", ["documentation/server.md", "vaayu/server/README.md"])
+def test_the_nvme_cap_rows_do_not_claim_nvme_queue_rqs_is_eliminated(doc):
+    """This claim SHIPPED once and is REFUTED by measurement (2026-11-17).
+
+    The plan said capping SQEs per enter takes the process out of
+    `nvme_queue_rqs` "entirely". bpftrace says hits are flat at ~238k per 5 s at
+    every `to_submit`, including 1: that path is reached through the plug's
+    DISPATCH list, which fills under any plug -- including the `nr_ios == 1` plug
+    the direct-IO path starts -- while the race corrupts the separate
+    `cached_rqs` list, filled only when `nr_ios > 1`. Being in that function is
+    not the hazard. A doc that promises otherwise invites someone to "verify" the
+    mitigation with a check that can never pass, and to conclude it is broken.
+    """
+    text = (ROOT / doc).read_text()
+    assert "out of the batch-dispatch path entirely" not in text, doc
+    assert "Measured caveat (2026-11-17)" in text, (
+        f"{doc} must keep the caveat that nvme_queue_rqs hit count is flat")

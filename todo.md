@@ -179,9 +179,10 @@ DEFERRED, not refused, and the Rust workaround is wanted in parallel in its own 
    reports the EFFECTIVE pair in `env.json` and both env names are in `_KNOWN_VAAYU_VARS`. An older wheel
    raises `TypeError` on the 4-arg call → falls back to the old arity and WARNS, naming `CVE-2026-64017`
    and `INERT`, because silently dropping the caps leaves an operator believing a box is mitigated.
-   **Floors: `cargo test` 38 → `46 passed, 0 failed, 1 ignored`; pytest 4242 → `4264 passed, 92 skipped,
-   1 failed` (396.16 s, FOREGROUND), reconciled 4357 collected = 4335 + 22 new (15 `test_sqe_caps.py`,
-   1 `test_server_config_module.py`, 6 `test_docs_speed_knobs.py`); the 1 failure is the pre-existing
+   **Floors: `cargo test` 38 → `46 passed, 0 failed, 1 ignored`; pytest 4242 → `4266 passed, 92 skipped,
+   1 failed` (364.09 s, FOREGROUND), reconciled 4359 collected = 4335 + 24 new (15 `test_sqe_caps.py`,
+   1 `test_server_config_module.py`, 8 `test_docs_speed_knobs.py` — two of them pin the refutation above so
+   the wrong claim cannot ship again); the 1 failure is the pre-existing
    `config_local MAX_BATCH_SIZE=3` artifact.** All 8 new Rust tests passed first run, so they were
    MUTATION-CHECKED — 5 mutants (unlimited→2, off-by-one grouping, dropped per-segment floor, ignored
    chunk cap, error accounting forgetting `handed`) each caught. One real defect found by the new Python
@@ -189,12 +190,33 @@ DEFERRED, not refused, and the Rust workaround is wanted in parallel in its own 
    `VAAYU_MAX_SQES_PER_ENTER=-3` would have silently DISABLED a configured cap; invalid values are now
    ignored, never clamped.
    **STILL OPEN, in order:**
-   a. [ ] **bpftrace proof — needs the USER's `sudo` (password required in-session).**
-      `sudo bash plans/probes/bpf_premise.sh` — model-free, sweeps `idle / 32 / 3 / cap2 / cap2+chunk2 /
-      qd1` against the real O_DIRECT read path; expect `nvme_queue_rqs` NON-ZERO at `to_submit` 3 and 32
-      and **ZERO** at 1 and 2. **Until this is recorded the mitigation is REASONED, NOT PROVED** — the
-      claim is about kernel-internal behaviour and the perf numbers say nothing about it. Never
-      ptrace/strace/py-spy a live Vaayu; kprobes are safe.
+   a. [bug] **THE PLAN'S ACCEPTANCE TEST IS REFUTED — measured 2026-11-17 (`plans/probes/bpf_premise.sh`,
+      root).** `nvme_queue_rqs` does NOT fall to zero with the cap on and CANNOT: hits were FLAT across
+      every arm — base(32) 238566, thresh3 240335, cap2 239205, cap2chunk2 237920, **qd1(to_submit=1)
+      238246**. So the plan's §1 claim "a plugged batch is the only way `nvme_queue_rqs` runs at all" is
+      WRONG, and **DoD #3 as written must not be used as the gate.** It conflated two fields of the same
+      plug: `plug->cached_rqs` (pre-allocated SPARES — what the race corrupts; filled ONLY when
+      `nr_ios > 1`, which only io_uring's multi-SQE plug ever does here) vs `plug->rq_list` (requests for
+      BATCH DISPATCH — what drives `.queue_rqs`; accumulates under ANY plug, including the `nr_ios == 1`
+      plug iomap's direct-IO path starts). A ~1 MiB chunk splits into 8x 128 KiB bios, so one `io_read`
+      fills iomap's own plug and reaches `nvme_queue_rqs` with no io_uring plug at all. Being IN that
+      function is not the hazard; being handed a request with `mq_hctx == NULL` is.
+      **The mitigation's logic is NOT refuted** — at `to_submit <= 2`, `need_plug` is false, io_uring
+      starts no plug, iomap's carries `nr_ios == 1`, so `nr_tags == 1`, the batch-alloc path is skipped
+      and `cached_rqs` stays empty, so the race's peek returns NULL. But that is REASONING, NOT MEASURED.
+      **What the same run DID prove — the implementation, and the unit tests against the real kernel.**
+      `to_submit` histograms: base `[32,64)`; thresh3 `[2,4)` 41327 = 11.00 enters/read (32 = 3x10+2);
+      cap2 `[2,4)` 59808 + `[0]` 3738 = **17.00 enters/read, exactly what the unit test predicts**;
+      cap2chunk2 `[2,4)` 3728 + `[0]` 3728 = **2.00, also exact**; qd1 `[1]`. Bandwidth 5.82-5.87 GiB/s in
+      every arm — the ~0 cost reconfirmed on a different instrument.
+   a2.[ ] **CORRECTED gate — STILL TO RUN, needs the USER's `sudo`** (password required in-session):
+      `sudo bash plans/probes/bpf_cached_rqs.sh`. Watches the PRECONDITION, not a consequence:
+      **`__blk_mq_alloc_requests_batch`** (a real probeable symbol here; called only when `nr_tags > 1`
+      and it is what fills `cached_rqs`, so its hit count IS precondition A) and
+      **`blk_start_plug_nr_ios`** (`arg1` = `nr_ios`; io_uring passes `max_ios` when
+      `need_plug = max_ios > 2`, iomap passes 1 — pins the threshold). Expect both NON-ZERO at
+      `to_submit` 32 and 3, **ABSENT** at 2 and 1 with only `nr_ios=1` there. Until recorded, the
+      mitigation stays REASONED, NOT PROVED. Never ptrace/strace/py-spy a live Vaayu; kprobes are safe.
    b. [ ] **Flip the default?** Both knobs still ship `0`. Turning `NVME_MAX_SQES_PER_ENTER` to `2` is a
       behaviour change for every user on every kernel — the user's call, measurement above.
    c. [ ] **§9 release.** Committed in the private `vaayu_rust` repo; **NOT released.** Bump the version in

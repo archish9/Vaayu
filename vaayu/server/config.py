@@ -333,8 +333,18 @@ ENABLE_EXPERT_USAGE = False
 #   B  a blocking `GFP_NOIO` allocation inside the submit. This drive's
 #      `max_hw_sectors_kb` is 128 -- a HARDWARE limit that cannot be raised -- so
 #      every chunk above that must split a bio. Unavoidable.
-# Removing A closes the window, and also takes us out of the batch-dispatch
-# function that oopsed.
+# Removing A closes the window: with <= 2 SQEs per enter io_uring starts no
+# plug, the direct-IO path's own plug carries nr_ios == 1, so the batch
+# allocation that fills `cached_rqs` is skipped and the race's peek finds
+# nothing.
+#
+# MEASURED CAVEAT (2026-11-17, bpftrace): this does NOT stop us entering
+# `nvme_queue_rqs`. That is reached via the plug's DISPATCH list (`rq_list`),
+# which fills under ANY plug -- a ~1 MiB chunk splits into 8 x 128 KiB bios, so
+# one read fills the direct-IO path's own plug -- and its hit count is FLAT at
+# every `to_submit` (~238k in 5 s at both 32 and 1). Being in that function is
+# not the hazard; being handed a request with `mq_hctx == NULL` is. Do not use
+# "zero nvme_queue_rqs" as a check that these caps are working.
 #
 #   NVME_MAX_SQES_PER_ENTER   SQEs per `io_uring_enter`. 2 removes the plug.
 #                             0 = unlimited = pre-workaround behaviour.

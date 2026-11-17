@@ -352,9 +352,13 @@ def _ensure_executor():
 # booting a patched kernel is the REAL fix). io_uring starts a block plug only
 # when one io_uring_enter submits MORE THAN 2 SQEs (`io_submit_state_start`:
 # `need_plug = max_ios > 2`), and the plug's cached-request list is what the race
-# corrupts, so capping what one enter carries removes the window and keeps us out
-# of `nvme_queue_rqs` entirely. `_MAX_CHUNKS_PER_WAVE` bounds how many SQEs a
-# wave needs at all, which is what makes the first cap cheap.
+# corrupts, so capping what one enter carries removes the window: io_uring then
+# starts no plug at all, the direct-IO path's own plug carries nr_ios == 1, and
+# the batch allocation that fills `cached_rqs` is skipped. It does NOT keep us
+# out of `nvme_queue_rqs` -- measured flat at ~238k hits in 5 s at every
+# `to_submit` including 1, because that path is driven by the plug's DISPATCH
+# list, which fills under any plug (2026-11-17). `_MAX_CHUNKS_PER_WAVE` bounds
+# how many SQEs a wave needs at all, which is what makes the first cap cheap.
 #
 # 0 = unlimited = the behaviour before this knob existed, on both. The server
 # sets them from `config.py` before the load (`set_sqe_caps`); the two env vars
