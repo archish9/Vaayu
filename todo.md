@@ -253,9 +253,30 @@ DEFERRED, not refused, and the Rust workaround is wanted in parallel in its own 
       **wheel ONLY, never `maturin publish`** (it uploads an sdist and leaks the source); then verify
       `https://pypi.org/simple/vaayu-rust/` lists no `.tar.gz`. Until then the knob works only on this
       box's `maturin develop` build and every other machine takes the stale-wheel WARNING path.
-   d. [ ] Not measured: Qwen3-Next-80B (plan called it optional, least disk-bound) and the fused-EXL3
-      gate (`FUSED_EXL3_CKPT=`, model `darkbit1001--Qwen3.6-35B-A3B-EXL3-6.00bpw-hb6`) — worth a run since
-      this touches shared I/O infra, but outside the plan's stated scope.
+   d. [x] **fused-EXL3 DONE 2026-11-17 — gate passes AND both caps are a small WIN there.**
+      Gate `tests/test_fused_exl3_gate.py` with `FUSED_EXL3_CKPT=darkbit1001--Qwen3.6-35B-A3B-EXL3-6.00bpw-hb6`:
+      **3 passed in 23.65 s**, ring line proves the shipped cap was live
+      (`max_sqes_per_enter=2  max_chunks_per_wave=0`), **ppl 5.98** = the figure recorded for this
+      checkpoint BEFORE the caps existed. A/B, 7 mirrored arms, 96-token decode slope (65 ms/token needs
+      a wide slope; 16 tokens is swamped by wall noise), this model re-streams **24.44 GB per request's
+      first forward** at ~4.9 GB/s even on a prefix HIT: decode `off` **66.18** → `cap` 65.63
+      (**−0.82 %**) → `capchunk` 64.77 (**−2.13 %**); cold −0.51 % / −1.60 %; prefill token (the most
+      disk-dominated quantity) −1.02 % / −2.03 %. **Monotone FASTER on all three metrics**, `off` arms
+      bracket the rest (65.73, 66.62) while each capped arm's spread is 0.06-0.35 ms, so it is not drift.
+      Bigger chunks suit a big sequential prefill — matches the drive-level finding. **The only model so
+      far where the chunk cap clearly earns its keep**; does not change the shipped default, since
+      `per_enter=2` alone removes the hazard and the knob is reachable.
+   d2.[bug] **`CLAUDE.md` §0/§5 ARE STALE: 3 of the 6 listed on-device targets DO NOT EXIST.** Audited
+      2026-11-17 against `/home/a/code/ai-ml/models` (one filesystem; nothing in the HF cache; no
+      reference in any run log's `env.json`): **Qwen3-Next-80B-A3B int4 ABSENT** (§0 calls it "the
+      most-tested and most perf-tuned path" and "the fastest model on this box"), **gpt-oss-20b ABSENT**
+      (pages of §0 detail: S8/S14/S18/S35/S35-E/S50/S51), **DeepSeek-V4-Flash-0731 ABSENT**. Present:
+      MiniMax-M2.7 135 G, Llama-3.3-70B 39 G, Llama-3.2-1B 12 G, **plus Qwen3.6-35B-A3B EXL3 52 G which
+      is NOT in the §5 table at all**. Consequence: §5's "test more than one geometry" cannot be
+      satisfied as written, and three MoE forwards (fused non-EXL3, whole-layer, module-list non-EXL3)
+      have NO on-device model — any claim of an on-device result for them is unverifiable.
+      **`CLAUDE.md` deliberately NOT edited: it is the governing file and that is the USER's call.**
+      Unblocks: user decides to correct §0/§5, or to re-download one or more checkpoints.
    **It is a workaround, not a fix** — set `NVME_MAX_SQES_PER_ENTER` back to `0` once the kernel moves.
 
 **Do NOT fold this into the run-E stall report.** `VAAYU-RUN-E-REPORT.md` §2.1 (stream starts, ~10 chunks,
