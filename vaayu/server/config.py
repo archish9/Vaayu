@@ -357,8 +357,30 @@ ENABLE_EXPERT_USAGE = False
 # The wave itself is unchanged either way: every chunk of an expert is still in
 # flight together, and the device still sees the same N reads.
 #
-# MEASURED COST OF GETTING IT WRONG: see the todo.md SQE-PLUG row.
-NVME_MAX_SQES_PER_ENTER = 0
+# WHY THE FIRST ONE SHIPS ON (2026-11-17). Both halves were measured:
+#
+#   it works -- bpftrace, root, on the real O_DIRECT read path. `nr_ios > 1` and
+#   the batch request allocation that fills `cached_rqs` are both PRESENT at
+#   to_submit 32 and 3, and both ABSENT at 2 and 1, tracking each other 1:1
+#   (3679:3679 and 36930:36930). So at <= 2 nothing allocates a batch, the list
+#   the race corrupts is never populated, and its peek finds nothing. The `> 2`
+#   threshold is empirical, not read off kernel source: 3 plugs, 2 does not.
+#
+#   it costs nothing -- measured through this server at N=1, mirrored arms,
+#   decode by difference. MiniMax-M2.7 EXL3 518.86 -> 519.60 ms/token
+#   (+0.14 %); Llama-3.3-70B dense -0.16 %, consistent across two disk-work
+#   regimes. Output BIT-IDENTICAL in all 20 arms. Full numbers: todo.md's
+#   SQE-PLUG row.
+#
+# The second one stays OFF: `2` on the first already removes the hazard
+# completely, so the chunk cap's only remaining effect is fewer syscalls (one
+# expert read = 2 enters instead of 16), which measured as nothing. It is kept
+# reachable for a box where syscall overhead does bite.
+#
+# SET THE FIRST BACK TO 0 once this box boots a patched kernel (>= 7.0.0-28).
+# It works around a defect that is already fixed upstream, and keeping it past
+# that means paying 16 extra syscalls per expert read for nothing.
+NVME_MAX_SQES_PER_ENTER = 2
 NVME_MAX_CHUNKS_PER_WAVE = 0
 
 # --------------------------------------------------------------------------

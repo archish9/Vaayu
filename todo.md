@@ -179,8 +179,8 @@ DEFERRED, not refused, and the Rust workaround is wanted in parallel in its own 
    reports the EFFECTIVE pair in `env.json` and both env names are in `_KNOWN_VAAYU_VARS`. An older wheel
    raises `TypeError` on the 4-arg call → falls back to the old arity and WARNS, naming `CVE-2026-64017`
    and `INERT`, because silently dropping the caps leaves an operator believing a box is mitigated.
-   **Floors: `cargo test` 38 → `46 passed, 0 failed, 1 ignored`; pytest 4242 → `4266 passed, 92 skipped,
-   1 failed` (364.09 s, FOREGROUND), reconciled 4359 collected = 4335 + 24 new (15 `test_sqe_caps.py`,
+   **Floors: `cargo test` 38 → `46 passed, 0 failed, 1 ignored`; pytest 4242 → `4267 passed, 92 skipped,
+   1 failed` (364.50 s, FOREGROUND), reconciled 4360 collected = 4335 + 25 new (16 `test_sqe_caps.py`,
    1 `test_server_config_module.py`, 8 `test_docs_speed_knobs.py` — two of them pin the refutation above so
    the wrong claim cannot ship again); the 1 failure is the pre-existing
    `config_local MAX_BATCH_SIZE=3` artifact.** All 8 new Rust tests passed first run, so they were
@@ -209,16 +209,45 @@ DEFERRED, not refused, and the Rust workaround is wanted in parallel in its own 
       cap2 `[2,4)` 59808 + `[0]` 3738 = **17.00 enters/read, exactly what the unit test predicts**;
       cap2chunk2 `[2,4)` 3728 + `[0]` 3728 = **2.00, also exact**; qd1 `[1]`. Bandwidth 5.82-5.87 GiB/s in
       every arm — the ~0 cost reconfirmed on a different instrument.
-   a2.[ ] **CORRECTED gate — STILL TO RUN, needs the USER's `sudo`** (password required in-session):
-      `sudo bash plans/probes/bpf_cached_rqs.sh`. Watches the PRECONDITION, not a consequence:
-      **`__blk_mq_alloc_requests_batch`** (a real probeable symbol here; called only when `nr_tags > 1`
-      and it is what fills `cached_rqs`, so its hit count IS precondition A) and
-      **`blk_start_plug_nr_ios`** (`arg1` = `nr_ios`; io_uring passes `max_ios` when
-      `need_plug = max_ios > 2`, iomap passes 1 — pins the threshold). Expect both NON-ZERO at
-      `to_submit` 32 and 3, **ABSENT** at 2 and 1 with only `nr_ios=1` there. Until recorded, the
-      mitigation stays REASONED, NOT PROVED. Never ptrace/strace/py-spy a live Vaayu; kprobes are safe.
-   b. [ ] **Flip the default?** Both knobs still ship `0`. Turning `NVME_MAX_SQES_PER_ENTER` to `2` is a
-      behaviour change for every user on every kernel — the user's call, measurement above.
+   a2.[x] **CORRECTED gate RUN 2026-11-17 — IT PASSES. The mitigation is PROVED.**
+      `plans/probes/bpf_cached_rqs.sh` (root), 5 probes attached, 5 s per arm. `nr_ios` (io_uring's
+      plug) and `blk_mq_get_tags` (the batch allocation that FILLS `cached_rqs`): base/32 →
+      `nr_ios=32` 3679 hits = 1/read and get_tags 3679; thresh3/3 → `nr_ios=3` 36930 = 10/read and
+      get_tags 36930; **cap2, cap2chunk2 and qd1 → BOTH ABSENT.** So at `to_submit <= 2` nothing
+      allocates a batch, `cached_rqs` is never populated, and the race's peek finds nothing —
+      **precondition A is gone.** get_tags tracks `nr_ios>1` **1:1** at both plugged values
+      (3679:3679, 36930:36930) and both vanish together, which retires empirically the caveat that
+      get_tags' single-caller property was only recalled from kernel source. **The `> 2` threshold is
+      now EMPIRICAL:** 3 plugs, 2 does not; and thresh3 is self-consistent (32 = 3x10+2 → ten enters
+      carry 3 and plug, the eleventh carries 2 and does not = the 10 plugs/read seen against 11.00
+      enters/read).
+      Incidental: `blk_start_plug` is INLINED here, so iomap's `nr_ios==1` plug is invisible to the
+      probe in every arm — does not weaken the result, since get_tags is process-wide and absent.
+      `blk_mq_free_plug_rqs` never fired for us in any arm (uninformative, as flagged): `cached_rqs`
+      was always fully consumed, so the race needs a CONCURRENT flush to free it mid-peek —
+      consistent with 1 occurrence in 33 boots. `nvme_queue_rqs` entries DO fall with bigger chunks
+      (236k → 100k → 57k at 32/2/1 chunks per read) — fewer plug flushes, but not the hazard.
+      **Two script bugs fixed to get here, both mine:** v1 probed
+      `__blk_mq_alloc_requests_batch`, which IS in `/proc/kallsyms` but is NOT traceable (inlined or
+      `notrace`) — kallsyms is the WRONG oracle, the real list is
+      `/sys/kernel/tracing/available_filter_functions` (root-only, so the script now PREFLIGHTS each
+      probe); and the attach guard grepped for `"Attaching"`, which bpftrace prints BEFORE it fails,
+      so one dead symbol silently killed all six arms and looked like six empty results. Guard now
+      also requires the process alive and no ERROR line. Never ptrace/strace/py-spy a live Vaayu;
+      kprobes are safe.
+   b. [x] **DEFAULT FLIPPED ON 2026-11-17: `NVME_MAX_SQES_PER_ENTER = 2`, `NVME_MAX_CHUNKS_PER_WAVE = 0`**,
+      in `config.py` AND as the `ServerConfig` dataclass default (otherwise a caller building one
+      directly is silently unmitigated). This executes the plan's own pre-authorized acceptance
+      (<3 % both models, ids identical) with the gate replaced, since the plan's gate was refuted.
+      Verified end-to-end on a PLAIN boot with NO env override: ring line
+      `max_sqes_per_enter=2  max_chunks_per_wave=0`, `env.json` storage `2`/`0`, and both env vars
+      `null` — proving the value came from `config.py`, not a leaked variable.
+      Chunk cap stays `0`: `2` removes the hazard alone, so the chunk cap's only remaining effect is
+      2 enters per expert read instead of 16, which measured as nothing. Kept reachable.
+      **REVERT CONDITION: set it back to `0` once this box boots >= 7.0.0-28** — past that it is 16
+      extra syscalls per expert read for no benefit. `test_the_shipped_defaults_are_the_measured_ones`
+      pins both values against the TRACKED config file and asserts the dataclass agrees; its failure
+      message names the revert condition.
    c. [ ] **§9 release.** Committed in the private `vaayu_rust` repo; **NOT released.** Bump the version in
       BOTH `Cargo.toml` and `pyproject.toml`, `maturin build --release --zig`, `maturin upload … *.whl` —
       **wheel ONLY, never `maturin publish`** (it uploads an sdist and leaks the source); then verify
@@ -227,7 +256,7 @@ DEFERRED, not refused, and the Rust workaround is wanted in parallel in its own 
    d. [ ] Not measured: Qwen3-Next-80B (plan called it optional, least disk-bound) and the fused-EXL3
       gate (`FUSED_EXL3_CKPT=`, model `darkbit1001--Qwen3.6-35B-A3B-EXL3-6.00bpw-hb6`) — worth a run since
       this touches shared I/O infra, but outside the plan's stated scope.
-   **It is a workaround, not a fix** — revert it, or flip its default off, once the kernel moves.
+   **It is a workaround, not a fix** — set `NVME_MAX_SQES_PER_ENTER` back to `0` once the kernel moves.
 
 **Do NOT fold this into the run-E stall report.** `VAAYU-RUN-E-REPORT.md` §2.1 (stream starts, ~10 chunks,
 then 300 s silence) also happened at 13:11 **with no kernel fault in the log** — a separate Vaayu bug, since

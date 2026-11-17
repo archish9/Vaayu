@@ -153,9 +153,45 @@ def test_the_caps_are_a_server_config_knob():
                          ("nvme_max_chunks_per_wave", "NVME_MAX_CHUNKS_PER_WAVE")):
         assert field in fields
         assert hasattr(config, const)
-        assert getattr(config, const) == 0, (
-            f"{const} must ship OFF: this is a workaround for a kernel bug, and "
-            f"its cost is measured per model (todo.md SQE-PLUG row)")
+
+
+def test_the_shipped_defaults_are_the_measured_ones():
+    """`2` and `0` -- and the dataclass must agree with the tracked config file.
+
+    Both halves were measured before this was turned on (2026-11-17). bpftrace
+    on the real O_DIRECT read path showed `nr_ios > 1` and the batch allocation
+    that fills `cached_rqs` present at to_submit 32 and 3 and absent at 2 and 1,
+    tracking each other 1:1; the server A/B showed +0.14 % on MiniMax-M2.7 and
+    -0.16 % on dense with bit-identical output in all 20 arms. The chunk cap
+    stays 0 because `2` above removes the hazard on its own, leaving it only
+    fewer syscalls, which measured as nothing.
+
+    Read against the TRACKED file, not the imported module: a developer's
+    machine-local `config_local.py` must not decide whether the suite passes.
+    """
+    import ast
+    import inspect
+
+    from vaayu.server import config as cfg
+    from vaayu.server.app import ServerConfig
+
+    tracked = {}
+    for node in ast.parse(inspect.getsource(cfg)).body:
+        if isinstance(node, ast.Assign) and isinstance(node.targets[0], ast.Name):
+            try:
+                tracked[node.targets[0].id] = ast.literal_eval(node.value)
+            except ValueError:
+                pass
+    assert tracked["NVME_MAX_SQES_PER_ENTER"] == 2, (
+        "this is the measured mitigation for a kernel bug that hard-hung the box; "
+        "set it back to 0 only once the box boots a patched kernel (>= 7.0.0-28)")
+    assert tracked["NVME_MAX_CHUNKS_PER_WAVE"] == 0
+
+    defaults = {f.name: f.default for f in dataclasses.fields(ServerConfig)}
+    assert defaults["nvme_max_sqes_per_enter"] == tracked["NVME_MAX_SQES_PER_ENTER"], (
+        "the dataclass default and config.py must agree, or a caller that builds a "
+        "ServerConfig directly is silently unmitigated")
+    assert defaults["nvme_max_chunks_per_wave"] == tracked["NVME_MAX_CHUNKS_PER_WAVE"]
 
 
 def test_the_caps_are_applied_before_the_model_loads(monkeypatch):

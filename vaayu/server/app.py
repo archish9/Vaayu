@@ -152,7 +152,12 @@ class ServerConfig:
     # starting a block plug, working around CVE-2026-64017 (see config.py). 0 =
     # unlimited = pre-workaround behaviour. Applied to the persister BEFORE the
     # load, because the rings are built once during it.
-    nvme_max_sqes_per_enter: int = 0
+    #
+    # 2 here, as in config.py, because the hazard is real on this kernel and the
+    # measured cost is nothing (+0.14 % MiniMax, -0.16 % dense, ids identical).
+    # A caller that builds a ServerConfig directly would otherwise be silently
+    # unmitigated. The chunk cap stays 0: the first one removes the hazard alone.
+    nvme_max_sqes_per_enter: int = 2
     nvme_max_chunks_per_wave: int = 0
 
 
