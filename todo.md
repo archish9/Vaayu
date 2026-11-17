@@ -139,12 +139,22 @@ DEFERRED, not refused, and the Rust workaround is wanted in parallel in its own 
    escape hatch (`GRUB_TIMEOUT_STYLE=menu`, `GRUB_TIMEOUT=5`, back up `/etc/default/grub` first — there is
    NO backup today) in doc §8.4. The real risk of the move is the CUDA 13.0 / exllamav3 stack, not the driver.
    Canary after any long run: `journalctl -b -k | grep blk_mq_submit_bio` must stay empty.
-2. [~] Rust workaround — **BUILT AND MEASURED 2026-11-17; blocked only on the bpftrace proof (needs
-   your `sudo`) and the PyPI release.** Plan `docs/2026-11-08-SQE-PLUG-rust-mitigation-PLAN.md`, results
-   `docs/2026-11-17-SQE-PLUG-rust-mitigation-RESULTS.md`. **Two knobs, both shipping `0` = unlimited =
-   bit-for-bit the old behaviour:** `NVME_MAX_SQES_PER_ENTER` (SQEs per `io_uring_enter`; `2` means
+   **ON THE DAY THIS HAPPENS, do row 2's revert: set `NVME_MAX_SQES_PER_ENTER` back to `0`** in
+   `vaayu/server/config.py` AND the `ServerConfig` dataclass default, and update
+   `test_the_shipped_defaults_are_the_measured_ones`, which pins `2` and whose failure message names
+   this condition. Past 7.0.0-28 the cap is 16 extra syscalls per expert read for no benefit.
+2. [x] Rust workaround — **DONE 2026-11-17: built, measured, PROVED, default ON, and RELEASED as
+   `vaayu-rust` 0.3.0.** Plan `docs/2026-11-08-SQE-PLUG-rust-mitigation-PLAN.md` (read its correction
+   banner first — its §4.1/§6/§8.3 acceptance test is refuted), results
+   `docs/2026-11-17-SQE-PLUG-rust-mitigation-RESULTS.md`. **Two knobs. `0` = unlimited = bit-for-bit the
+   old behaviour, which is what the CODE defaults to; the SERVER now ships `2`/`0`** (step b flipped it
+   once the gate passed — this header previously said both ship `0`, which stopped being true that day):
+   `NVME_MAX_SQES_PER_ENTER` (SQEs per `io_uring_enter`; `2` means
    `need_plug = max_ios > 2` is false, so io_uring never starts the block plug whose cached-request list
-   the race corrupts, and we never reach `nvme_queue_rqs`) and `NVME_MAX_CHUNKS_PER_WAVE` (chunks one read
+   the race corrupts. **It does NOT stop us reaching `nvme_queue_rqs`** — that was this row's own refuted
+   claim, see step a: `nvme_queue_rqs` is driven by `plug->rq_list`, which fills under iomap's
+   `nr_ios == 1` plug too, and measured FLAT at ~238k in every arm including `to_submit=1`)
+   and `NVME_MAX_CHUNKS_PER_WAVE` (chunks one read
    is cut into, i.e. how many SQEs the wave needs at all; floored at the segment count since a chunk may
    not cross a segment). Env: `VAAYU_MAX_SQES_PER_ENTER` / `VAAYU_MAX_CHUNKS_PER_WAVE`, which override
    config so an arm needs no edit. Rust: `SqeCaps` on `RingState`, seeded from globals set by
@@ -190,7 +200,13 @@ DEFERRED, not refused, and the Rust workaround is wanted in parallel in its own 
    `VAAYU_MAX_SQES_PER_ENTER=-3` would have silently DISABLED a configured cap; invalid values are now
    ignored, never clamped.
    **STILL OPEN, in order:**
-   a. [bug] **THE PLAN'S ACCEPTANCE TEST IS REFUTED — measured 2026-11-17 (`plans/probes/bpf_premise.sh`,
+   a. [x] **CORRECTED EVERYWHERE `93097a8` — the wrong claim no longer ships.** Fixed in `README.md`,
+      `documentation/server.md`, `vaayu/server/config.py`, the persister comment, the Rust `SqeCaps`
+      doc comment, this row's own header, and as a banner on the plan. Two tests in
+      `tests/test_docs_speed_knobs.py` pin it: the doc rows must name the real fix and must NOT claim
+      `nvme_queue_rqs` is eliminated, so it cannot be re-derived into the docs. The finding itself,
+      kept because it is the reason the gate changed:
+      **THE PLAN'S ACCEPTANCE TEST IS REFUTED — measured 2026-11-17 (`plans/probes/bpf_premise.sh`,
       root).** `nvme_queue_rqs` does NOT fall to zero with the cap on and CANNOT: hits were FLAT across
       every arm — base(32) 238566, thresh3 240335, cap2 239205, cap2chunk2 237920, **qd1(to_submit=1)
       238246**. So the plan's §1 claim "a plugged batch is the only way `nvme_queue_rqs` runs at all" is
@@ -248,11 +264,26 @@ DEFERRED, not refused, and the Rust workaround is wanted in parallel in its own 
       extra syscalls per expert read for no benefit. `test_the_shipped_defaults_are_the_measured_ones`
       pins both values against the TRACKED config file and asserts the dataclass agrees; its failure
       message names the revert condition.
-   c. [ ] **§9 release.** Committed in the private `vaayu_rust` repo; **NOT released.** Bump the version in
-      BOTH `Cargo.toml` and `pyproject.toml`, `maturin build --release --zig`, `maturin upload … *.whl` —
-      **wheel ONLY, never `maturin publish`** (it uploads an sdist and leaks the source); then verify
-      `https://pypi.org/simple/vaayu-rust/` lists no `.tar.gz`. Until then the knob works only on this
-      box's `maturin develop` build and every other machine takes the stale-wheel WARNING path.
+   c. [x] **§9 release DONE 2026-11-17 — `vaayu-rust` 0.3.0 is on PyPI, so the caps now actually SHIP.**
+      Version bumped in BOTH `Cargo.toml` and `pyproject.toml` (maturin takes the PyPI version from
+      pyproject, cargo from Cargo.toml — a mismatch publishes the wrong one), `maturin build --release
+      --zig`, then `maturin upload … target/wheels/*.whl`. **`--zig` is mandatory**: a plain build tags
+      `linux_x86_64`, which PyPI REJECTS. **Wheel only; `maturin publish` was NOT used** — with `--zig`
+      it builds through an sdist and uploads the `.tar.gz`, i.e. the whole secret `src/`, which already
+      happened once on 0.2.0.
+      **Verified, both halves:** `https://pypi.org/simple/vaayu-rust/` lists ONLY `.whl` (0.2.0 and
+      0.3.0, no `.tar.gz` — source stayed secret); and a throwaway venv with no source present
+      (`python3 -m venv /tmp/t && /tmp/t/bin/pip install --upgrade vaayu-rust`) pulled 0.3.0 and reports
+      `init_ring_pool(pool_size, queue_depth, max_sqes_per_enter=0, max_chunks_per_wave=0)`.
+      **The ARITY is the check that matters, not that `import` succeeded** — a 2-arg wheel imports
+      perfectly well and then silently takes the `TypeError` fallback, so `config.py` would claim `2`
+      while the box ran unmitigated. Floors bumped to `vaayu-rust>=0.3.0` in `requirements.txt`,
+      `install.sh` and `setup.py`; `tests/test_sqe_caps.py` 16 passed. **KEEP the stale-wheel fallback +
+      `INERT` warning** — still correct for a user who has not upgraded, and
+      `test_a_wheel_too_old_for_the_caps_says_so_and_still_loads` pins it.
+      Rust repo: `e7d2215` (caps), `d87fc5c` (comment fix), `63fef53` (0.3.0), `18841b0` (lockfile).
+      Vaayu repo: `bae188c` (reachable), `93097a8` (`nvme_queue_rqs` claim corrected), `0c8d310`
+      (default flipped), `1950516` (floors).
    d. [x] **fused-EXL3 DONE 2026-11-17 — gate passes AND both caps are a small WIN there.**
       Gate `tests/test_fused_exl3_gate.py` with `FUSED_EXL3_CKPT=darkbit1001--Qwen3.6-35B-A3B-EXL3-6.00bpw-hb6`:
       **3 passed in 23.65 s**, ring line proves the shipped cap was live
