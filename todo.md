@@ -275,8 +275,23 @@ DEFERRED, not refused, and the Rust workaround is wanted in parallel in its own 
       is NOT in the §5 table at all**. Consequence: §5's "test more than one geometry" cannot be
       satisfied as written, and three MoE forwards (fused non-EXL3, whole-layer, module-list non-EXL3)
       have NO on-device model — any claim of an on-device result for them is unverifiable.
-      **`CLAUDE.md` deliberately NOT edited: it is the governing file and that is the USER's call.**
-      Unblocks: user decides to correct §0/§5, or to re-download one or more checkpoints.
+      **FIXED 2026-11-17 at the user's instruction** (`CLAUDE.md` §0 + §5, 15 edits): §0 opens with the
+      DISK AUDIT and the four surviving checkpoints; the "most-tested path is non-EXL3 MoE (Qwen3-Next)"
+      claim is corrected to EXL3 (MiniMax module-list + Qwen3.6-35B fused-EXL3); the dispatch table's
+      whole-layer, fused-non-EXL3 and module-list-non-EXL3 rows carry `NO MODEL ON DISK` / `ABSENT`
+      markers while KEEPING their perf numbers as history (the precedent the fused-EXL3 row already
+      set); the **fused-EXL3 row is INVERTED the other way — it HAS a model again** (Qwen3.6-35B, gate
+      3/3, ppl 5.98); "four MoE forwards have a model, fused-EXL3 is the only one that does not" becomes
+      **TWO have a model and THREE do not**; "the on-device models sit on four different rows" becomes
+      THREE; §5's table gains a **Qwen3.6-35B-A3B EXL3** row and marks the three absent ones ABSENT; and
+      §5's "test more than one geometry" rule now states explicitly that Qwen3-235B-like, Qwen3-Next-like,
+      gpt-oss-like and DeepSeek-V4-like are SYNTHETIC parametrizations whose checkpoints are gone (tests
+      using them must keep passing; never claim an on-device result from them) while only MiniMax-like and
+      Qwen3.6-35B-like can be checked on hardware. §8's P8 example notes Qwen3-235B is retired.
+      Verified by a mention-by-mention cross-check: every named model that is absent sits next to an
+      ABSENT / HISTORY / NO MODEL / gone marker.
+      **Still open for the USER:** whether to re-download any of the three (that would restore coverage
+      for three MoE forwards); nothing in the code depends on it.
    **It is a workaround, not a fix** — set `NVME_MAX_SQES_PER_ENTER` back to `0` once the kernel moves.
 
 **Do NOT fold this into the run-E stall report.** `VAAYU-RUN-E-REPORT.md` §2.1 (stream starts, ~10 chunks,
