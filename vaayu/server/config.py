@@ -268,6 +268,19 @@ KV_CACHE_MODE = "auto"
 # Every shipped max_seq_len figure was verified on sdpa; "flash_attention_2"
 # derives a larger context at the same reserve, and costs -2.3 % MiniMax /
 # -4.1 % Qwen end-to-end against sdpa.
+#
+# THE MiniMax HALF WAS RE-MEASURED 2026-11-17 AND HOLDS: sdpa 493.42 vs flash
+# 504.26 ms/token, i.e. flash +2.2 % against the -2.3 % on record. Mirrored
+# arms through the server, decode by difference, MAX_SEQ_LEN pinned equal, each
+# arm's kernel proved from the load log; non-overlapping groups, per-name spread
+# 0.16-0.50 %. Probe plans/probes/attn_ab.py, write-up
+# docs/2026-11-17-attn-sdpa-vs-flash-RESULTS.md, numbers also in todo.md.
+# The -4.1 % Qwen half CANNOT be re-measured -- that checkpoint is gone from
+# disk (2026-11-17 audit) -- so read it as history, not as a live figure.
+# Flash's 0 B/score-element (vram_plan.py:114, vs sdpa's 10.9) does hand back
+# 4.08 GiB of reserve, which became 2.4x the expert VRAM cache and bought
+# NOTHING on MiniMax (gb_tok moved 0.08 %). Its real advantage is the larger
+# derived context, not speed.
 ATTN_IMPLEMENTATION = None
 
 # GB of PAGEABLE RAM for the dense layer cache. None derives it from TOTAL RAM

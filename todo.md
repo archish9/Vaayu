@@ -345,6 +345,62 @@ then 300 s silence) also happened at 13:11 **with no kernel fault in the log** �
 root-caused and fixed (see the `RUN-E-STALL` row: `_sse` goes silent for a buffered tool-call body). Only the
 16:26-onward wedge is this kernel bug.
 
+## [x] ATTN-AB — sdpa vs flash_attention_2, measured through the server — DONE 2026-11-17; the figure on record HOLDS
+
+**Verdict: `sdpa` is FASTER on MiniMax. `flash_attention_2` costs +2.2 % on decode.** So `config.py:269`'s
+long-standing "-2.3 % MiniMax" is CONFIRMED, and `config_local.py`'s prose, which claimed the opposite
+direction ("sdpa costs ~-4.1 % vs flash"), was BACKWARDS and is corrected.
+
+**Numbers (durable copy — `docs/` and `plans/` are gitignored).** Probe `plans/probes/attn_ab.py`, raw
+`plans/probes/attn-minimax.json`, write-up `docs/2026-11-17-attn-sdpa-vs-flash-RESULTS.md`.
+
+| | sdpa | flash_attention_2 | delta |
+|---|---|---|---|
+| decode ms/token | **493.42** | **504.26** | **+2.2 % flash** |
+| per-arm | 492.20 / 494.65 | 504.67 / 503.85 | spread 0.50 % / 0.16 % |
+| cold wall s | 29.62 | 29.34 | −0.93 % — **NOT resolvable**, same size as flash's own spread |
+| `reserve_gib` | 8.77 | 4.69 | −4.08 GiB |
+| `expert_vram_cache_gb` | 3.04 | 7.43 | **+2.4×** |
+| `expert_disk` s | 30.6 / 30.2 | 30.8 / 31.2 | flash slightly WORSE |
+| `gb_tok` (prefill token) | 120.69 | 120.59 | −0.08 % |
+
+**Why it is signal:** the groups do not overlap (sdpa's worst 494.65 < flash's best 503.85) and each name's
+internal spread is 4–14× smaller than the gap. Method: 5 whole-server boots `sdpa,sdpa,flash,flash,sdpa`
+(first a PREPENDED throwaway, rest mirrored — arms drift ~3 % by position), decode BY DIFFERENCE
+(`1000*(long-warm)/(n2-n1)`; the summaries' `%.1f` is 100 ms/token of resolution), one prompt three times on
+one session, `MAX_SEQ_LEN` **pinned equal at 16384** in both arms, and **each arm's kernel PROVED** from the
+server's own `Attention implementation:` line — the probe aborts the arm if it is not what was asked for.
+
+**The mechanism, and the prediction it killed.** `vram_plan.py:114` charges the score buffer at 10.9
+B/element for sdpa and **0.0 for flash** (fused/tiled, no S-sized buffer). That landed exactly as designed —
+flash's reserve fell 4.08 GiB and the expert VRAM cache grew 2.4× — **and it bought nothing**: `gb_tok` moved
+0.08 % and `expert_disk` went the wrong way. Independent reconfirmation of the 2026-10-16 MiniMax-tier
+refutation from the opposite direction: VRAM handed to MiniMax's expert tier is not a lever, the attention
+kernel's own arithmetic is. **Flash's real advantage is the LARGER DERIVED CONTEXT at the same reserve**,
+which this probe deliberately did not measure (`MAX_SEQ_LEN` pinned). If that pin is ever removed, re-open
+the choice.
+
+**Output:** both kernels fully deterministic and reproducible across positions; the two differ from each
+other on `long`/`warm`, which is EXPECTED (different accumulation order) and is not a quality verdict from
+one 56-token greedy draw. **Noted for a follow-up, not claimed as a bug:** under flash, prefix-MISS and
+prefix-HIT outputs are byte-identical; under sdpa they differ, reproducibly in both arms. Probably an
+ordinary bf16 tie, but judging it needs a HIT-vs-no-pool-replay on the same tree, which this probe did not
+run.
+
+**Scope limit:** only the MiniMax half was re-measurable. **The "-4.1 % Qwen" figure is permanently
+unverifiable** — Qwen3-Next is gone from disk (2026-11-17 audit) — so it stays marked HISTORY in
+`config.py`, `documentation/server.md` and `vaayu/server/README.md`.
+
+**Why it was run:** removing the leftover `MAX_BATCH_SIZE = 3` from `config_local.py` (a 2026-10-14 batching-
+sweep artefact that was failing `test_max_batch_size_defaults_to_one`; suite now 4268 passed / 0 failed)
+orphaned sdpa's stated reason for being in that file — sdpa was there ONLY because batched decode requires
+it. The figure that would have settled it had no row, no RESULTS doc, and predated the exllamav3 1.6.2
+upgrade (S57) and the S28/S33 host fast paths. It now has all three.
+
+**§8 reachability:** `ATTN_IMPLEMENTATION` is already a server knob (`config.py`, `ServerConfig`,
+`__main__.py`), default `None`. No code change — this row moved only comments, docs and the machine-local
+override. **§9:** no Rust, no PyPI release.
+
 ## [x] LOG-FOLDER-PEER-IP — a mailed `logs/run-*/` folder carried PEER IP ADDRESSES — FIXED 2026-11-09 by option 2 (access log kept, address scrubbed)
 
 **Found 2026-11-08 by the WIRE-TELEMETRY Task 6 review; verified on the code, not inferred.** It contradicts
