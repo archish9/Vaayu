@@ -139,10 +139,21 @@ DEFERRED, not refused, and the Rust workaround is wanted in parallel in its own 
    escape hatch (`GRUB_TIMEOUT_STYLE=menu`, `GRUB_TIMEOUT=5`, back up `/etc/default/grub` first — there is
    NO backup today) in doc §8.4. The real risk of the move is the CUDA 13.0 / exllamav3 stack, not the driver.
    Canary after any long run: `journalctl -b -k | grep blk_mq_submit_bio` must stay empty.
-   **ON THE DAY THIS HAPPENS, do row 2's revert: set `NVME_MAX_SQES_PER_ENTER` back to `0`** in
-   `vaayu/server/config.py` AND the `ServerConfig` dataclass default, and update
-   `test_the_shipped_defaults_are_the_measured_ones`, which pins `2` and whose failure message names
-   this condition. Past 7.0.0-28 the cap is 16 extra syscalls per expert read for no benefit.
+   **ON THE DAY THIS HAPPENS, revisit row 2's cap — it is a CHOICE, not a correctness requirement.**
+   Setting `NVME_MAX_SQES_PER_ENTER` back to `0` means `vaayu/server/config.py` AND the `ServerConfig`
+   dataclass default, plus `test_the_shipped_defaults_are_the_measured_ones`, which pins `2` (so the
+   suite fails until the test is updated too; its message names this condition rather than looking
+   like a regression).
+   **The two sides, honestly.** FOR reverting: on a fixed kernel the cap protects against nothing, and
+   it is 17 `io_uring_enter` syscalls per expert read instead of 1 — carrying a workaround with no
+   remaining reason. AGAINST: it measured neutral-to-better. `per_enter=2` alone was **−0.82 % on
+   fused-EXL3** (Qwen3.6-35B, monotone across decode/cold/prefill-token), +0.14 % MiniMax, −0.16 %
+   dense — the latter two inside noise. So the syscall count argues one way and the stopwatch the
+   other; **nothing is broken if it stays.**
+   **If it does stay, its JUSTIFICATION changes and the prose must change with it:** it stops being a
+   CVE-2026-64017 mitigation and becomes an ordinary perf setting. Rewrite `config.py`'s comment and
+   the test's failure message accordingly, or they will tell a future reader the box is mitigating a
+   bug its kernel no longer has.
 2. [x] Rust workaround — **DONE 2026-11-17: built, measured, PROVED, default ON, and RELEASED as
    `vaayu-rust` 0.3.0.** Plan `docs/2026-11-08-SQE-PLUG-rust-mitigation-PLAN.md` (read its correction
    banner first — its §4.1/§6/§8.3 acceptance test is refuted), results
@@ -260,8 +271,12 @@ DEFERRED, not refused, and the Rust workaround is wanted in parallel in its own 
       `null` — proving the value came from `config.py`, not a leaked variable.
       Chunk cap stays `0`: `2` removes the hazard alone, so the chunk cap's only remaining effect is
       2 enters per expert read instead of 16, which measured as nothing. Kept reachable.
-      **REVERT CONDITION: set it back to `0` once this box boots >= 7.0.0-28** — past that it is 16
-      extra syscalls per expert read for no benefit. `test_the_shipped_defaults_are_the_measured_ones`
+      **REVISIT ONCE THIS BOX BOOTS >= 7.0.0-28 — a CHOICE, not a requirement; the full both-sides
+      argument lives on row 1, where the trigger is.** Short version: past that kernel the cap guards
+      nothing and costs 17 enters per expert read instead of 1, but it measured neutral-to-better
+      (−0.82 % fused-EXL3, +0.14 % MiniMax, −0.16 % dense), so nothing is broken if it stays — only
+      its justification changes, from mitigation to perf setting.
+      `test_the_shipped_defaults_are_the_measured_ones`
       pins both values against the TRACKED config file and asserts the dataclass agrees; its failure
       message names the revert condition.
    c. [x] **§9 release DONE 2026-11-17 — `vaayu-rust` 0.3.0 is on PyPI, so the caps now actually SHIP.**

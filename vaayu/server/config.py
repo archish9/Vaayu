@@ -377,9 +377,19 @@ ENABLE_EXPERT_USAGE = False
 # expert read = 2 enters instead of 16), which measured as nothing. It is kept
 # reachable for a box where syscall overhead does bite.
 #
-# SET THE FIRST BACK TO 0 once this box boots a patched kernel (>= 7.0.0-28).
-# It works around a defect that is already fixed upstream, and keeping it past
-# that means paying 16 extra syscalls per expert read for nothing.
+# REVISIT THE FIRST ONE once this box boots a patched kernel (>= 7.0.0-28) --
+# as a CHOICE, not a correctness requirement. Past that kernel the cap protects
+# against nothing, and it is 17 `io_uring_enter` syscalls per expert read
+# instead of 1. But it did not measure as a cost: `per_enter=2` alone was
+# -0.82 % on fused-EXL3 (monotone across decode/cold/prefill), +0.14 % MiniMax
+# and -0.16 % dense, the latter two inside noise. The syscall count argues for
+# reverting and the stopwatch does not, so nothing is broken if it stays.
+#
+# If it stays, its JUSTIFICATION changes: it is then an ordinary perf setting,
+# not a CVE-2026-64017 mitigation. Rewrite this comment and
+# `test_the_shipped_defaults_are_the_measured_ones`'s failure message if that
+# happens -- otherwise they claim the box mitigates a bug its kernel no longer
+# has.
 NVME_MAX_SQES_PER_ENTER = 2
 NVME_MAX_CHUNKS_PER_WAVE = 0
 
