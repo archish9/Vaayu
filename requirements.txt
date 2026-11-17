@@ -63,7 +63,7 @@ kernels>=0.13.0
 # a prebuilt manylinux abi3 wheel from PyPI — Linux-only. The engine imports it at
 # load and falls back to a slower read path with a [VAAYU-IO] WARNING if absent
 # (see vaayu/persist/safetensor_model_persister.py).
-vaayu-rust>=0.2.0 ; sys_platform == "linux"
+vaayu-rust>=0.3.0 ; sys_platform == "linux"
 
 Pillow
 # HTTP server (vaayu/server) — OpenAI-compatible inference API
