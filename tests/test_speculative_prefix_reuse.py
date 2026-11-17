@@ -6,6 +6,7 @@ _FakeBatchedModel does for batched_generate -- no model load needed.
 """
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from vaayu.prefix_cache import PrefixCacheStore
@@ -218,3 +219,92 @@ def test_miss_then_hit_shortens_the_second_prefill():
 
     assert out1.shape[1] == 5 + 3
     assert out2.shape[1] == 5 + 3
+
+
+def test_an_aborted_speculative_turn_puts_the_popped_prefix_back():
+    """PREFIX-SPEC-NO-RESTORE (2026-11-17). `pc.lookup` POPS the entry and
+    `_persist_and_store` only re-inserts it when the turn finishes, so a turn
+    that dies in between loses that session's prefix PERMANENTLY -- every later
+    turn on the session then prefills in full, which on this workload is the
+    top TTFT lever gone (CLAUDE.md section 0).
+
+    `generate` has carried the fix since I4 (`restore_on_abort`, vaayu_base.py's
+    except around super().generate). `speculative_generate` did not, and it is
+    the path EVERY DENSE LOAD takes -- `use_prompt_lookup="auto"` resolves to
+    True for dense, so `choose_speculative_target` never returns `generate`
+    there.
+    """
+    pc = PrefixCacheStore(budget_bytes=10 ** 9)
+    model = _FakeSpecModel(pc)
+    prompt = torch.tensor([[1, 2, 3, 4, 5]])
+
+    VaayuBaseModel.speculative_generate(model, prompt, max_new_tokens=3,
+                                        session_id="s1")
+    assert (pc.misses, pc.hits) == (1, 0), "premise: round 1 is the MISS that stores"
+
+    # Round 2 dies AFTER the lookup popped the entry: the first forward is the
+    # tail prefill, so raising on the second is an abort mid-generation, where
+    # an OOM or a cancellation lands.
+    real_forward = model.forward
+    seen = {"n": 0}
+
+    def boom(**kwargs):
+        seen["n"] += 1
+        if seen["n"] >= 2:
+            raise RuntimeError("injected: died mid-generation")
+        return real_forward(**kwargs)
+
+    model.forward = boom
+    with pytest.raises(RuntimeError, match="died mid-generation"):
+        VaayuBaseModel.speculative_generate(model, prompt, max_new_tokens=3,
+                                            session_id="s1")
+    model.forward = real_forward
+    assert pc.hits == 1, "premise: round 2's lookup DID pop an entry"
+
+    # Round 3 is the test: the aborted turn must not have cost the session its
+    # prefix.
+    model.forward_calls.clear()
+    VaayuBaseModel.speculative_generate(model, prompt, max_new_tokens=3,
+                                        session_id="s1")
+    assert pc.hits == 2, \
+        "the aborted turn drained the pool: round 3 missed on an entry that " \
+        "round 1 stored and nothing legitimately consumed"
+    assert model.forward_calls[0] < prompt.shape[1], \
+        "round 3 hit, so its prefill must be the tail only, not the whole prompt"
+
+
+def test_the_speculative_path_logs_its_prefix_miss_and_hit(capsys):
+    """PREFIX-SPEC-SILENT (2026-11-17). `generate` prints
+    `[Vaayu-Prefix] MISS ...` / `HIT match_len=M/N ...`; this path did the same
+    lookup and printed nothing, so on a dense load -- which always takes this
+    path -- `server.log` carried no prefix line at all while
+    `requests.jsonl` recorded `prefix_hit: true`. That cost a false bug report
+    (the retracted DENSE-PREFIX-INERT row), and the stored
+    `logs-are-a-support-artifact` rule is that a mailed `logs/run-*/` folder is
+    what Vaayu is debugged from.
+
+    The HIT line must carry the CLAMPED match_len -- `_adopt_prefix_hit`'s
+    return, not `lookup`'s raw value -- or it claims a reuse one position longer
+    than the cache actually kept.
+    """
+    pc = PrefixCacheStore(budget_bytes=10 ** 9)
+    model = _FakeSpecModel(pc)
+    prompt = torch.tensor([[1, 2, 3, 4, 5]])
+
+    VaayuBaseModel.speculative_generate(model, prompt, max_new_tokens=3,
+                                        session_id="s1")
+    miss_out = capsys.readouterr().out
+    # The same wording generate() uses, verbatim -- an unquoted session=, so a
+    # log reader and any line-matching probe cannot tell the two paths apart.
+    assert "[Vaayu-Prefix] MISS session=s1" in miss_out, \
+        f"a MISS on the speculative path must say so; got: {miss_out!r}"
+    assert "prompt_len=5" in miss_out
+
+    VaayuBaseModel.speculative_generate(model, prompt, max_new_tokens=3,
+                                        session_id="s1")
+    hit_out = capsys.readouterr().out
+    assert pc.hits == 1, "premise: round 2 must be a HIT"
+    assert "[Vaayu-Prefix] HIT session=s1" in hit_out, \
+        f"a HIT on the speculative path must say so; got: {hit_out!r}"
+    assert "match_len=4/5" in hit_out, \
+        f"the clamped match_len (4), not lookup's raw 5; got: {hit_out!r}"

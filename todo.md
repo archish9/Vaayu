@@ -387,7 +387,7 @@ absence proves only that the line is absent. The stored `reach-check-enclosing-g
 verify reach AT THE PREDICATE and not at a call-site guard; this is the same error, committed while the
 note was in context.
 
-## [bug] PREFIX-SPEC-SILENT — the speculative path's prefix MISS/HIT is never logged. Found 2026-11-17, NOT fixed
+## [x] PREFIX-SPEC-SILENT — the speculative path's prefix MISS/HIT is never logged — FIXED 2026-11-17
 
 **What is wrong.** `VaayuBaseModel.generate` prints `[Vaayu-Prefix] MISS …` / `HIT match_len=M/N …`
 (`vaayu_base.py:6760`, `:6765`). `speculative_generate` does the identical lookup/adopt/store at
@@ -407,7 +407,26 @@ what `generate` prints and what `restore_on_abort` needs, so capture it rather t
 unclamped `pc.lookup` value. Test: drive `speculative_generate` against the existing
 `tests/test_speculative_prefix_reuse.py` fake and assert both lines appear with the clamped length.
 
-## [bug] PREFIX-SPEC-NO-RESTORE — an aborted speculative request drains the prefix pool permanently. Found 2026-11-17 by code reading, NOT measured, NOT fixed
+**FIXED 2026-11-17** (`vaayu_base.py`, `speculative_generate`). It now prints the same two lines
+`generate` prints, in the same wording — `[Vaayu-Prefix] MISS session=X prompt_len=N — full prefill` and
+`HIT session=X match_len=M/N — prefill only K new positions` — so a log reader cannot tell the two paths
+apart. The HIT line carries the **clamped** `match_len`: the method was calling `_adopt_prefix_hit` bare
+and throwing its return away, which is also what left the abort path with no length to restore to, so one
+line fixed both rows. Test: `test_the_speculative_path_logs_its_prefix_miss_and_hit` in
+`tests/test_speculative_prefix_reuse.py` (asserts the exact wording and `match_len=4/5`, i.e. the clamp,
+not `lookup`'s raw 5).
+
+**Verified end-to-end on a real dense load**, which is the point of the row — the lines now reach the
+mailed artifact. `logs/run-*/server.log` from `plans/probes/prefix_abort_server.py` carries:
+
+    [Vaayu-Prefix] MISS session=abort prompt_len=1953 — full prefill
+    [Vaayu-Prefix] HIT session=abort match_len=1952/1953 — prefill only 1 new positions
+    [Vaayu-Prefix] HIT session=abort match_len=1952/1953 — prefill only 1 new positions
+
+Before the fix that same load printed no prefix line at all while `requests.jsonl` recorded
+`prefix_hit: true`.
+
+## [x] PREFIX-SPEC-NO-RESTORE — an aborted speculative request drains the prefix pool permanently — MEASURED, then FIXED 2026-11-17
 
 **What is wrong.** `pc.lookup` POPS the entry. `generate` wraps `super().generate` in
 `try/except BaseException` and calls `restore_on_abort(pc, resolved_sid, ids_list, kv, match_len)`
@@ -424,6 +443,48 @@ normally still stores, and `RUN-E-STALL` is a row about real clients giving up m
 mid-generation, then the same prompt re-sent on the same session, must show `prefix_hit: true` in
 `requests.jsonl` and does not if this is real. `tests/test_prefix_restore_on_abort.py` is the pattern for
 the unit test.
+
+**MEASURED FIRST, then fixed** — it was filed as a code reading, and the Iron Law says prove it. Driving
+the real `VaayuBaseModel.speculative_generate` against the existing fake, with a raise injected on the
+second forward of turn 2 (i.e. after `lookup` popped the entry):
+
+| turn | expected | before the fix |
+|---|---|---|
+| 1 | MISS, stores | MISS, stores |
+| 2 | HIT, then dies mid-generation | HIT, dies — entry gone |
+| 3 | HIT on turn 1's entry | **MISS** (`assert pc.hits == 2` → `1 == 2`) |
+
+So the defect is real and the blast radius claim stands: `generate` has restored since I4 and this path
+never did, and dense always takes this path.
+
+**FIXED 2026-11-17** (`vaayu_base.py`, `speculative_generate`): an `except BaseException:` clause on the
+method's existing try, mirroring `generate`'s, calling `restore_on_abort(pc, resolved_sid, ids_list, kv,
+match_len)` with the clamped length and re-raising. The checkout tuple is bound to `None` before the try
+for the same reason the file already pre-binds `_saved_vram_layers` — a raise before the lookup must not
+find it unassigned. `restore_on_abort` itself already handles the cases that must NOT be restored
+(one-length and recurrent caches), so nothing new was invented here.
+
+**Blast radius, MEASURED through the server and NARROWER than the row first claimed**
+(`plans/probes/prefix_abort_server.py`, dense Llama-3.2-1B, one session, one boot):
+
+| turn | request | row in `requests.jsonl` |
+|---|---|---|
+| 1 | full | `prefix_hit=False`, 48 tokens, `finish=length` |
+| 2 | streamed, client hangs up after 3 chunks | `prefix_hit=True match=1953`, 8 tokens, **`finish=cancelled cancel_reason=stream_closed`** |
+| 3 | full, same prompt + session | **`prefix_hit=True match=1953`**, 48 tokens |
+
+Turn 2 produced a NORMAL row with `finish=cancelled`, not an error row — so an ordinary disconnect is a
+**cooperative cancel that returns through the store**, exactly as the stored
+`prefix-reuse-premise-traps` finding says, and it never reaches the new except clause. **So this fix
+fires on RAISES — OOM, `_assert_context_fits`, a CUDA error — not on everyday disconnects.** That is the
+honest radius: still every dense load, still a permanent loss of that session's prefix when it happens,
+but rarer than "cancellation is not an edge case here" implied. The unit test covers the raise path
+because the server cannot be made to raise on demand.
+
+**§8 check:** no knob needed (stated, not assumed — it is a correctness fix on a path the server already
+calls); plumbed by construction, since `speculative_generate` IS what `choose_speculative_target` returns;
+and reachable in the server's real mode — the server probe above drove it through
+`/v1/chat/completions` on the default dense configuration.
 
 ## [x] SDPA-PREFIX-HIT — **ROOT-CAUSED AND CLOSED 2026-11-17 AS *NOT A DEFECT*.** It is not an `sdpa` bug and not a prefix-cache bug: the store/restore moves ZERO bits, the HIT just prefills the tail in a separate smaller forward, and a tie-margin argmax flips on the resulting bf16 rounding. The bar the row was holding it to is unachievable in principle
 

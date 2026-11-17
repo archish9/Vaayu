@@ -6928,6 +6928,11 @@ class VaayuBaseModel(GenerationMixin):
             # anywhere inside must not find them unassigned.
             _saved_vram_layers = getattr(self, "_vram_cacheable_layers", None)
             _resized_vram_prefix = False
+            # Same reason, for the except clause: lookup() POPS the prefix entry
+            # and nothing re-inserts it until this method returns, so a raise in
+            # between must be able to put it back. None until a HIT or MISS has
+            # actually checked an entry out.
+            _checked_out = None
 
             try:
                 # This loop honours NOTHING about sampling -- say so rather than hand
@@ -7031,9 +7036,21 @@ class VaayuBaseModel(GenerationMixin):
                     kv, match_len = pc.lookup(session_id, ids_list, device=self.running_device)
                     if kv is None:
                         kv = self._create_kv_cache()
+                        print(f"[Vaayu-Prefix] MISS session={session_id} "
+                              f"prompt_len={input_ids.shape[1]} — full prefill")
                     else:
-                        self._adopt_prefix_hit(
+                        # The CLAMPED length, not lookup()'s raw value: that is
+                        # what crop() used, so it is what the log line may claim
+                        # and what an abort must restore to. Discarding it is how
+                        # this path came to print nothing and restore nothing.
+                        match_len = self._adopt_prefix_hit(
                             kv, match_len, input_ids.shape[1], session_id)
+                        print(f"[Vaayu-Prefix] HIT session={session_id} "
+                              f"match_len={match_len}/{input_ids.shape[1]} — "
+                              f"prefill only {input_ids.shape[1] - match_len} new positions")
+                    _resolved_sid = (session_id if session_id is not None
+                                     else _auto_session_id(ids_list))
+                    _checked_out = (pc, _resolved_sid, ids_list, kv, match_len)
 
                 # A HIT crops `kv` to match_len < prompt length. generate()'s HIT path
                 # gets away with passing the untouched prompt because HF's own
@@ -7231,6 +7248,19 @@ class VaayuBaseModel(GenerationMixin):
                     resolved = session_id if session_id is not None else _auto_session_id(ids_list)
                     self._persist_and_store(pc, resolved, kv, generated[0].tolist())
                 return generated
+            except BaseException:
+                # lookup() above POPPED this entry. Without putting it back, an
+                # aborted turn -- an SSE client disconnecting, a cancellation,
+                # an OOM -- drains the pool permanently, and this is the path
+                # EVERY DENSE LOAD takes (use_prompt_lookup="auto" resolves to
+                # True for dense, so choose_speculative_target never returns
+                # generate there). generate() has had this since I4; this path
+                # did not, measured 2026-11-17 as round 3 missing on an entry
+                # round 1 stored.
+                if _checked_out is not None:
+                    from .prefix_cache import restore_on_abort
+                    restore_on_abort(*_checked_out)
+                raise
             finally:
                 if _resized_vram_prefix:
                     self._vram_cacheable_layers = _saved_vram_layers
