@@ -345,54 +345,87 @@ then 300 s silence) also happened at 13:11 **with no kernel fault in the log** �
 root-caused and fixed (see the `RUN-E-STALL` row: `_sse` goes silent for a buffered tool-call body). Only the
 16:26-onward wedge is this kernel bug.
 
-## [bug] DENSE-PREFIX-INERT — the cross-turn prefix cache prints ENABLED on DENSE models and never runs. Found 2026-11-17, NOT fixed
+## [x] DENSE-PREFIX-INERT — **REFUTED 2026-11-17, the same day it was filed. The dense prefix cache WORKS.** My finding was wrong; what is real is two smaller defects, split out as the two rows below
 
-**What is wrong.** On Llama-3.3-70B-exl3 the server prints
-`[Vaayu] cross-turn prefix cache ENABLED: 3.55 GB budget`, serves requests normally, and **never emits a
-single `[Vaayu-Prefix]` MISS or HIT line.** Llama-3.2-1B behaves the same (`21.97 GB budget`, zero
-events). MiniMax on the same code, same probe, logs `MISS` then `HIT match_len=…` as expected.
+**What I claimed.** That on dense (Llama-3.3-70B-exl3, Llama-3.2-1B) the server prints
+`cross-turn prefix cache ENABLED` and the cache never runs, because `VaayuBaseModel.generate` — "the ONLY
+place the cross-turn lookup/store happens" — is never entered. The instrumentation was right: dense
+really does not enter that method. **The inference from it was wrong, and it is wrong in the one way this
+project keeps writing rules about: I proved a premise about ONE code path and reported a conclusion about
+the FEATURE.**
 
-**Proved by instrumentation, not inferred.** A temporary print at the top of `VaayuBaseModel.generate`
-(right after `pc = getattr(self, "_prefix_cache", None)`, so it fires unconditionally whenever that
-method runs) was added, run against BOTH models, and reverted:
+**What refutes it — the server's own request row, which was on disk the whole time**
+(`logs/run-2026-11-17T12-59-22Z/requests.jsonl`, Llama-3.3-70B, two turns on session `k1`):
 
-| model | debug lines from `generate()` | requests served | prefix events |
-|---|---|---|---|
-| MiniMax-M2.7 | **1** (`cls=VaayuBaseModel pc=False session_id='nopool-k1'`) | yes | yes |
-| Llama-3.3-70B | **0** | yes, 9 token summaries | **none** |
+| turn | prompt_tokens | `prefix_hit` | `prefix_match_tokens` | wall_s | gb_tok |
+|---|---|---|---|---|---|
+| 1 | 703 | false | 0 | 20.25 | 18.99 |
+| 2 | 709 | **true** | **697** | **13.98** | **15.20** |
 
-So on dense, `VaayuBaseModel.generate` — the ONLY place the cross-turn lookup/store happens — is never
-entered. The positive control rules out a dead instrument, and `vaayu.vaayu_base.__file__` confirms the
-server imports the repo copy (only `vaayu_rust` is in site-packages), so the edit was live.
+697 of 709 positions reused, 31 % off the wall clock and 3.8 GB/token less disk. The cache is not inert;
+it is working. `prefix_hit` there is computed from `PrefixCacheStore`'s OWN counters
+(`engine.py:455`, `_prefix_hits()`), which is the authoritative premise proof — independent of any print.
 
-**It is not the obvious suspects:** no speculator is configured (`DRAFTER_MODEL_PATH = None`, no
-speculation lines in the log), so `choose_speculative_target` returns `model.generate`; there is no
-`is_moe` gate anywhere in that method; and no `prefix cache DISABLED` refusal was printed
-(`prefix_cache_refusal_reason` did not fire). All three dense and MoE loads chunk-prefill, so that is not
-the differentiator either. **Where the dense path's generation actually goes is NOT yet established** —
-`vaayu/server/engine.py` calls only `stream_generate`, which calls `choose_speculative_target(...)`'s
-return value, which should be this method. Unresolved.
+**Why `generate` is not entered, and where the lookup actually happens.** `use_prompt_lookup` defaults to
+`"auto"` (`server/app.py:57`), and `resolve_use_prompt_lookup` (`vaayu_base.py:1609`) resolves `auto` to
+**True for every DENSE load** and False for MoE. So a dense load always has a speculator, and
+`choose_speculative_target` hands back `model.speculative_generate`, not `model.generate`. The dense run's
+log says so in plain text — `[Vaayu-Spec] drafted=5 accepted=1 total_new=4/4 accept_rate=20%`, and
+`env.json`'s `speculative` block reads `{"requested": "prompt_lookup", "active": true}`. **I asserted the
+opposite in the filed row** ("no speculator is configured ... no speculation lines in the log"); the lines
+were there and I did not grep for them. `speculative_generate` carries its own full prefix path —
+`pc.lookup` → `_adopt_prefix_hit` → `_persist_and_store` at `vaayu_base.py:7028-7079`, deliberate,
+shipped as Task 5, and covered by `tests/test_speculative_prefix_reuse.py`.
 
-**Why it matters.** CLAUDE.md §0 names cross-turn prefix caching the **top TTFT lever** for this
-workload, and since the 2026-11-17 disk audit **dense is half of everything testable on this box**. A
-lever that reports ENABLED and does nothing is worse than one that is off: `ENABLE_PREFIX_CACHE = True`
-is the shipped default, so every dense user believes they have it. The 2.07× TTFT figure banked for A1
-was measured on MoE.
+**The two real defects this turned up** (both now their own rows): the speculative path's prefix events are
+never PRINTED, which is the whole of what I mistook for a missing feature (`PREFIX-SPEC-SILENT`), and that
+path has no `restore_on_abort`, which `generate`'s does (`PREFIX-SPEC-NO-RESTORE`).
 
-**Found as a side effect** of answering step 2 of the `SDPA-PREFIX-HIT` row (does that bug reproduce on
-dense?). The answer is "it cannot, because dense never takes the path at all" — which is a bigger
-finding than the question.
+**The methodology lesson, stated plainly because it cost a false bug report.** `logs/run-*/requests.jsonl`
+is the premise oracle for "did the feature run" — it is written from the store's counters. A log line's
+absence proves only that the line is absent. The stored `reach-check-enclosing-guard` finding says to
+verify reach AT THE PREDICATE and not at a call-site guard; this is the same error, committed while the
+note was in context.
 
-**Next steps, none taken:**
-1. Establish what dense generation actually calls instead (instrument `stream_generate`'s `target`, and
-   print `type(model).__mro__` for both model kinds).
-2. If the prefix cache genuinely never runs on dense, decide whether it CAN (dense KV is the simple
-   per-token layout, so there is no architectural reason it should not) and wire it, or make the load
-   print an honest refusal instead of `ENABLED`.
-3. Either way a test: a dense model must either log a HIT on a repeat turn or state why not. The
-   assertion that fails today is "ENABLED implies a HIT is reachable".
+## [bug] PREFIX-SPEC-SILENT — the speculative path's prefix MISS/HIT is never logged. Found 2026-11-17, NOT fixed
 
-## [bug] SDPA-PREFIX-HIT — under `sdpa`, a prefix-cache HIT returns a DIFFERENT ANSWER from the uncached computation. `flash_attention_2` is exact. Found 2026-11-17, NOT fixed
+**What is wrong.** `VaayuBaseModel.generate` prints `[Vaayu-Prefix] MISS …` / `HIT match_len=M/N …`
+(`vaayu_base.py:6760`, `:6765`). `speculative_generate` does the identical lookup/adopt/store at
+`:7028-7079` and prints **nothing**. `batched_generate` prints only refusals.
+
+**Blast radius: every DENSE load**, because `use_prompt_lookup="auto"` makes dense speculate by default
+(see the refuted row above), so dense is exactly the case with no prefix logging at all.
+
+**Why it matters beyond tidiness.** It cost a false bug report THIS SESSION — the row above — and the
+stored `logs-are-a-support-artifact` rule says a mailed `logs/run-*/` folder is what the user debugs
+somebody else's box from, alone. A folder whose `requests.jsonl` says `prefix_hit: true` while
+`server.log` shows no prefix line at all invites exactly the wrong conclusion.
+
+**Fix.** Print the same two lines from the speculative path. `speculative_generate` currently DISCARDS
+`_adopt_prefix_hit`'s return (`:7035` calls it bare) — that return is the CLAMPED match_len, which is
+what `generate` prints and what `restore_on_abort` needs, so capture it rather than re-printing the
+unclamped `pc.lookup` value. Test: drive `speculative_generate` against the existing
+`tests/test_speculative_prefix_reuse.py` fake and assert both lines appear with the clamped length.
+
+## [bug] PREFIX-SPEC-NO-RESTORE — an aborted speculative request drains the prefix pool permanently. Found 2026-11-17 by code reading, NOT measured, NOT fixed
+
+**What is wrong.** `pc.lookup` POPS the entry. `generate` wraps `super().generate` in
+`try/except BaseException` and calls `restore_on_abort(pc, resolved_sid, ids_list, kv, match_len)`
+(`vaayu_base.py:6775-6779`) precisely so that an SSE disconnect, a cancellation or an OOM does not drain
+the pool. **`speculative_generate` has no such except block** — `grep -n restore_on_abort vaayu/*.py`
+returns that one call site only. Its `_persist_and_store` runs on the success paths, so an abort anywhere
+between the lookup and the store loses the entry for good.
+
+**Blast radius: every DENSE load** (default speculation), and cancellation is not an edge case here — the
+stored `prefix-reuse-premise-traps` finding records that a client disconnect is a COOPERATIVE cancel that
+normally still stores, and `RUN-E-STALL` is a row about real clients giving up mid-stream.
+
+**UNVERIFIED — this is a code reading, not a measured defect.** Confirm first: a dense request cancelled
+mid-generation, then the same prompt re-sent on the same session, must show `prefix_hit: true` in
+`requests.jsonl` and does not if this is real. `tests/test_prefix_restore_on_abort.py` is the pattern for
+the unit test.
+
+## [x] SDPA-PREFIX-HIT — **ROOT-CAUSED AND CLOSED 2026-11-17 AS *NOT A DEFECT*.** It is not an `sdpa` bug and not a prefix-cache bug: the store/restore moves ZERO bits, the HIT just prefills the tail in a separate smaller forward, and a tie-margin argmax flips on the resulting bf16 rounding. The bar the row was holding it to is unachievable in principle
 
 **What is wrong.** On MiniMax-M2.7, with `ATTN_IMPLEMENTATION = "sdpa"`, a request served from a
 cross-turn prefix-cache HIT produces materially different output from the same prompt run with the
@@ -462,8 +495,8 @@ with that branch.
 |---|---|
 | module-list EXL3 — **MiniMax-M2.7** | **AFFECTED** (above) |
 | fused-EXL3 — Qwen3.6-35B | **cannot be exercised: NO HIT EVER OCCURS.** Two MISSes at 16384/1937 tok and again at 6144/1285. The prefix cache prints ENABLED but with a **0.65 GB** budget (free RAM 4.41 − 3.76 reserve) because the expert cache took 22.30 GB. Nothing is stored, so nothing hits |
-| dense — Llama-3.3-70B | **cannot be exercised, and for a WORSE reason — see the DENSE-PREFIX-INERT row below** |
-| dense — Llama-3.2-1B | logs no prefix events either (same cause as the 70B) |
+| dense — **Llama-3.3-70B** | **CAN be exercised — my step-2 answer was WRONG.** I read "no `[Vaayu-Prefix]` line" as "no HIT"; the same run's `requests.jsonl` records `prefix_hit: true, prefix_match_tokens: 697/709` under `sdpa`. Dense speculates by default, and `speculative_generate`'s prefix path prints nothing (`PREFIX-SPEC-SILENT`). **NOT YET REPLAY-CHECKED** — the HIT exists, whether it AGREES with a cache-OFF replay is unmeasured |
+| dense — **Llama-3.2-1B** | same path, and it loads in seconds — **this is the fast reproducer** this row has been missing |
 
 **Hypothesis 2 (the sdpa bottom-right mask is not built on the HIT path) is ALSO REFUTED.** Instrumented
 `vaayu_base.py:5985` and ran the k=16 HIT: `impl=sdpa max_q=45 kv_total=1972 past=1927 seq=45
@@ -479,14 +512,23 @@ thing specific to the failing case is that the past came from a **store/restore 
 (`PrefixCacheStore.store` does `cache.to_cpu()`; `_adopt_prefix_hit` does `to_device()` then
 `kv.crop(match_len)`) rather than from a cache built in-process.
 
-**HYPOTHESIS 3, LIVE AND UNCONFIRMED — do not act on it without measuring:** a restored/cropped bf16 ring
+**HYPOTHESIS 3 — DEAD, SUPERSEDED BY THE RESOLUTION BELOW (kept for the record; it was never instrumented, because the split-no-pool arm made it unnecessary):** a restored/cropped bf16 ring
 buffer may present a KEY COUNT to the layers that differs from the `get_past_key_values_cache_seq_len`
 value the mask was sized from (1927), so the explicit mask misaligns against the actual K length, while
 flash — which is handed `attention_mask=None` and uses its own bottom-right convention off the real
 tensor shapes — stays right. Test: print the layer's actual K length against the mask's key dimension on
 a HIT. **Two hypotheses have already died here; this one is a reading, not a finding.**
 
-**Remaining steps:**
+**Remaining steps — ALL SUPERSEDED BY THE RESOLUTION SECTION BELOW; step 0 was run and is what closed the row:**
+0. **NEW, do this first — replay-check DENSE under sdpa** (`Llama-3.2-1B`, seconds per boot). Step 2's
+   dense answer was wrong (see its table): dense DOES take a prefix HIT, through a SECOND adoption site
+   (`speculative_generate`, `vaayu_base.py:7028`) on a DIFFERENT forward. Either outcome narrows the hunt
+   and both are worth more than another MiniMax boot: if dense diverges too, the cause is common to both
+   adoption sites and the reproducer drops from minutes to seconds; if dense is exact, the cause is
+   specific to MiniMax's module-list forward or to `generate`'s own HIT path, which kills a wide class of
+   hypotheses in one run. The probe's premise proof must read `prefix_hit` from
+   `logs/run-*/requests.jsonl` for this, NOT the `[Vaayu-Prefix]` lines — the speculative path does not
+   print them (`PREFIX-SPEC-SILENT`), so a log-line check would abort the arm on a HIT that happened.
 1. Confirm or kill hypothesis 3 (one instrumented run).
 2. Then fix the root cause, with a standing test at the no-pool-replay bar
    (`plans/probes/prefix_replay_check.py` is the manual form; it needs to become a gate).
@@ -504,6 +546,96 @@ session per boot is the fix.
 **Config consequence, already applied:** the `ATTN_IMPLEMENTATION = "sdpa"` override was REMOVED from
 this box's `config_local.py` (machine-local, gitignored). It cost 2.2 % of decode and bought a correct
 prefix HIT. Nothing in the tracked tree changed — the shipped default was already the clean kernel.
+
+### RESOLUTION 2026-11-17 — root cause, with the measurements that killed the row's own framing
+
+**The kernel was never the variable.** Running the same replay check on dense Llama-3.2-1B reversed the
+sign of the headline claim:
+
+| model / forward | adoption site | sdpa HIT == replay | flash HIT == replay |
+|---|---|---|---|
+| MiniMax-M2.7, module-list EXL3 | `generate` | **NO** (char 7, sim 0.64) | yes |
+| Llama-3.2-1B, dense | `generate` (`--no-spec`) | yes | **NO** (char 39, sim 0.823) |
+| Llama-3.2-1B, dense | `speculative_generate` (the DEFAULT on dense) | yes | yes |
+
+Dense/flash reproduced byte-for-byte across two independent runs (`replay-dense1b-nospec.json`,
+`-r2.json`). **No mask-alignment story can hold both directions at once**, so HYPOTHESIS 3 is dead with
+the other two — and it died without ever being instrumented, because a cheaper experiment made it
+unnecessary.
+
+**What it actually is — three measurements, `plans/probes/prefix_hit_logits.py` (library mode, logits,
+no sampling anywhere):**
+
+1. **The store/restore round trip is BIT-EXACT.** Snapshot the KV before `pc.store`, compare the restored
+   buffers after `_adopt_prefix_hit` over the positions the HIT kept: `max|ΔK| = max|ΔV| = 0`, bitwise
+   equal, on **MiniMax** — the model with the larger residue. The prefix cache does not corrupt, quantize
+   or misalign anything.
+2. **The divergence is reproduced with NO CACHE IN THE PATH.** The discriminator arm prefills
+   `ids[:, :match_len]` and then the tail in two forwards, with no store, no restore and no pool. On dense
+   it is **bit-identical to the HIT** (`max|split − hit| = 0` across 12 greedy steps) while both differ
+   from the single-call replay; on MiniMax it picks the **same 12 token ids** as the HIT. So what the row
+   called a cache defect is the arithmetic of prefilling a tail separately.
+3. **It flips only at a tie.** Per-step `max|Δlogit|` between HIT and replay is **0.12–0.23 on dense**
+   (1–2 bf16 ULPs at that logit scale) and **0.34–2.95 on MiniMax**, against top-2 margins of 0.6–14.6 —
+   no flip. Both models first diverge at **step 8**, where the margin collapses to **0.0000 (dense)** and
+   **0.25 (MiniMax)**. That is the stored `decode-ppl-bit-sensitive` pattern and exactly what S13 closed as
+   NOT A DEFECT for gpt-oss's "token-50 drift".
+
+**The MiniMax residue, explained and measured.** MiniMax keeps a small logit difference (`max|split − hit|
+= 2.68`) that dense does not, against a **determinism floor of exactly 0** (the same split arm run twice:
+bitwise identical), so it is real and not run-to-run noise. The cause is **buffer CAPACITY, not values**:
+`FP8DynamicCache.to_cpu` compacts each layer to its used length for pool storage, so a restored cache
+carries `capacity == 1935` where a freshly grown one carries the geometric `2048` —
+
+    layout HIT   {'shape': [1, 8, 1935, 128], 'capacity': 1935, 'seq_len': 1934, 'contiguous': True}
+    layout SPLIT {'shape': [1, 8, 2048, 128], 'capacity': 2048, 'seq_len': 1946, 'contiguous': True}
+
+— identical values in a differently shaped buffer, so the GEMM takes a different split and rounds
+differently (the stored `cublas-bf16-gemm-rounding` finding: bf16 `F.linear` rounding depends on the ROW
+COUNT).
+
+**Why the row's bar was wrong.** `pool-vs-replay-exact-bar` says to check a HIT against a **no-pool
+replay**, and that is right — but the replay has to be **split at the same point**. A HIT does strictly
+less arithmetic, in a different shape, than a single-call prefill of the whole prompt; requiring the two
+to agree bitwise is requiring bf16 addition to be associative. Shape-matched, dense passes **bitwise** and
+MiniMax passes **at the token level**.
+
+**What this REVERSES.** `ATTN_IMPLEMENTATION = "sdpa"` was removed from this box's `config_local.py`
+earlier today on this row's evidence, at a measured cost of **2.2 % decode** (sdpa 493.42 vs flash 504.26
+ms/token, the ATTN-AB row). That reason is now refuted — sdpa is not wrong on the HIT path — so the
+override is RESTORED, and `docs/2026-11-17-attn-sdpa-vs-flash-RESULTS.md` is corrected. The
+`MAX_BATCH_SIZE`-requires-sdpa coupling is a non-issue: there was never a correctness reason to avoid
+sdpa, so no warning is owed to `documentation/server.md` or `vaayu/server/README.md`.
+
+**Raw data** (gitignored): `plans/probes/hitlogits-{dense1b-flash,dense1b-sdpa,minimax-sdpa}*.json`,
+`plans/probes/replay-dense1b{,-nospec,-nospec-r2}.json`.
+
+**What is still open, as its own row below:** the capacity/stride residue (`PREFIX-CAPACITY-RESIDUE`), and
+the standing gate — which must now assert the SHAPE-MATCHED bar, since the bar this row used would fail on
+correct code.
+
+## [bug] PREFIX-CAPACITY-RESIDUE — a restored prefix cache is reshaped, so a HIT's logits differ from a shape-matched replay on MiniMax. Found 2026-11-17, NOT fixed, NOT a correctness bug
+
+**What is wrong.** `FP8DynamicCache.to_cpu` compacts every layer to `used` length (`vaayu_base.py:2030`,
+deliberately — it drops the geometric-growth tail so the pool is not charged for slack it does not need).
+On restore the buffer therefore has `capacity == used` where a cache grown in-process has the next
+geometric step. Values are bit-identical (measured: `max|ΔK| = max|ΔV| = 0`); the SHAPE is not. On MiniMax
+that is worth up to **2.68 of logit difference** against a determinism floor of 0, and a tie-margin step
+then picks a different token.
+
+**Why it is worth fixing anyway.** Not for correctness — both answers are equally valid bf16 results — but
+because a bit-exact bar is the only cheap gate for the prefix cache. Dense already passes it; closing this
+makes `HIT == shape-matched replay` assertable on MiniMax too, and a gate that can assert bits does not
+need a similarity threshold nobody can defend.
+
+**Shape of the fix (not built).** Grow the restored buffer to the capacity a fresh cache would hold, at
+`_adopt_prefix_hit`/`to_device` time rather than at store time — the allocation happens on the next append
+regardless, so pool RAM is unaffected. Do NOT pad in `to_cpu`: that charges the pool for slack and
+`to_cpu`'s compaction is there on purpose.
+
+**Verify with** `plans/probes/prefix_hit_logits.py`, which already prints both layouts and
+`max|split − hit|`: the fix lands when MiniMax reports `bitwise_eq_hit=True`, with the determinism floor
+still 0 and dense still 0.
 
 ## [x] ATTN-AB — sdpa vs flash_attention_2, measured through the server — DONE 2026-11-17; the figure on record HOLDS
 
