@@ -345,6 +345,53 @@ then 300 s silence) also happened at 13:11 **with no kernel fault in the log** �
 root-caused and fixed (see the `RUN-E-STALL` row: `_sse` goes silent for a buffered tool-call body). Only the
 16:26-onward wedge is this kernel bug.
 
+## [bug] DENSE-PREFIX-INERT — the cross-turn prefix cache prints ENABLED on DENSE models and never runs. Found 2026-11-17, NOT fixed
+
+**What is wrong.** On Llama-3.3-70B-exl3 the server prints
+`[Vaayu] cross-turn prefix cache ENABLED: 3.55 GB budget`, serves requests normally, and **never emits a
+single `[Vaayu-Prefix]` MISS or HIT line.** Llama-3.2-1B behaves the same (`21.97 GB budget`, zero
+events). MiniMax on the same code, same probe, logs `MISS` then `HIT match_len=…` as expected.
+
+**Proved by instrumentation, not inferred.** A temporary print at the top of `VaayuBaseModel.generate`
+(right after `pc = getattr(self, "_prefix_cache", None)`, so it fires unconditionally whenever that
+method runs) was added, run against BOTH models, and reverted:
+
+| model | debug lines from `generate()` | requests served | prefix events |
+|---|---|---|---|
+| MiniMax-M2.7 | **1** (`cls=VaayuBaseModel pc=False session_id='nopool-k1'`) | yes | yes |
+| Llama-3.3-70B | **0** | yes, 9 token summaries | **none** |
+
+So on dense, `VaayuBaseModel.generate` — the ONLY place the cross-turn lookup/store happens — is never
+entered. The positive control rules out a dead instrument, and `vaayu.vaayu_base.__file__` confirms the
+server imports the repo copy (only `vaayu_rust` is in site-packages), so the edit was live.
+
+**It is not the obvious suspects:** no speculator is configured (`DRAFTER_MODEL_PATH = None`, no
+speculation lines in the log), so `choose_speculative_target` returns `model.generate`; there is no
+`is_moe` gate anywhere in that method; and no `prefix cache DISABLED` refusal was printed
+(`prefix_cache_refusal_reason` did not fire). All three dense and MoE loads chunk-prefill, so that is not
+the differentiator either. **Where the dense path's generation actually goes is NOT yet established** —
+`vaayu/server/engine.py` calls only `stream_generate`, which calls `choose_speculative_target(...)`'s
+return value, which should be this method. Unresolved.
+
+**Why it matters.** CLAUDE.md §0 names cross-turn prefix caching the **top TTFT lever** for this
+workload, and since the 2026-11-17 disk audit **dense is half of everything testable on this box**. A
+lever that reports ENABLED and does nothing is worse than one that is off: `ENABLE_PREFIX_CACHE = True`
+is the shipped default, so every dense user believes they have it. The 2.07× TTFT figure banked for A1
+was measured on MoE.
+
+**Found as a side effect** of answering step 2 of the `SDPA-PREFIX-HIT` row (does that bug reproduce on
+dense?). The answer is "it cannot, because dense never takes the path at all" — which is a bigger
+finding than the question.
+
+**Next steps, none taken:**
+1. Establish what dense generation actually calls instead (instrument `stream_generate`'s `target`, and
+   print `type(model).__mro__` for both model kinds).
+2. If the prefix cache genuinely never runs on dense, decide whether it CAN (dense KV is the simple
+   per-token layout, so there is no architectural reason it should not) and wire it, or make the load
+   print an honest refusal instead of `ENABLED`.
+3. Either way a test: a dense model must either log a HIT on a repeat turn or state why not. The
+   assertion that fails today is "ENABLED implies a HIT is reachable".
+
 ## [bug] SDPA-PREFIX-HIT — under `sdpa`, a prefix-cache HIT returns a DIFFERENT ANSWER from the uncached computation. `flash_attention_2` is exact. Found 2026-11-17, NOT fixed
 
 **What is wrong.** On MiniMax-M2.7, with `ATTN_IMPLEMENTATION = "sdpa"`, a request served from a
@@ -392,14 +439,67 @@ exactly that (`len_s <= 1 or _active_attn_impl != "sdpa"` returns no mask) and
 attention module's own `sliding_window` argument while sdpa needs an explicit mask, per that
 function's own comment. UNVERIFIED — that is a reading of the code, not a measured root cause.
 
-**Next steps, none taken:**
-1. Narrow it: does a HIT with >1 new position also diverge, or is it only `len_s == 1`? One more probe
-   run with a 2-token-longer second prompt answers it.
-2. Does it reproduce on the DENSE model (Llama-3.3-70B) and on fused-EXL3 (Qwen3.6-35B), or is it
-   module-list-only? Llama-3.2-1B cannot answer it — it logs no prefix events at all.
-3. Then root-cause and fix, with a standing test at the no-pool-replay bar.
-4. Until fixed, `documentation/server.md` and `vaayu/server/README.md` should warn on the
+**STEPS 1 AND 2 DONE 2026-11-17 (`plans/probes/prefix_hit_newpos.py`). Root cause NOT found yet — two
+hypotheses refuted by measurement.**
+
+**Step 1 — it is NOT the `len_s == 1` special case. EVERY hit diverges under sdpa:**
+
+| new positions | sdpa HIT == no-pool replay | first diff | similarity |
+|---|---|---|---|
+| 1 (identical prompt) | **no** | char 7 | 0.64 |
+| 15 (`k=1`) | **no** | char 15 | 0.845 |
+| 45 (`k=16`) | **no** | char 0 | 0.498 |
+| **flash, all three** | **YES, byte-identical** | — | — |
+
+The flash control at 15 and 45 new positions is what makes this an sdpa defect rather than a
+prefix-cache approximation flash happens to mask at one position. **Hypothesis 1 (the
+`get_attention_mask_args` `len_s <= 1` branch) is REFUTED** — divergence at 15 and 45 has nothing to do
+with that branch.
+
+**Step 2 — of the four checkpoints on disk, only MiniMax can even exercise it:**
+
+| forward / model | result |
+|---|---|
+| module-list EXL3 — **MiniMax-M2.7** | **AFFECTED** (above) |
+| fused-EXL3 — Qwen3.6-35B | **cannot be exercised: NO HIT EVER OCCURS.** Two MISSes at 16384/1937 tok and again at 6144/1285. The prefix cache prints ENABLED but with a **0.65 GB** budget (free RAM 4.41 − 3.76 reserve) because the expert cache took 22.30 GB. Nothing is stored, so nothing hits |
+| dense — Llama-3.3-70B | **cannot be exercised, and for a WORSE reason — see the DENSE-PREFIX-INERT row below** |
+| dense — Llama-3.2-1B | logs no prefix events either (same cause as the 70B) |
+
+**Hypothesis 2 (the sdpa bottom-right mask is not built on the HIT path) is ALSO REFUTED.** Instrumented
+`vaayu_base.py:5985` and ran the k=16 HIT: `impl=sdpa max_q=45 kv_total=1972 past=1927 seq=45
+chunks=None mask=(1, 1, 45, 1972)`. The mask IS built, with the right shape and the right bottom-right
+alignment, and `get_attention_mask_args` slices it `[:, :, -45:, -1972:]`, i.e. whole. On paper the mask
+path is correct. (Positive control for the instrument: it fired on MiniMax and on the no-pool arm's
+chunked prefill, `max_q=512 kv_total=1972 mask=(1,1,512,1972)`.)
+
+**What the evidence now constrains.** The restored KV cannot itself be the difference — flash reads the
+SAME restored, cropped cache and is byte-exact. A chunk with past KV is not the problem either — the
+MISS's chunks 1-3 carry past and sdpa is correct there (`on_miss == off_replay`, measured). The only
+thing specific to the failing case is that the past came from a **store/restore round trip**
+(`PrefixCacheStore.store` does `cache.to_cpu()`; `_adopt_prefix_hit` does `to_device()` then
+`kv.crop(match_len)`) rather than from a cache built in-process.
+
+**HYPOTHESIS 3, LIVE AND UNCONFIRMED — do not act on it without measuring:** a restored/cropped bf16 ring
+buffer may present a KEY COUNT to the layers that differs from the `get_past_key_values_cache_seq_len`
+value the mask was sized from (1927), so the explicit mask misaligns against the actual K length, while
+flash — which is handed `attention_mask=None` and uses its own bottom-right convention off the real
+tensor shapes — stays right. Test: print the layer's actual K length against the mask's key dimension on
+a HIT. **Two hypotheses have already died here; this one is a reading, not a finding.**
+
+**Remaining steps:**
+1. Confirm or kill hypothesis 3 (one instrumented run).
+2. Then fix the root cause, with a standing test at the no-pool-replay bar
+   (`plans/probes/prefix_replay_check.py` is the manual form; it needs to become a gate).
+3. Until fixed, `documentation/server.md` and `vaayu/server/README.md` should warn on the
    `MAX_BATCH_SIZE`/`sdpa` coupling. NOT yet written — this row is the record.
+
+**Probes and raw data** (gitignored, hence the numbers above): `plans/probes/prefix_replay_check.py`,
+`plans/probes/prefix_hit_newpos.py`, `plans/probes/newpos-mm-{sdpa,flash}-k{1,16}.json`,
+`plans/probes/replay-{sdpa,flash}.json`. Both probes PROVE their own premises per arm (kernel from the
+`Attention implementation:` line, HIT/MISS from `[Vaayu-Prefix]`) and ABORT rather than report an arm
+that did not do what was asked — which is how the multi-session design was caught: the k2 and k16 SEEDS
+came back as HITs, because a named-session miss falls back to the BEST PREFIX ACROSS SESSIONS. One
+session per boot is the fix.
 
 **Config consequence, already applied:** the `ATTN_IMPLEMENTATION = "sdpa"` override was REMOVED from
 this box's `config_local.py` (machine-local, gitignored). It cost 2.2 % of decode and bought a correct
