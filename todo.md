@@ -345,6 +345,66 @@ then 300 s silence) also happened at 13:11 **with no kernel fault in the log** �
 root-caused and fixed (see the `RUN-E-STALL` row: `_sse` goes silent for a buffered tool-call body). Only the
 16:26-onward wedge is this kernel bug.
 
+## [bug] SDPA-PREFIX-HIT — under `sdpa`, a prefix-cache HIT returns a DIFFERENT ANSWER from the uncached computation. `flash_attention_2` is exact. Found 2026-11-17, NOT fixed
+
+**What is wrong.** On MiniMax-M2.7, with `ATTN_IMPLEMENTATION = "sdpa"`, a request served from a
+cross-turn prefix-cache HIT produces materially different output from the same prompt run with the
+prefix cache OFF. Under `flash_attention_2` the two are byte-identical. Measured, same prompt, 24
+tokens, `plans/probes/prefix_replay_check.py`:
+
+| arm | output |
+|---|---|
+| sdpa, cache OFF, req1 and req2 | `import asyncio\nfrom pathlib import Path\n…DebouncedWatcher:` |
+| sdpa, cache ON, **MISS** | same as above, byte-identical |
+| sdpa, cache ON, **HIT** | **`import os\nimport time\nfrom collections import defaultdict…`** |
+| flash, all four of the above | all byte-identical to the first row |
+
+**It is not a tie.** First divergence at **character 7**, `SequenceMatcher` ratio **0.64**, lengths 114
+vs 111 — a different answer from the second token, not a near-tie compounding late. The stored
+`pool-vs-replay-exact-bar` finding is why the bar is the **no-pool replay**, not the cold request in
+the same server: a MISS prefills all 1937 positions at once while a HIT reuses 1936 and prefills **1
+new position**, so MISS-vs-HIT differing proves nothing on its own. sdpa fails the replay bar; flash
+passes it exactly.
+
+**Controls that make it a defect and not noise.** Cache OFF is fully deterministic (`req1 == req2`) on
+both kernels, and `cache ON + MISS == cache OFF` on both — so the cache's mere presence is fine, and
+the engine is deterministic. It is specifically the REUSE path, specifically under sdpa. Each arm's
+kernel is proved from the server's own `Attention implementation:` line and each arm's HIT/MISS from
+the `[Vaayu-Prefix]` lines; the probe aborts rather than reporting an arm that did not do what was
+asked.
+
+**Why it matters more than its size suggests.** CLAUDE.md §0: this engine exists to serve an agent
+whose loop iterations re-send largely overlapping context, and cross-turn prefix caching is named the
+top TTFT lever. The HIT is the COMMON case, so this corrupts the normal path, not an edge.
+
+**Blast radius — LIMITED TODAY, and this is why it sat unseen.** `config.py` ships
+`ATTN_IMPLEMENTATION = None`, which prefers `flash_attention_2`, the clean kernel. Only an operator who
+explicitly sets `"sdpa"` is exposed. **But `MAX_BATCH_SIZE` is INERT unless the impl resolves to sdpa**
+(`config.py`, `documentation/server.md:597`, `vaayu/server/README.md:93` all say so), so **batching and
+the prefix cache cannot both be used correctly until this is fixed.** Anyone following the batching
+documentation walks into it. That is a §8 reachability trap one layer down: the knob is reachable, and
+reaching it breaks another shipped feature.
+
+**Where to look.** The asymmetry is `len_s`: a HIT runs the final prefill with ONE query position
+against 1936 cached keys; a MISS runs 1937 together. `vaayu_base.get_attention_mask_args` branches on
+exactly that (`len_s <= 1 or _active_attn_impl != "sdpa"` returns no mask) and
+`_adopt_prefix_hit` clamps `match_len` down by one position. Flash gets its window through the
+attention module's own `sliding_window` argument while sdpa needs an explicit mask, per that
+function's own comment. UNVERIFIED — that is a reading of the code, not a measured root cause.
+
+**Next steps, none taken:**
+1. Narrow it: does a HIT with >1 new position also diverge, or is it only `len_s == 1`? One more probe
+   run with a 2-token-longer second prompt answers it.
+2. Does it reproduce on the DENSE model (Llama-3.3-70B) and on fused-EXL3 (Qwen3.6-35B), or is it
+   module-list-only? Llama-3.2-1B cannot answer it — it logs no prefix events at all.
+3. Then root-cause and fix, with a standing test at the no-pool-replay bar.
+4. Until fixed, `documentation/server.md` and `vaayu/server/README.md` should warn on the
+   `MAX_BATCH_SIZE`/`sdpa` coupling. NOT yet written — this row is the record.
+
+**Config consequence, already applied:** the `ATTN_IMPLEMENTATION = "sdpa"` override was REMOVED from
+this box's `config_local.py` (machine-local, gitignored). It cost 2.2 % of decode and bought a correct
+prefix HIT. Nothing in the tracked tree changed — the shipped default was already the clean kernel.
+
 ## [x] ATTN-AB — sdpa vs flash_attention_2, measured through the server — DONE 2026-11-17; the figure on record HOLDS
 
 **Verdict: `sdpa` is FASTER on MiniMax. `flash_attention_2` costs +2.2 % on decode.** So `config.py:269`'s
