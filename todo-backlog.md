@@ -59,6 +59,136 @@ the on-disk MoE forwards, live for dense. This rule drives S56's `batching_helps
 
 ---
 
+## ARCHIVE — prefix-cache rows closed 2026-11-18 (moved from `todo.md`)
+
+Both rows come out of the same day's work as `SDPA-PREFIX-HIT`, `PREFIX-SPEC-SILENT` and
+`PREFIX-SPEC-NO-RESTORE`. Read them together: the recurring lesson is that a prefix HIT is held to a
+bar, and three of the four bars tried were unachievable on correct code.
+
+### [x] PREFIX-CAPACITY-RESIDUE — closed NOT A DEFECT, cause REFUTED
+
+## [bug] PREFIX-CAPACITY-RESIDUE — a restored prefix cache is reshaped, so a HIT's logits differ from a shape-matched replay on MiniMax. Found 2026-11-17, NOT fixed, NOT a correctness bug
+
+**What is wrong.** `FP8DynamicCache.to_cpu` compacts every layer to `used` length (`vaayu_base.py:2030`,
+deliberately — it drops the geometric-growth tail so the pool is not charged for slack it does not need).
+On restore the buffer therefore has `capacity == used` where a cache grown in-process has the next
+geometric step. Values are bit-identical (measured: `max|ΔK| = max|ΔV| = 0`); the SHAPE is not. On MiniMax
+that is worth up to **2.68 of logit difference** against a determinism floor of 0, and a tie-margin step
+then picks a different token.
+
+**Why it is worth fixing anyway.** Not for correctness — both answers are equally valid bf16 results — but
+because a bit-exact bar is the only cheap gate for the prefix cache. Dense already passes it; closing this
+makes `HIT == shape-matched replay` assertable on MiniMax too, and a gate that can assert bits does not
+need a similarity threshold nobody can defend.
+
+**Shape of the fix (not built).** Grow the restored buffer to the capacity a fresh cache would hold, at
+`_adopt_prefix_hit`/`to_device` time rather than at store time — the allocation happens on the next append
+regardless, so pool RAM is unaffected. Do NOT pad in `to_cpu`: that charges the pool for slack and
+`to_cpu`'s compaction is there on purpose.
+
+**Verify with** `plans/probes/prefix_hit_logits.py`, which already prints both layouts and
+`max|split − hit|`: the fix lands when MiniMax reports `bitwise_eq_hit=True`, with the determinism floor
+still 0 and dense still 0.
+
+**RESOLUTION 2026-11-18. The row's cause was wrong, and the row is closed without a fix.**
+
+The row blamed buffer capacity: `to_cpu` compacts to `used`, so a restored buffer has
+`capacity == used` where a grown one has geometric slack, and `update()` returns `buf[..., :used, :]`
+— a non-contiguous view whose strides carry the capacity into the attention call. Three measurements
+killed it:
+
+| measurement | result |
+|---|---|
+| synthetic: same values, capacity 1935 / 2048 / 3870, CPU + CUDA, bf16 + fp16, q_len 1 + 19 | attention output **bitwise identical** in every pair, `max_abs_delta = 0` |
+| dense-1B (flash): `layout HIT capacity=1953` vs `layout SPLIT capacity=2048` | **the same mismatch the row blames**, and `bitwise_eq_hit=True`, `max|split-hit| = 0` |
+| MiniMax (sdpa): HEAD BITS, the comparison the probe never made | **`bitwise_eq=False`, `max|dK| = 0.25`, `max|dV| = 0.000244`** |
+
+So the capacity difference is real and inert, and the residue is the HEAD's own K/V. Why the heads
+differ with no cache in the path: the stored prefix is produced by a forward over turn 1's WHOLE
+prompt (1935 tokens, chunked 512/512/512/**399**), the shape-matched replay's head by a forward over
+`match_len` (1934, chunked 512/512/512/**398**). Different final chunk, different GEMM row count, and
+bf16 `F.linear`'s rounding depends on the row count (`cublas-bf16-gemm-rounding`). 0.25 on K
+propagates to 2.68 in the logits.
+
+Two alternatives were measured and excluded, not argued:
+* **the pool** — round trip `max|dK| = max|dV| = 0` (restored buffers compared against a pre-store
+  snapshot of the tensors themselves);
+* **arm order on an MoE load** — a new floor arm (arm E: the split re-run AFTER the HIT, so the expert
+  VRAM tier / RAM arena / disk path is as warm as the HIT left it) gives `max|C-E| = 0`, against
+  `max|E-hit| = 2.67969`. Arm D could not see this, because it runs before the HIT.
+
+**The stop rule the row carried — "the fix lands when MiniMax reports `bitwise_eq_hit=True`" — is
+unachievable**, for the same reason SDPA-PREFIX-HIT's bar was: it compares two legitimately different
+bf16 results. The fix shape the row recorded (grow the restored buffer at `_adopt_prefix_hit`/
+`to_device` time) would have changed nothing measurable; it was NOT built.
+
+What the work produced instead is `PREFIX-HIT-GATE` below, whose bar holds the head construction
+fixed. Raw data (gitignored): `plans/probes/hitlogits-minimax-sdpa-armE.json`,
+`plans/probes/hitlogits-dense1b-flash-{headbits,armE}.json`; the probe grew a head-bits comparison, an
+arm E, and per-arm cache freeing (six live 1935-token MiniMax caches CUDA-OOM on layer 7).
+
+### [x] PREFIX-HIT-GATE — done
+
+## [ ] PREFIX-HIT-GATE — make the prefix-cache replay check a STANDING gate, at the shape-matched bar
+
+**Why it is its own row.** This obligation was living in the prose of `SDPA-PREFIX-HIT`, which is `[x]`
+closed — open work parked inside a closed row is exactly what §6 forbids, so it is hoisted here.
+
+**What exists today.** `plans/probes/prefix_replay_check.py` (manual, server-level, `requests.jsonl` as the
+premise oracle) and `plans/probes/prefix_hit_logits.py` (library-level, logits + layouts + determinism
+floor). Both gitignored. Neither runs in the suite, so nothing re-checks that a prefix HIT agrees with a
+no-pool run after any change to the cache, the stager or an attention path.
+
+**The bar MUST be shape-matched.** A HIT compared against a single-call prefill of the whole prompt fails on
+CORRECT code — the HIT does strictly less arithmetic in a different shape, and the bf16 rounding differs
+(that wrong bar is what produced the retracted `SDPA-PREFIX-HIT` row). The gate compares a HIT against a
+no-pool replay SPLIT AT THE SAME POINT (`head_len = match_len`), with a determinism-floor control arm
+(same split run twice, which measured exactly 0).
+
+**Blocked-ish on `PREFIX-CAPACITY-RESIDUE` for the strong form.** Dense passes `bitwise_eq` today; MiniMax
+carries 2.68 of logit residue purely from buffer capacity. So either land the residue fix first and assert
+BITS on both, or land the gate dense-only now and widen it after. Prefer the former — a gate with a
+similarity threshold nobody can defend is the thing this row is trying to avoid.
+
+**§8.** Needs no knob (a test, not a feature); state it in the commit either way.
+
+**RESOLUTION 2026-11-18. `tests/test_prefix_hit_bitwise_gate.py` — env-free, CPU, 3 cases, ~4 s.**
+
+**The bar.** Three candidate bars, two unsound:
+* HIT vs a single cold prefill of the whole prompt — **unsound**, and this is what produced the
+  retracted SDPA-PREFIX-HIT row;
+* HIT vs a no-pool replay SPLIT at `match_len` — **also unsound**, and now measured: the two heads
+  differ by `max|dK| = 0.25` on MiniMax from the GEMM row count alone (see the row above). The row's
+  own text had called for this bar;
+* **HIT vs `forward(turn1) -> crop -> forward(tail)`** — sound. Both arms build the head with the same
+  forward over the same rows, so the ONLY difference is `to_cpu` / the pinned-CPU hop / `to_device`.
+  Bitwise equality is achievable BY CONSTRUCTION and a failure is the pool's by elimination.
+
+**Both shapes, because each is blind to what the other catches** — measured with mutants in production
+code, not assumed:
+
+| mutant | `extra=0` (match = prompt_len − 1) | `extra=16` (turn 2 = turn 1 + new text) |
+|---|---|---|
+| M1 `to_cpu` compacts to `used - 1` | PASSES (the token it loses is the one the clamp crops) | **fails** |
+| M2 `_adopt_prefix_hit` drops `kv.crop(match_len)` | **fails** | PASSES (crop is a no-op there) |
+| M3 `to_cpu` perturbs one value by 1 ULP | **fails** | **fails** |
+| M4 clamp `match_len >= prompt_len` → `>` | **fails** | PASSES |
+| M5 `lookup` under-reports the match by one | PASSES | **fails** |
+| M6 `get_seq_length` off by one (the RoPE-offset class) | **fails** | **fails** |
+
+Four of six are visible in only one shape, so a single-shape gate would have shipped half blind.
+
+**It asserts the savings, not only the logits.** M1 taught this: a round trip that silently SHORTENS
+the prefix still produces correct logits, because the walk just re-forwards what went missing — the
+PREFIX-SPEC-NO-RESTORE class of bug. So the gate also asserts the adopted cache HOLDS what it reports
+and that the first forward after a HIT prefills exactly the new positions.
+
+**§8:** no knob needed (a test, not a feature). The on-device form of the same question — MiniMax,
+dense-70B, flash vs sdpa, with the determinism floor and arm E — stays in
+`plans/probes/prefix_hit_logits.py`, which is the manual instrument, not a gate.
+
+---
+
 ## SETTLED — DO NOT RE-OPEN (since the 2026-10-14 clear)
 
 Refuted perf ideas with the number that killed each. Read before proposing MoE perf work (the old

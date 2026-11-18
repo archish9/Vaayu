@@ -671,55 +671,16 @@ sdpa, so no warning is owed to `documentation/server.md` or `vaayu/server/README
 **Raw data** (gitignored): `plans/probes/hitlogits-{dense1b-flash,dense1b-sdpa,minimax-sdpa}*.json`,
 `plans/probes/replay-dense1b{,-nospec,-nospec-r2}.json`.
 
-**What is still open, as its own row below:** the capacity/stride residue (`PREFIX-CAPACITY-RESIDUE`), and
-the standing gate — which must now assert the SHAPE-MATCHED bar, since the bar this row used would fail on
-correct code.
+**Both follow-ups are now CLOSED (2026-11-18), and one of them corrects this row.** The capacity/stride
+residue (`PREFIX-CAPACITY-RESIDUE`) closed as NOT A DEFECT with its cause refuted: capacity is inert,
+the residue is the head's own K/V at a different GEMM row count. The standing gate shipped as
+`PREFIX-HIT-GATE` — but NOT at the SHAPE-MATCHED bar this line called for, because that bar is also
+unsound (it compares heads built from different row counts, `max|dK| = 0.25` on MiniMax). It holds the
+head construction fixed instead. See both rows below.
 
-## [bug] PREFIX-CAPACITY-RESIDUE — a restored prefix cache is reshaped, so a HIT's logits differ from a shape-matched replay on MiniMax. Found 2026-11-17, NOT fixed, NOT a correctness bug
+## [x] PREFIX-CAPACITY-RESIDUE — **CLOSED 2026-11-18 as NOT A DEFECT, and its stated cause REFUTED.** Capacity is not what moves the logits: identical values at capacity 1935 / 2048 / 3870 give bitwise-identical attention output (CPU and CUDA, bf16 and fp16, q_len 1 and 19), and dense-1B carries the SAME 1953-vs-2048 mismatch while staying bitwise equal (`max|split-hit| = 0`). MiniMax's 2.68 is the HEAD's own K/V — `max|dK| = 0.25` between the HIT's head and the replay's — because the stored head's last prefill chunk held 399 rows against the replay's 398, and bf16 `F.linear`'s rounding depends on the ROW COUNT (`cublas-bf16-gemm-rounding`). The pool is exonerated (round trip `max|dK| = max|dV| = 0`) and so is arm order on an MoE load (new floor arm, split re-run AFTER the HIT: `max|C-E| = 0`). NO FIX BUILT — the `bitwise_eq_hit=True` stop rule the row carried is unachievable for the same reason SDPA-PREFIX-HIT's bar was. Full text, numbers and the refuted fix shape: `todo-backlog.md`
 
-**What is wrong.** `FP8DynamicCache.to_cpu` compacts every layer to `used` length (`vaayu_base.py:2030`,
-deliberately — it drops the geometric-growth tail so the pool is not charged for slack it does not need).
-On restore the buffer therefore has `capacity == used` where a cache grown in-process has the next
-geometric step. Values are bit-identical (measured: `max|ΔK| = max|ΔV| = 0`); the SHAPE is not. On MiniMax
-that is worth up to **2.68 of logit difference** against a determinism floor of 0, and a tie-margin step
-then picks a different token.
-
-**Why it is worth fixing anyway.** Not for correctness — both answers are equally valid bf16 results — but
-because a bit-exact bar is the only cheap gate for the prefix cache. Dense already passes it; closing this
-makes `HIT == shape-matched replay` assertable on MiniMax too, and a gate that can assert bits does not
-need a similarity threshold nobody can defend.
-
-**Shape of the fix (not built).** Grow the restored buffer to the capacity a fresh cache would hold, at
-`_adopt_prefix_hit`/`to_device` time rather than at store time — the allocation happens on the next append
-regardless, so pool RAM is unaffected. Do NOT pad in `to_cpu`: that charges the pool for slack and
-`to_cpu`'s compaction is there on purpose.
-
-**Verify with** `plans/probes/prefix_hit_logits.py`, which already prints both layouts and
-`max|split − hit|`: the fix lands when MiniMax reports `bitwise_eq_hit=True`, with the determinism floor
-still 0 and dense still 0.
-
-## [ ] PREFIX-HIT-GATE — make the prefix-cache replay check a STANDING gate, at the shape-matched bar
-
-**Why it is its own row.** This obligation was living in the prose of `SDPA-PREFIX-HIT`, which is `[x]`
-closed — open work parked inside a closed row is exactly what §6 forbids, so it is hoisted here.
-
-**What exists today.** `plans/probes/prefix_replay_check.py` (manual, server-level, `requests.jsonl` as the
-premise oracle) and `plans/probes/prefix_hit_logits.py` (library-level, logits + layouts + determinism
-floor). Both gitignored. Neither runs in the suite, so nothing re-checks that a prefix HIT agrees with a
-no-pool run after any change to the cache, the stager or an attention path.
-
-**The bar MUST be shape-matched.** A HIT compared against a single-call prefill of the whole prompt fails on
-CORRECT code — the HIT does strictly less arithmetic in a different shape, and the bf16 rounding differs
-(that wrong bar is what produced the retracted `SDPA-PREFIX-HIT` row). The gate compares a HIT against a
-no-pool replay SPLIT AT THE SAME POINT (`head_len = match_len`), with a determinism-floor control arm
-(same split run twice, which measured exactly 0).
-
-**Blocked-ish on `PREFIX-CAPACITY-RESIDUE` for the strong form.** Dense passes `bitwise_eq` today; MiniMax
-carries 2.68 of logit residue purely from buffer capacity. So either land the residue fix first and assert
-BITS on both, or land the gate dense-only now and widen it after. Prefer the former — a gate with a
-similarity threshold nobody can defend is the thing this row is trying to avoid.
-
-**§8.** Needs no knob (a test, not a feature); state it in the commit either way.
+## [x] PREFIX-HIT-GATE — **DONE 2026-11-18.** `tests/test_prefix_hit_bitwise_gate.py`: env-free, CPU, 3 cases, ~4 s. A HIT must be bitwise identical to `full prefill -> crop -> tail` run without the pool — the one bar where only the round trip differs, so equality holds by construction and there is no similarity threshold to defend (a SHAPE-MATCHED replay is NOT sound: its head comes from a different GEMM row count, measured at `max|dK| = 0.25` on MiniMax). Parametrized over both prefix shapes, and SIX mutants in production code were each caught — four of them by only one shape, so a single-shape gate would have shipped half blind. Full text: `todo-backlog.md`
 
 ## [x] ATTN-AB — sdpa vs flash_attention_2, measured through the server — DONE 2026-11-17; the figure on record HOLDS
 
