@@ -239,8 +239,8 @@ Vaayu is OpenAI-wire, but these keep long agentic streams healthy:
   agent's calls sequential unless `/v1/models` says fan-out helps.
 
 Model choice is the biggest lever for remote agentic use: a disk-streamed MoE
-(MiniMax-M2.7, ~1.8 tok/s) makes every call minutes long; a faster target (Qwen3-Next-80B,
-gpt-oss-20b) finishes well inside any timeout. See `documentation/server.md` §7.
+(a streamed MoE, ~1.8 tok/s) makes every call minutes long; a faster target (a hybrid (linear-attention) MoE,
+A windowed-attention MoE) finishes well inside any timeout. See `documentation/server.md` §7.
 
 ---
 

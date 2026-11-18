@@ -6,7 +6,7 @@
 
 Welcome to **Vaayu**—the high-performance, local-first inference engine designed to break through the physical boundaries of consumer hardware. 
 
-Vaayu operates on a revolutionary principle: **You don't need a $10,000 enterprise GPU cluster to run world-class AI.** By streaming model weights layer-by-layer directly from an NVMe SSD into GPU VRAM on every single token, Vaayu enables massive Large Language Models (like Llama 3.3 70B) to execute natively on a single, affordable 16 GB GPU. 
+Vaayu operates on a revolutionary principle: **You don't need a $10,000 enterprise GPU cluster to run world-class AI.** By streaming model weights layer-by-layer directly from an NVMe SSD into GPU VRAM on every single token, Vaayu enables massive Large Language Models (70B-class dense and beyond) to execute natively on a single, affordable 16 GB GPU. 
 
 We have achieved massive technical breakthroughs—shredding per-token latency from **116.8 seconds down to a highly responsive 29.6 seconds**, bypassing operating system caches, and engineering the ultimate zero-copy asynchronous disk pipeline.
 
@@ -27,14 +27,14 @@ process holds is a layer Vaayu must re-read from disk on every single token.**
 How much this costs is measured directly by the pinning A/B — the same mechanism a
 crowded GPU triggers, since a smaller budget pins fewer layers:
 
-| checkpoint | nothing pinned | budget filled | penalty |
+| model class | nothing pinned | budget filled | penalty |
 |---|---|---|---|
-| Llama-3.2-1B | 6.40 tok/s | **83.27 tok/s** | **13.0×** |
-| MiniMax-M2.7 (MoE) | 0.760 tok/s | **1.537 tok/s** | **2.02×** |
-| Llama-3.3-70B (dense) | 0.131 tok/s | **0.167 tok/s** | **1.27×** |
+| small dense (1B) | 6.40 tok/s | **83.27 tok/s** | **13.0×** |
+| large MoE | 0.760 tok/s | **1.537 tok/s** | **2.02×** |
+| large dense (70B) | 0.131 tok/s | **0.167 tok/s** | **1.27×** |
 
 A shared GPU lands you somewhere on that scale — the less VRAM free at load, the closer to
-the left column. (One observation, not yet an isolated A/B: MiniMax decoded at 0.631 tok/s
+the left column. (One observation, not yet an isolated A/B: the large MoE decoded at 0.631 tok/s
 on a box where 9.3 GiB was held by unrelated containers, against 1.537 tok/s on record.)
 
 **Before starting Vaayu:**
@@ -97,9 +97,9 @@ Through months of hardware-software co-design, we have systematically targeted a
 * **📦 The Double-Buffering Victory (Saves 41.5s/token)**: Allocating pinned memory host buffers dynamically inside the layer loop forced the OS kernel to lock contiguous pages on every call, costing ~0.5s per layer. We replaced this with **two static global pinned memory double-buffers** allocated once at startup, reducing dynamic allocation overhead to **0.0 seconds**.
 * **🧠 The KV Cache Resurrection**: We tracked down and squashed a critical legacy cache bug where the engine was silently recomputing the entire prompt history on every step. By patching cache subscripts, subsequent tokens only evaluate the single new token, saving massive computation time.
 * **🧹 CPU Cleanse (Saves 1.4s/token)**: We stripped defensive garbage collection sweeps (`gc.collect()`) and configured CUDA Host-to-Device memory copies to run asynchronously (`non_blocking=True`), completely flattening CPU latency spikes.
-* **🔥 FP8 KV Cache Quantization (~50% VRAM savings)**: The KV cache accumulates at full BF16 precision during generation—2.68 GB for Llama-70B at 8k context, silently eating VRAM that should go to layer pinning and speculative decoding. We implemented `FP8DynamicCache`, a drop-in replacement storing K/V tensors in `torch.float8_e4m3fn` with per-head per-token scales. Pure PyTorch, zero new dependencies. KV footprint drops from **2.68 GB → 1.38 GB** at 8k context, freeing ~1.3 GB for the phases ahead.
+* **🔥 FP8 KV Cache Quantization (~50% VRAM savings)**: The KV cache accumulates at full BF16 precision during generation—2.68 GB for a 70B model at 8k context, silently eating VRAM that should go to layer pinning and speculative decoding. We implemented `FP8DynamicCache`, a drop-in replacement storing K/V tensors in `torch.float8_e4m3fn` with per-head per-token scales. Pure PyTorch, zero new dependencies. KV footprint drops from **2.68 GB → 1.38 GB** at 8k context, freeing ~1.3 GB for the phases ahead.
 * **📌 Asymmetric Layer Pinning (15–25% Faster Prefill)**: Previously only 3 shared layers (embed, norm, lm_head, ~1 GB) were pre-loaded into VRAM, leaving ~11 GB of available budget unused. We rewrote `_init_pinned_layers()` with topology-aware two-phase pinning: Phase 1 pins shared layers; Phase 2 fills the remaining VRAM budget with the first N transformer layers in order, using `break` on budget exhaustion (homogeneous layer sizes mean if one doesn't fit, none will). On a 16 GB GPU with FP8 KV cache, this permanently eliminates **~35% of all NVMe reads per token**—delivering faster prefill on long prompts and more stable streaming throughput. Pass `max_pinned_layers=-1` to auto-fill, or `max_pinned_layers=N` to pin exactly N transformer layers.
-* **🔮 Phase H: Speculative Decoding (2–4× Tokens/Second)**: Standard generation streams 80 layers once per token (~5 s/token). Speculative Decoding inserts a **resident drafter** (EAGLE-3 self-speculation ~0.1 GB VRAM, or any small HuggingFace model like Qwen2.5-0.5B) that guesses 5 tokens instantly, then Vaayu verifies all 5 in **one forward pass** and accepts the correct prefix. A 60–80% acceptance rate yields **2–4× effective throughput**. Configure via `EAGLE_HEAD_PATH` or `DRAFTER_MODEL_PATH` in `test_quick.py`.
+* **🔮 Phase H: Speculative Decoding (2–4× Tokens/Second)**: Standard generation streams 80 layers once per token (~5 s/token). Speculative Decoding inserts a **resident drafter** (EAGLE-3 self-speculation ~0.1 GB VRAM, or any small HuggingFace model) that guesses 5 tokens instantly, then Vaayu verifies all 5 in **one forward pass** and accepts the correct prefix. A 60–80% acceptance rate yields **2–4× effective throughput**. Configure via `EAGLE_HEAD_PATH` or `DRAFTER_MODEL_PATH` in `test_quick.py`.
 
 ---
 
@@ -108,24 +108,20 @@ Through months of hardware-software co-design, we have systematically targeted a
 To run Vaayu at its absolute hardware-ceiling sequential speeds, you must configure both your environment and your physical hardware correctly.
 
 ### Step 1: Install Core Dependencies
-Set up your Python environment and compile `flash-attn` and `exllamav3` using our strict sandbox-bypass order:
+Vaayu installs with [uv](https://docs.astral.sh/uv/) (recommended) or pip. `install.sh` handles the strict build order — core deps first, then the `--no-build-isolation` compiles (`flash-attn`, then `exllamav3` 1.6.2):
 ```bash
-# Create and activate environment
-python3.12 -m venv venv
-source venv/bin/activate
-
-# Install core libraries & Triton JIT requirements
-pip install "torch>=2.6.0" "transformers==5.5.4" "accelerate>=0.28.0" "safetensors>=0.4.0" "optimum>=1.17.0" "huggingface-hub>=0.20.0" "bitsandbytes>=0.43.0" ninja tqdm einops scipy sentencepiece peft evaluate scikit-learn wandb kernels Pillow
-
-# Compile CUDA FlashAttention-2 & ExLlamaV3 (compilation takes 5-15 mins)
-pip install flash-attn --no-build-isolation
-pip install git+https://github.com/turboderp-org/exllamav3 --no-build-isolation
+# uv: --seed is REQUIRED — a bare `uv venv` ships no setuptools/wheel, which the
+# --no-build-isolation builds need. install.sh prefers `uv pip`, falls back to pip.
+uv venv --python 3.12 --seed
+source .venv/bin/activate
+bash install.sh
 ```
+To install by hand instead, see [documentation/setup_and_speed_guide.md](documentation/setup_and_speed_guide.md). The exact dependency set — including the server's `fastapi`/`uvicorn` and the optional per-architecture reference kernels — is pinned in [`requirements.txt`](requirements.txt).
 
 ### Step 2: Install the Native `vaayu_rust` Extension
-Vaayu's zero-copy `io_uring` disk-streaming engine ships as a prebuilt wheel on PyPI (Linux x86-64):
+Vaayu's zero-copy `io_uring` disk-streaming engine ships as a prebuilt wheel on PyPI (Linux x86-64). `install.sh` already installs it (`vaayu-rust>=0.3.0`); to install it on its own:
 ```bash
-pip install vaayu-rust
+uv pip install "vaayu-rust>=0.3.0"
 ```
 
 It is a self-contained `manylinux` `abi3` wheel — no Rust toolchain or compilation needed, and one wheel covers Python 3.8+. If the installed extension is older than the engine expects, the load log prints a `[VAAYU-IO] WARNING` naming what is missing and the engine falls back to a slower read path.
@@ -160,8 +156,8 @@ The remaining phases follow a strict dependency chain. Each one unlocks the next
 Implemented. Vaayu acts as the **Verifier** — a tiny drafter (EAGLE-3 self-speculation for near-zero VRAM, or any small HuggingFace model) guesses N tokens; Vaayu verifies all N in **one forward pass**. ExLlamaV3 native EAGLE bridge tried first; manual weight loader fallback. Configure in `test_quick.py`:
 
 ```python
-EAGLE_HEAD_PATH    = "/path/to/yuhuili/EAGLE3-LLaMA3.3-Instruct-70B"
-DRAFTER_MODEL_PATH = "/path/to/Qwen2.5-0.5B"   # fallback or standalone
+EAGLE_HEAD_PATH    = "/path/to/eagle3-head-for-your-model"
+DRAFTER_MODEL_PATH = "/path/to/small-drafter-model"   # fallback or standalone
 DRAFT_TOKENS       = 5
 ```
 
@@ -180,10 +176,10 @@ We have structured the entire architectural knowledge, installation guides, and 
 * [**📂 Quantization & Pluggable Strategies**](documentation/quantization_and_strategies.md): Explaining our decoupled `LoaderStrategy` pattern (Peeking safetensors headers to auto-detect strategies), compiling custom ExLlamaV3 4-bit CUDA kernels, managing heap memory safety, and executing `quantize.py`.
 * [**🔮 Speculative Decoding & MoE Roadmap**](documentation/speculative_decoding_and_moe.md): Our technical blueprint detailing drafting-verification loops, Mixture-of-Experts routing gates, and expert-aware byte-offset disk streaming.
 * [**🍎 Apple Silicon & The Unified Memory Paradigm**](documentation/mac_unified_memory_paradigm.md): Exploring UMA zero-copy superpowers (`gpu_load` drops to 0s), analyzing the 16 GB MacBook VM swap thrashing constraint, and outlining a Mac manual swap manager using Metal (MPS) and `F_NOCACHE` (via `fcntl`).
-* [**🌐 Running Vaayu as a Server**](documentation/server.md): The complete OpenAI-compatible server reference — every CLI flag and request field, curl examples for streaming and tool calling, the coding-agent integration checklist, the measured speed levers (layer pinning is worth 13x on the 1B, 2.0x on MiniMax and 1.27x on the 70B), and the troubleshooting table.
+* [**🌐 Running Vaayu as a Server**](documentation/server.md): The complete OpenAI-compatible server reference — every CLI flag and request field, curl examples for streaming and tool calling, the coding-agent integration checklist, the measured speed levers (layer pinning is worth 13x on a small dense model, 2.0x on a large MoE and 1.27x on a large dense model), and the troubleshooting table.
 * [**⚙️ Tuning Guide: what to set, and when**](documentation/TUNING.md): The decision guide for the caching knobs — when `prefix_compress` pays (and when it is pure cost), why the pool budget is not free RAM, and which knobs currently do nothing. Pairs with `tune_advisor.py`, which computes the crossover for your own model and box.
-* [**🧩 Missing Buffers**](documentation/missing_buffers.md): What the load-time "persistent buffer(s) have no tensor in this checkpoint" WARNING means, why a dropped MoE routing bias (`e_score_correction_bias`, missing from the MiniMax-M2.7 EXL3 build) changes which experts run, and how to fetch just those tensors from the original repo with `scripts/fetch_missing_buffers.py`.
-* [**🏆 The Bugfix & Maintenance Victory Log**](documentation/bugfix_log.md): A massive, structured developer ledger detailing every single code fix and API migration (including DynamicCache transitions, RoPE positional overrides, Gemma4 multi-modal remappings, 0-indexed non-sequential caching, and Triton compiler resolutions).
+* [**🧩 Missing Buffers**](documentation/missing_buffers.md): What the load-time "persistent buffer(s) have no tensor in this checkpoint" WARNING means, why a dropped MoE routing bias (`e_score_correction_bias`, missing from some EXL3 MoE builds) changes which experts run, and how to fetch just those tensors from the original repo with `scripts/fetch_missing_buffers.py`.
+* [**🏆 The Bugfix & Maintenance Victory Log**](documentation/bugfix_log.md): A massive, structured developer ledger detailing every single code fix and API migration (including DynamicCache transitions, RoPE positional overrides, multi-modal remappings, 0-indexed non-sequential caching, and Triton compiler resolutions).
 
 ---
 
@@ -200,7 +196,7 @@ All parameters are set in the `CONFIG` block at the top of `test_quick.py` and p
 
 ### Understanding Vaayu's Per-Token Cost
 
-Before tuning parameters, understand the core cost model. Vaayu streams model weights from NVMe → GPU on **every token**. For Llama-3.3-70B at EXL3 4.5 bpw, this means reading ~37 GB from disk per token. The time to generate one token is:
+Before tuning parameters, understand the core cost model. Vaayu streams model weights from NVMe → GPU on **every token**. For a 70B model at EXL3 4.5 bpw, this means reading ~37 GB from disk per token. The time to generate one token is:
 
 ```
 token_time = (layers_streamed × layer_size / nvme_bandwidth) + gpu_compute_time
@@ -213,10 +209,10 @@ Every parameter below either **reduces layers_streamed** (pinning), **reduces la
 ### `MODEL_PATH`
 
 ```python
-MODEL_PATH = "/home/a/code/ai-ml/models/Llama-3.3-70B-Instruct-exl3-4.5bpw"
+MODEL_PATH = "/path/to/your-model-exl3-4.5bpw"
 ```
 
-**What it does:** Path to the local HuggingFace model checkpoint directory. Vaayu auto-detects the architecture (Llama, Qwen, Mistral, Mixtral, Gemma, ChatGLM, etc.) from `config.json` and the weight format (BF16/FP16 safetensors or EXL3 quantized) from safetensors headers.
+**What it does:** Path to the local HuggingFace model checkpoint directory. Vaayu auto-detects the architecture from `config.json` and the weight format (BF16/FP16 safetensors or EXL3 quantized) from safetensors headers.
 
 **How it affects speed:**
 
@@ -246,7 +242,7 @@ KV_CACHE_MODE = "auto"   # "auto" | "fp8" | "fp16"
 - `"fp8"` — Custom `FP8DynamicCache`. Stores K/V in `torch.float8_e4m3fn` (1 byte per element) with per-head per-token scale factors. Dequantizes to BF16 before returning to attention. Quality loss is negligible.
 - `"auto"` — Selects `"fp8"` if the model uses EXL3 quantization, `"fp16"` otherwise.
 
-**VRAM usage at 8k context (Llama-70B, 80 layers, 8 KV heads, 128 head dim):**
+**VRAM usage at 8k context (a 70B model, 80 layers, 8 KV heads, 128 head dim):**
 
 | Mode | Formula | VRAM |
 |------|---------|------|
@@ -280,7 +276,7 @@ Budget formula: `total_VRAM - KV_cache_reservation - 1.5 GB overhead - 1 layer s
 | `-1` | **Auto-fill** remaining VRAM budget | **Recommended.** Pins as many layers as will fit |
 | `N` (e.g., `10`) | Shared + first N transformer layers | Manual control; still budget-capped |
 
-**How it affects speed (16 GB GPU, Llama-70B EXL3 4.5 bpw, FP8 KV):**
+**How it affects speed (16 GB GPU, a 70B model at EXL3 4.5 bpw, FP8 KV):**
 
 | Pinned Layers | NVMe Reads/Token | Approx. Speedup |
 |---------------|-------------------|-----------------|
@@ -415,21 +411,21 @@ There are **two mutually exclusive modes**:
 #### Mode A: Standard Drafter (`DRAFTER_MODEL_PATH`)
 
 ```python
-DRAFTER_MODEL_PATH = "/home/a/code/ai-ml/models/Llama-3.2-1B-Instruct"
+DRAFTER_MODEL_PATH = "/path/to/small-drafter-model"
 USE_PROMPT_LOOKUP  = False
 ```
 
 **What it does:** Loads a small language model (0.5B-1.5B parameters) permanently into VRAM. This drafter model generates candidate tokens autoregressively at near-zero latency (no disk I/O — it's fully in VRAM).
 
 **Requirements:**
-- The drafter must share a **compatible tokenizer** with the verifier (pair within the same model family — Llama drafter for Llama verifier, Qwen drafter for Qwen verifier).
+- The drafter must share a **compatible tokenizer** with the verifier (pair a drafter from the same model family as the verifier so the tokenizer matches).
 - The drafter consumes VRAM permanently, reducing budget for layer pinning.
 
-| Drafter Model | VRAM Cost | Best For |
+| Drafter Size | VRAM Cost | Best For |
 |---------------|-----------|----------|
-| Llama-3.2-1B-Instruct | ~0.6 GB | General Llama-family tasks |
-| Qwen2.5-0.5B | ~0.3 GB | Minimal VRAM impact (Qwen family) |
-| Qwen2.5-Coder-1.5B | ~1.0 GB | Higher acceptance rate for code |
+| ~1B instruct | ~0.6 GB | General same-family tasks |
+| ~0.5B | ~0.3 GB | Minimal VRAM impact |
+| ~1.5B coder | ~1.0 GB | Higher acceptance rate for code |
 
 **Acceptance rate:** 40-80% depending on drafter/verifier alignment. Better for **instruction-following, chat, and novel creative responses** where the small model's priors partially align with the large model.
 
@@ -473,7 +469,7 @@ USE_PROMPT_LOOKUP  = True
 
 ---
 
-### Speeding up MoE with prompt lookup (1.31× on MiniMax-M2.7)
+### Speeding up MoE with prompt lookup (1.31× on a large MoE)
 
 Speculative decoding used to be refused outright on MoE checkpoints. It is now
 decided at **runtime**, per model, from that model's own behaviour — so on the
@@ -482,17 +478,17 @@ one configuration where it pays, you can have it.
 **Measured 2026-09-06, this box, greedy, generated ids byte-identical to plain
 decode in every arm:**
 
-| checkpoint | result | what the gate decided |
+| model | result | what the gate decided |
 |---|---|---|
-| MiniMax-M2.7 | **1.307×** (1.7795 → 2.3253 tok/s) | `run` — acceptance 1.00 against a 0.61 break-even |
-| Qwen3-235B | **0.932×** (1.080 → 1.0064 tok/s) | `off_acceptance` — acceptance 0.351 against a 0.528 bar |
+| large MoE (this box) | **1.307×** (1.7795 → 2.3253 tok/s) | `run` — acceptance 1.00 against a 0.61 break-even |
+| another large MoE | **0.932×** (1.080 → 1.0064 tok/s) | `off_acceptance` — acceptance 0.351 against a 0.528 bar |
 
 #### Enabling it
 
 ```python
 # vaayu/server/config_local.py
 USE_PROMPT_LOOKUP = True     # zero VRAM; the gate decides whether it runs
-DRAFT_TOKENS      = 3        # measured best on MiniMax-M2.7
+DRAFT_TOKENS      = 3        # measured best on the large MoE
 ```
 
 That is the whole change. `ENABLE_THINKING` is already `False` on the server,
@@ -500,9 +496,9 @@ which matters more than it looks — see below.
 
 #### The three conditions. All of them, or you get nothing
 
-1. **The right model.** MiniMax-M2.7 wins. **Qwen3-235B loses 6.8 %** — the gate
-   catches it and switches off, but the trial costs something. If you serve
-   Qwen, leave `USE_PROMPT_LOOKUP` off.
+1. **The right model.** The large MoE on this box wins. **Another large MoE lost
+   6.8 %** — the gate catches it and switches off, but the trial costs something.
+   If the gate's calibration shows no gain for your model, leave `USE_PROMPT_LOOKUP` off.
 2. **Thinking suppressed.** Both MoE templates end their assistant turn with a
    hard-coded `<think>`, and ignore the `enable_thinking` flag entirely. The
    server closes that block for them (`render_prompt`), which is why its
@@ -539,7 +535,7 @@ The same object is written to `logs/latest/env.json` for a support bundle.
 #### What it costs when it says no
 
 The gate cannot know a model's acceptance rate without trying, so it spends its
-calibration steps and up to 64 drafting rounds finding out. On Qwen over a
+calibration steps and up to 64 drafting rounds finding out. On the losing MoE over a
 128-token run that is the 6.8 % above. It is paid **once per process**, not per
 request — but on short generations against a model you already know does not
 pay, switching `USE_PROMPT_LOOKUP` off by hand still beats letting the gate
@@ -588,7 +584,7 @@ DRAFT_TOKENS = 15
 #### Coding Agent (16 GB GPU, EXL3 model) — Maximum Speed
 
 ```python
-MODEL_PATH         = "/path/to/Llama-3.3-70B-Instruct-exl3-4.5bpw"
+MODEL_PATH         = "/path/to/your-model-exl3-4.5bpw"
 KV_CACHE_MODE      = "auto"          # bf16 ring buffer for EXL3 → 2.0 bytes/element
 MAX_PINNED_LAYERS  = -1              # auto-fill → ~28 layers pinned
 MAX_NEW_TOKENS     = 512             # room for full code output
@@ -602,13 +598,13 @@ DRAFT_TOKENS       = 15              # maximize PLD matches
 #### General Chat (16 GB GPU, EXL3 model) — Balanced
 
 ```python
-MODEL_PATH         = "/path/to/Llama-3.3-70B-Instruct-exl3-4.5bpw"
+MODEL_PATH         = "/path/to/your-model-exl3-4.5bpw"
 KV_CACHE_MODE      = "auto"
 MAX_PINNED_LAYERS  = -1
 MAX_NEW_TOKENS     = 256
 MAX_LENGTH         = 1024
 PREFILL_CHUNK_SIZE = 512
-DRAFTER_MODEL_PATH = "/path/to/Llama-3.2-1B-Instruct"  # ~0.6 GB VRAM
+DRAFTER_MODEL_PATH = "/path/to/small-drafter-model"  # ~0.6 GB VRAM
 USE_PROMPT_LOOKUP  = False
 DRAFT_TOKENS       = 5
 ```
@@ -616,7 +612,7 @@ DRAFT_TOKENS       = 5
 #### Minimum VRAM (16 GB GPU, BF16 model) — Conservative
 
 ```python
-MODEL_PATH         = "/path/to/Llama-3.3-70B-Instruct"
+MODEL_PATH         = "/path/to/your-model"
 KV_CACHE_MODE      = "fp16"
 MAX_PINNED_LAYERS  = 0               # shared layers only
 MAX_NEW_TOKENS     = 128
@@ -707,7 +703,7 @@ It ships for time-to-first-token visibility, early abort, and mid-stream tool-ca
 
 ### What the defaults buy
 
-Measured end-to-end on Qwen3-235B — 2 concurrent sessions x 3 rounds, ~4.6k-token shared
+Measured end-to-end on a large MoE — 2 concurrent sessions x 3 rounds, ~4.6k-token shared
 prefix, agent-shaped. Same box, same day; only configuration differs:
 
 | | first working config | shipped defaults | |
@@ -725,11 +721,11 @@ Full breakdown and the per-lever numbers: [documentation/server.md §7](document
 | `MODEL_PATH` | `""` | required. One model per process — a load costs minutes, so swapping is a restart |
 | `SERVED_MODEL_NAME` | `None` (checkpoint path) | short stable `id` for clients to hardcode |
 | `QUEUE_DEPTH` | `8` | waiting requests before `503`. One runs at a time regardless |
-| `MAX_PINNED_LAYERS` | **`-1`** | auto-fills VRAM with transformer layers. Setting `0` costs **13× on the 1B, 2.0× on MiniMax, 1.27× on the 70B** — the gain scales with how much of the model fits |
+| `MAX_PINNED_LAYERS` | **`-1`** | auto-fills VRAM with transformer layers. Setting `0` costs **13× on a small dense model, 2.0× on a large MoE, 1.27× on a large dense model** — the gain scales with how much of the model fits |
 | `ENABLE_PREFIX_CACHE` | **`True`** | leave it on. Reuse is the largest lever here |
 | `PREFIX_COMPRESS` | `None` (set `9`) | ~1.6× the pooled sessions (0.605× bf16: 9 bits plus 8 exact channels per layer, which is what clears the quality bar on both MoE forwards). Reuse collapses to **zero**, not gradually, once the pool is over capacity |
 | `DRAFTER_MODEL_PATH` | `None` | **5.57×** on streamed dense. Still refused at load on MoE (a weighted drafter costs VRAM the expert cache needs) |
-| `USE_PROMPT_LOOKUP` | `"auto"` | `"auto"` = ON for dense, OFF for MoE, resolved at load. **1.94×** on streamed dense, zero VRAM. On MoE a runtime gate decides per model — **1.31× on MiniMax-M2.7**, correctly refused on Qwen3-235B. See [Speeding up MoE with prompt lookup](#speeding-up-moe-with-prompt-lookup-131-on-minimax-m27) |
+| `USE_PROMPT_LOOKUP` | `"auto"` | `"auto"` = ON for dense, OFF for MoE, resolved at load. **1.94×** on streamed dense, zero VRAM. On MoE a runtime gate decides per model — **1.31× on a large MoE**, correctly refused on another. See [Speeding up MoE with prompt lookup](#speeding-up-moe-with-prompt-lookup-131-on-a-large-moe) |
 | `RAM_CACHE_BUDGET_GB` | `None` *(derived from total RAM)* | pageable RAM holding layers that don't fit VRAM. On the 70B: 33/80 layers, 264 hits/248 misses. Dense only — MoE experts use the **pinned** expert cache, a scarcer resource with its own 8.5 GiB ceiling |
 | `--prefix-sessions` | `3` | concurrent sessions the prefix pool must hold before the MoE expert cache claims the rest. Lower = faster decode, fewer cached sessions |
 | `ATTN_IMPLEMENTATION` | `None` (sdpa) | `"flash_attention_2"` derives more context at the same reserve |
@@ -798,7 +794,7 @@ python test_quick.py
 from vaayu import AutoModel
 
 model = AutoModel.from_pretrained(
-    "/path/to/models/Llama-3.3-70B-Instruct-exl3-4.5bpw",
+    "/path/to/your-model-exl3-4.5bpw",
     kv_cache_mode="auto",        # "auto" selects bf16 for EXL3, FP16 otherwise
                                  # ("fp8" still available; it is 1.5x LARGER — it
                                  #  keeps a dequantized mirror alongside the fp8 store)

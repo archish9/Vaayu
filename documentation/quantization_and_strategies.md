@@ -90,18 +90,18 @@ To quantize a standard HF bfloat16/float16 model to EXL3 4.5bpw, use our pre-bui
 ### Foreground Execution Command
 ```bash
 python quantize.py \
-  --in_dir   /path/to/models/Llama-3.3-70B-Instruct \
-  --out_dir  /path/to/models/Llama-3.3-70B-Instruct-exl3-4.5bpw \
-  --work_dir /path/to/models/Llama-3.3-70B-Instruct-exl3-work \
+  --in_dir   /path/to/your-model \
+  --out_dir  /path/to/your-model-exl3-4.5bpw \
+  --work_dir /path/to/your-model-exl3-work \
   --bits     4.5
 ```
 
 ### Background Execution Command (With Log Tracking)
 ```bash
 nohup python quantize.py \
-  --in_dir   /path/to/models/Llama-3.3-70B-Instruct \
-  --out_dir  /path/to/models/Llama-3.3-70B-Instruct-exl3-4.5bpw \
-  --work_dir /path/to/models/Llama-3.3-70B-Instruct-exl3-work \
+  --in_dir   /path/to/your-model \
+  --out_dir  /path/to/your-model-exl3-4.5bpw \
+  --work_dir /path/to/your-model-exl3-work \
   --bits     4.5 \
   --resume > quantize.log 2>&1 &
 ```

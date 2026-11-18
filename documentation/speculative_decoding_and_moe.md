@@ -1,22 +1,22 @@
 # Speculative Decoding — As Built (Phase H)
 
 > Implementation complete. Measured outcomes: **5.57x** with a drafter and **1.94x** with prompt
-> lookup on streamed dense (Llama-3.3-70B).
+> lookup on streamed dense (a large (70B) dense model).
 >
 > **On MoE, updated 2026-09-06 — the flat "refused at load" is no longer true.** A *weighted
 > drafter* is still refused before it loads: it costs 3.09 GB of VRAM the expert cache needs. But
 > **prompt lookup is now decided at runtime**, per model, by an adaptive gate, because the static
 > refusal was wrong in both directions. The 53.4 GB / 26.4 GB figures below are a **zero-overlap
-> upper bound**: consecutive decode positions overlap 24-51 % (Qwen) and 14-35 % (MiniMax), so the
+> upper bound**: consecutive decode positions overlap 24-51 % (the second streamed MoE) and 14-35 % (a streamed MoE), so the
 > real verify-pass working set is 13.53 GB / 12.78 GB, and the bound was refusing a configuration
 > that fits.
 >
 > Measured with prompt lookup, thinking suppressed, ids byte-identical to plain decode:
-> **MiniMax-M2.7 1.307x** (the gate admits it), **Qwen3-235B 0.932x** (the gate latches off after
-> paying ~6.8 % to find out — Qwen opens its answers with prose, which PLD cannot draft from).
+> **A streamed MoE 1.307x** (the gate admits it), **A second streamed MoE 0.932x** (the gate latches off after
+> paying ~6.8 % to find out — The second streamed MoE opens its answers with prose, which PLD cannot draft from).
 >
 > Enabling it, the three conditions that must hold together, and how to read the gate's decision:
-> [`server.md` § Turning it on](server.md). Bytes-fit alone is **not** sufficient — Qwen's
+> [`server.md` § Turning it on](server.md). Bytes-fit alone is **not** sufficient — The second streamed MoE's
 > configuration fits the budget and is still slower, which is why the gate measures acceptance
 > rather than sizing alone.
 
@@ -38,7 +38,7 @@ For a direct library call, set one or both (note `test_quick.py` was deleted on
 EAGLE_HEAD_PATH = "/path/to/yuhuili/EAGLE3-LLaMA3.3-Instruct-70B"
 
 # Option B: Standard HF drafter (any small model)
-DRAFTER_MODEL_PATH = "/path/to/Qwen2.5-0.5B"
+DRAFTER_MODEL_PATH = "/path/to/small-drafter-model"
 
 DRAFT_TOKENS = 5
 ```
@@ -81,7 +81,7 @@ Speculative decoding is **live**. Vaayu acts as the Verifier. A resident drafter
 
 ## 2. Mixture-of-Experts (MoE) Expert-Aware Routing
 
-When targeting massive models like the **Qwen3-Coder-480B-A35B-Instruct** (a 960 GB model), a standard streaming engine would collapse under the payload weight. However, Mixture-of-Experts (MoE) models introduce a structural feature that changes the physics entirely.
+When targeting massive models like the **a ~480B-parameter MoE** (a 960 GB model), a standard streaming engine would collapse under the payload weight. However, Mixture-of-Experts (MoE) models introduce a structural feature that changes the physics entirely.
 
 * **Total Footprint**: 480B Parameters (960 GB uncompressed).
 * **Active Footprint (A35B)**: Out of the 480B parameters, the routing gate **only activates 35B parameters (2 experts)** to evaluate any single token.

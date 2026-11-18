@@ -1,16 +1,4 @@
-﻿import sys
 import setuptools
-from setuptools.command.install import install
-import subprocess
-
-# upgrade transformers to latest version to avoid "`rope_scaling` must be a dictionary with two fields" error
-class PostInstallCommand(install):
-    def run(self):
-        install.run(self)
-        try:
-            subprocess.check_call([sys.executable, "-m", "pip", "install", "--upgrade", "transformers"])
-        except subprocess.CalledProcessError:
-            print("Warning: Unable to upgrade transformers package. Please upgrade manually.")
 
 # Windows uses a different default encoding (use a consistent encoding)
 with open("README.md", "r", encoding="utf-8") as fh:
@@ -29,7 +17,7 @@ setuptools.setup(
     install_requires=[
         'tqdm',
         'torch',
-        'transformers',
+        'transformers==5.5.4',
         'accelerate',
         'safetensors',
         'optimum',
@@ -38,9 +26,6 @@ setuptools.setup(
         #'bitsandbytes' set it to optional to support fallback when not installable
         'vaayu-rust>=0.3.0; sys_platform == "linux"',  # native io_uring ext (prebuilt wheel)
     ],
-    cmdclass={
-        'install': PostInstallCommand,
-    },
     classifiers=[
         "Programming Language :: Python :: 3",
         "License :: OSI Approved :: MIT License",

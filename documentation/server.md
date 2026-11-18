@@ -323,7 +323,7 @@ healthy.
 **A cold prefill legitimately registers as silence**, and that is not a defect:
 the span starts at request arrival, because the wait for the first chunk is
 client-visible silence exactly as a mid-answer stall is. Expect 26 s on a cold
-MiniMax-M2.7 load and minutes on a large agentic prompt. Tell the two cases
+streamed-MoE load and minutes on a large agentic prompt. Tell the two cases
 apart by where the span started. `max_silence_at_s` at or near `0` with
 `tokens_held_at_max_silence: 0` is the prefill-or-queue case: the client was
 waiting for the answer to begin. A span that starts at `last_chunk_s` with
@@ -563,13 +563,13 @@ server runs them once the body of a successful (200) response has been sent,
 holding the engine lock, and prints `[Vaayu-Server] deferred hygiene: <N> ms`
 to `server.log`. After a refused or failed request they stay due until the next
 successful one. A request that arrives during those N milliseconds waits for
-them: 75–99 ms on Qwen3-Next-80B with a warm expert cache, under 40 ms on the
+them: 75–99 ms on a hybrid (linear-attention) MoE with a warm expert cache, under 40 ms on the
 other checkpoints measured (2026-10-07). A library caller (`AutoModel` without
 the server) keeps the every-32-pass cadence.
 
 **`vaayu_telemetry.json` is no longer written.** The engine used to rewrite
 that file in the working directory at the end of every request, which on
-Qwen3-Next-80B cost about 0.29 ms per token held in its ring: about 1.2 s per
+A hybrid (linear-attention) MoE cost about 0.29 ms per token held in its ring: about 1.2 s per
 request once the 4,096-token ring is full (extrapolated). The per-layer timing
 ring is still kept in memory, and a library caller can write it on demand with
 `model.telemetry.dump_json(path)`; the server exposes no endpoint for it. On a
@@ -585,29 +585,29 @@ holds one model for its whole life and should fill the box.
 
 | constant | default | what it does |
 |---|---|---|
-| `MAX_PINNED_LAYERS` | **`-1`** | `-1` auto-fills the VRAM budget with transformer layers. `0` pins shared layers only, so **every transformer layer streams from NVMe on every token**. Measured cost of getting this wrong: **13× on Llama-3.2-1B, 2.0× on MiniMax-M2.7, 1.27× on Llama-3.3-70B** (§7) |
-| `ENABLE_PREFIX_CACHE` | **`True`** | cross-turn KV reuse. Leave it on for an agent workload — reuse is the largest measured lever here (136–377× TTFT). **Hybrid / linear-attention models (`qwen3_next` and similar) get cross-turn reuse too, since 42-B:** the pooled entry carries the recurrent state along with the KV, and a turn that continues a previous one (resends its ids and appends) is served from it. A turn that diverges mid-context instead takes a full prefill — there is no partial prefix of a recurrent state to lend — and is counted separately as `recurrent_partial` in the prefix stats line. Measured **6.24×** on round-2 TTFT at 8k tokens on Qwen3-Next. **DeepSeek-V4 follows the same rule since S34** — its preallocated sliding-window cache cannot be cropped either: a turn that appends to the previous one is served from the pool (measured 10.26 s against 51.08 s to first token at a 1.3–1.8k context and 11.33 s against 165.00 s (one turn) at 4.3–4.9k), anything else prefills in full, and a turn that ends in an error drops the entry it was reusing (a cancelled turn does not — see §6.7). On DeepSeek-V4, reuse needs thinking off (`ENABLE_THINKING = False`, the default, and no per-request `"enable_thinking": true`): with thinking on, the checkpoint's own prompt encoder re-renders the previous assistant turn without its reasoning, so the new prompt no longer contains the stored entry and every turn prefills in full; `ENABLE_PREFIX_CACHE = False` then avoids parking a session for nothing. |
-| `PREFIX_COMPRESS` | `None` | packs pooled KV at N bits (**9**, both the recommended setting and the quantizer's ceiling) so the same RAM budget holds ~1.6× the sessions. 9 bits plus a mixed-precision outlier split is what clears the quality bar on both MoE forwards — [TUNING.md §2](TUNING.md). Matters when serving several agent sessions — see §6. Ignored, with a line at load saying so, on a model whose KV cache is servable at one length only (hybrid / linear-attention models, DeepSeek-V4) and on a model with windowed attention layers (gpt-oss-20b), whose live cache keeps those layers at window length. |
-| `DRAFTER_MODEL_PATH` | `None` | speculative decoding with a small drafter. Measured **5.57×** on streamed dense. Refused on both MoE targets **before the drafter is loaded** — see below. **Refused, with a WARNING naming the reason, on a model whose layers keep recurrent state** (hybrid / linear-attention families such as `qwen3_next`): a rejected draft cannot be rolled back out of a recurrent state, and before this refusal Qwen3-Next emitted garbage from the first drafting round. `VAAYU_SPEC_FORCE` does not lift it. |
-| `USE_PROMPT_LOOKUP` | `"auto"` | n-gram speculative decoding, **zero VRAM**. `"auto"` resolves at load, where MoE-ness is known: **ON for dense** (measured **1.94×** streamed, strongest on code, where identifiers and boilerplate repeat), **OFF for MoE**. `True`/`False` opt a model in or out and always win. **On MoE, MEASURE BEFORE OPTING IN — it depends on what the model emits, not on which model it is.** Qwen3-235B's gate refuses to draft at all (`off_union`), so it gains nothing. MiniMax-M2.7 on one 128-token code prompt (2026-09-07): at server defaults acceptance is 0.14 vs a 0.6259 break-even so the gate latches `off_acceptance` after ~1 call; with thinking on the gate said `run` and still lost 12.9 % total / 16.0 % decode. An earlier arm on a different prompt measured 1.307×. **Since 2026-09-11 the gate runs its own A/B.** After calibration, its trial alternates 4 drafting rounds with 4 suppressed ones, for at least 4 pairs and at least 48 drafted tokens (a trial that drafts slowly runs more pairs). It admits speculation only if acceptance clears the expert-byte break-even AND the drafting rounds cost less per token than their suppressed partners, averaged over the pairs. It reports `bar_used` (`"pooled"`; `"wall"` / `"bytes"` only when too few pairs were timed, which falls back to the earlier single-window rule), `pooled_ratio` (above 1 means drafting was dearer per token), `pairs_used`, `alpha`, `wall_breakeven` and `base_from`. Measured on MiniMax-M2.7: the arm where the earlier single-window gate said `run` and lost **−19.7 %** is now refused, 3 of 3 replicates (pooled ratio 1.33–1.36; forcing speculation on it measured **−18.6 %**), and the arm where speculation wins is still admitted and worth **+15.4 %**. **It is still a claim about the start of a call, not a promise:** the refusal above rests on the wider window — its first four pairs alone averaged 0.99 — and the whole trial runs in the first ~40–60 rounds, which are the cheapest part of a call. **Time your own workload both ways.** When speculation *is* worth running, sizing the VRAM expert-cache prefix on the verify width is worth a further +4.16 %. **Refused, with a WARNING naming the reason, on a model whose layers keep recurrent state** (hybrid / linear-attention families such as `qwen3_next`): a rejected draft cannot be rolled back out of a recurrent state, and before this refusal Qwen3-Next emitted garbage from the first drafting round. `VAAYU_SPEC_FORCE` does not lift it. |
+| `MAX_PINNED_LAYERS` | **`-1`** | `-1` auto-fills the VRAM budget with transformer layers. `0` pins shared layers only, so **every transformer layer streams from NVMe on every token**. Measured cost of getting this wrong: **13× on a small dense model, 2.0× on a streamed MoE, 1.27× on a large (70B) dense model** (§7) |
+| `ENABLE_PREFIX_CACHE` | **`True`** | cross-turn KV reuse. Leave it on for an agent workload — reuse is the largest measured lever here (136–377× TTFT). **Hybrid / linear-attention models (`qwen3_next` and similar) get cross-turn reuse too, since 42-B:** the pooled entry carries the recurrent state along with the KV, and a turn that continues a previous one (resends its ids and appends) is served from it. A turn that diverges mid-context instead takes a full prefill — there is no partial prefix of a recurrent state to lend — and is counted separately as `recurrent_partial` in the prefix stats line. Measured **6.24×** on round-2 TTFT at 8k tokens on a hybrid (linear-attention) MoE. **A fixed-cache streamed MoE follows the same rule since S34** — its preallocated sliding-window cache cannot be cropped either: a turn that appends to the previous one is served from the pool (measured 10.26 s against 51.08 s to first token at a 1.3–1.8k context and 11.33 s against 165.00 s (one turn) at 4.3–4.9k), anything else prefills in full, and a turn that ends in an error drops the entry it was reusing (a cancelled turn does not — see §6.7). On a fixed-cache streamed MoE, reuse needs thinking off (`ENABLE_THINKING = False`, the default, and no per-request `"enable_thinking": true`): with thinking on, the checkpoint's own prompt encoder re-renders the previous assistant turn without its reasoning, so the new prompt no longer contains the stored entry and every turn prefills in full; `ENABLE_PREFIX_CACHE = False` then avoids parking a session for nothing. |
+| `PREFIX_COMPRESS` | `None` | packs pooled KV at N bits (**9**, both the recommended setting and the quantizer's ceiling) so the same RAM budget holds ~1.6× the sessions. 9 bits plus a mixed-precision outlier split is what clears the quality bar on both MoE forwards — [TUNING.md §2](TUNING.md). Matters when serving several agent sessions — see §6. Ignored, with a line at load saying so, on a model whose KV cache is servable at one length only (hybrid / linear-attention models, a fixed-cache streamed MoE) and on a model with windowed attention layers (a windowed-attention MoE), whose live cache keeps those layers at window length. |
+| `DRAFTER_MODEL_PATH` | `None` | speculative decoding with a small drafter. Measured **5.57×** on streamed dense. Refused on both MoE targets **before the drafter is loaded** — see below. **Refused, with a WARNING naming the reason, on a model whose layers keep recurrent state** (hybrid / linear-attention families such as `qwen3_next`): a rejected draft cannot be rolled back out of a recurrent state, and before this refusal a hybrid (linear-attention) MoE emitted garbage from the first drafting round. `VAAYU_SPEC_FORCE` does not lift it. |
+| `USE_PROMPT_LOOKUP` | `"auto"` | n-gram speculative decoding, **zero VRAM**. `"auto"` resolves at load, where MoE-ness is known: **ON for dense** (measured **1.94×** streamed, strongest on code, where identifiers and boilerplate repeat), **OFF for MoE**. `True`/`False` opt a model in or out and always win. **On MoE, MEASURE BEFORE OPTING IN — it depends on what the model emits, not on which model it is.** a second streamed MoE's gate refuses to draft at all (`off_union`), so it gains nothing. A streamed MoE on one 128-token code prompt (2026-09-07): at server defaults acceptance is 0.14 vs a 0.6259 break-even so the gate latches `off_acceptance` after ~1 call; with thinking on the gate said `run` and still lost 12.9 % total / 16.0 % decode. An earlier arm on a different prompt measured 1.307×. **Since 2026-09-11 the gate runs its own A/B.** After calibration, its trial alternates 4 drafting rounds with 4 suppressed ones, for at least 4 pairs and at least 48 drafted tokens (a trial that drafts slowly runs more pairs). It admits speculation only if acceptance clears the expert-byte break-even AND the drafting rounds cost less per token than their suppressed partners, averaged over the pairs. It reports `bar_used` (`"pooled"`; `"wall"` / `"bytes"` only when too few pairs were timed, which falls back to the earlier single-window rule), `pooled_ratio` (above 1 means drafting was dearer per token), `pairs_used`, `alpha`, `wall_breakeven` and `base_from`. Measured on a streamed MoE: the arm where the earlier single-window gate said `run` and lost **−19.7 %** is now refused, 3 of 3 replicates (pooled ratio 1.33–1.36; forcing speculation on it measured **−18.6 %**), and the arm where speculation wins is still admitted and worth **+15.4 %**. **It is still a claim about the start of a call, not a promise:** the refusal above rests on the wider window — its first four pairs alone averaged 0.99 — and the whole trial runs in the first ~40–60 rounds, which are the cheapest part of a call. **Time your own workload both ways.** When speculation *is* worth running, sizing the VRAM expert-cache prefix on the verify width is worth a further +4.16 %. **Refused, with a WARNING naming the reason, on a model whose layers keep recurrent state** (hybrid / linear-attention families such as `qwen3_next`): a rejected draft cannot be rolled back out of a recurrent state, and before this refusal a hybrid (linear-attention) MoE emitted garbage from the first drafting round. `VAAYU_SPEC_FORCE` does not lift it. |
 | `DRAFT_TOKENS` | `5` | candidates per speculative round. `5–8` with a drafter, `10–15` with prompt lookup |
-| `PREFILL_CHUNK_SIZE` | `512` | tokens per prefill chunk. 512 is measured best; smaller costs TTFT (+24.7 % MoE, +213 % dense at 128) and buys nothing. On a hybrid (linear-attention) model the recurrent layers carry their state across chunks (gated-delta-net families such as `qwen3_next`; before 2026-09-18 they restarted at every chunk). A hybrid whose mixer Vaayu cannot continue refuses a multi-chunk prefill with an error; set this to `0` for such a model. `0` also makes a model with windowed layers (gpt-oss-20b) store them at full length (no window-length saving). |
+| `PREFILL_CHUNK_SIZE` | `512` | tokens per prefill chunk. 512 is measured best; smaller costs TTFT (+24.7 % MoE, +213 % dense at 128) and buys nothing. On a hybrid (linear-attention) model the recurrent layers carry their state across chunks (gated-delta-net families such as `qwen3_next`; before 2026-09-18 they restarted at every chunk). A hybrid whose mixer Vaayu cannot continue refuses a multi-chunk prefill with an error; set this to `0` for such a model. `0` also makes a model with windowed layers (a windowed-attention MoE) store them at full length (no window-length saving). |
 | `KV_CACHE_MODE` | `"auto"` | `auto` picks bf16 for EXL3. `fp8` is **1.5× larger**, not smaller — it keeps a dequantized mirror |
-| `ATTN_IMPLEMENTATION` | `None` | **prefers `flash_attention_2`** when `flash_attn` imports, then `sdpa`, then `eager` — it does **not** mean sdpa. Every shipped `max_seq_len` figure was verified on **sdpa**; `"flash_attention_2"` derives a larger context at the same reserve, and costs **−2.3 % MiniMax / −4.1 % Qwen** end-to-end against sdpa. **MiniMax half RE-MEASURED 2026-11-17 and it holds:** sdpa 493.42 vs flash 504.26 ms/token (flash **+2.2 %**), mirrored server arms, decode by difference, `max_seq_len` pinned equal, kernel proved per arm from the load log. Flash hands back 4.08 GiB of reserve (0 vs 10.9 B/score-element) which became 2.4× the expert VRAM cache and bought **nothing** (`gb_tok` moved 0.08 %) — its advantage is the larger context, not speed. The −4.1 % Qwen figure is **history**, not re-measurable (checkpoint gone). `MAX_BATCH_SIZE` below is **inert** unless this resolves to `sdpa` |
-| `MAX_BATCH_SIZE` | `1` | requests served together as one batch. A **ceiling, never a target** — max width is model- and context-dependent and is **not 3**. Measured 2026-09-08 at ~4.15k-token prompts, **engine-level (`batched_generate` called directly, not through the server) and with the prefix cache OFF** — no server-level A/B has been run, and the server defaults `ENABLE_PREFIX_CACHE = True`: `2` is **+1.606×** on MiniMax-M2.7 (TTFT 317.2 → 223.3 s, peak VRAM *lower* batched); `3` OOMs MiniMax and is **slower** than 2 on Qwen3-235B. Qwen admits N=1 only today, so this buys it nothing. **Inert unless `ATTN_IMPLEMENTATION` resolves to `sdpa`** |
-| `BATCH_WAIT_MS` | `50` | milliseconds a forming batch waits for company before running what it has. **Without it `MAX_BATCH_SIZE` never batches two concurrent clients at all** — a request wakes the dispatcher the instant it is queued, so the first of two simultaneous clients runs alone while the second is still being tokenized (measured on Llama-3.2-1B through the real server: 2 clients, warm, `batch=None` on both requests, 3 runs of 3). It also un-sticks two **steady** clients, which otherwise alternate one-at-a-time forever and never meet in the queue. Cost of getting it wrong is one-sided and bounded: a lone request at an idle server is delayed by this much, once — 0.02 % of MiniMax-M2.7's ~220 s TTFT at 4.15k tokens, ~4 % of a Llama-3.2-1B request. A batch that fills stops waiting immediately. `0` restores the pre-2026-09-09 behaviour. **Inert at `MAX_BATCH_SIZE = 1`.** Does **not** help a client whose turnaround exceeds the window — joining a *running* batch is continuous batching, which Vaayu does not do |
-| `RAM_CACHE_BUDGET_GB` | `None` *(derived from total RAM)* | GB of **pageable** RAM for the dense layer cache. `0` disables it. **No effect on MoE** — see §7.5. On a dense model it also decides buffered vs O_DIRECT reads (`TUNING.md`, "Buffered or direct disk reads"): Llama-3.3-70B read buffered decodes **21 %** slower, and `0` brings that choice back |
-| `ENABLE_KV_PERSIST` | `False` | persist prefix KV to disk so reuse survives a restart. Ignored, with a line at load saying so, on a model whose KV cache is servable at one length only (hybrid / linear-attention models, DeepSeek-V4) and on a model with windowed attention layers (gpt-oss-20b), whose live cache keeps those layers at window length. |
+| `ATTN_IMPLEMENTATION` | `None` | **prefers `flash_attention_2`** when `flash_attn` imports, then `sdpa`, then `eager` — it does **not** mean sdpa. Every shipped `max_seq_len` figure was verified on **sdpa**; `"flash_attention_2"` derives a larger context at the same reserve, and costs **−2.3 % a streamed MoE / −4.1 % the second streamed MoE** end-to-end against sdpa. **A streamed MoE half RE-MEASURED 2026-11-17 and it holds:** sdpa 493.42 vs flash 504.26 ms/token (flash **+2.2 %**), mirrored server arms, decode by difference, `max_seq_len` pinned equal, kernel proved per arm from the load log. Flash hands back 4.08 GiB of reserve (0 vs 10.9 B/score-element) which became 2.4× the expert VRAM cache and bought **nothing** (`gb_tok` moved 0.08 %) — its advantage is the larger context, not speed. The −4.1 % the second streamed MoE figure is **history**, not re-measurable (checkpoint gone). `MAX_BATCH_SIZE` below is **inert** unless this resolves to `sdpa` |
+| `MAX_BATCH_SIZE` | `1` | requests served together as one batch. A **ceiling, never a target** — max width is model- and context-dependent and is **not 3**. Measured 2026-09-08 at ~4.15k-token prompts, **engine-level (`batched_generate` called directly, not through the server) and with the prefix cache OFF** — no server-level A/B has been run, and the server defaults `ENABLE_PREFIX_CACHE = True`: `2` is **+1.606×** on a streamed MoE (TTFT 317.2 → 223.3 s, peak VRAM *lower* batched); `3` OOMs a streamed MoE and is **slower** than 2 on a second streamed MoE. The second streamed MoE admits N=1 only today, so this buys it nothing. **Inert unless `ATTN_IMPLEMENTATION` resolves to `sdpa`** |
+| `BATCH_WAIT_MS` | `50` | milliseconds a forming batch waits for company before running what it has. **Without it `MAX_BATCH_SIZE` never batches two concurrent clients at all** — a request wakes the dispatcher the instant it is queued, so the first of two simultaneous clients runs alone while the second is still being tokenized (measured on a small dense model through the real server: 2 clients, warm, `batch=None` on both requests, 3 runs of 3). It also un-sticks two **steady** clients, which otherwise alternate one-at-a-time forever and never meet in the queue. Cost of getting it wrong is one-sided and bounded: a lone request at an idle server is delayed by this much, once — 0.02 % of a streamed MoE's ~220 s TTFT at 4.15k tokens, ~4 % of a a small dense model request. A batch that fills stops waiting immediately. `0` restores the pre-2026-09-09 behaviour. **Inert at `MAX_BATCH_SIZE = 1`.** Does **not** help a client whose turnaround exceeds the window — joining a *running* batch is continuous batching, which Vaayu does not do |
+| `RAM_CACHE_BUDGET_GB` | `None` *(derived from total RAM)* | GB of **pageable** RAM for the dense layer cache. `0` disables it. **No effect on MoE** — see §7.5. On a dense model it also decides buffered vs O_DIRECT reads (`TUNING.md`, "Buffered or direct disk reads"): a large (70B) dense model read buffered decodes **21 %** slower, and `0` brings that choice back |
+| `ENABLE_KV_PERSIST` | `False` | persist prefix KV to disk so reuse survives a restart. Ignored, with a line at load saying so, on a model whose KV cache is servable at one length only (hybrid / linear-attention models, a fixed-cache streamed MoE) and on a model with windowed attention layers (a windowed-attention MoE), whose live cache keeps those layers at window length. |
 | `KV_PERSIST_DIR` | `None` *(`~/.cache/vaayu/kv`)* | where those entries are written. Until 2026-09-10 the feature above could be turned **on but not aimed**. The write budget is **derived as half the free space of whatever filesystem this names**, so this choice sets the cache's *size* as well as its location — a small or shared partition silently caps how much reuse survives a restart |
 | `KV_PERSIST_SYNC` | `False` | `fsync` each persisted entry before returning. `False` leaves the write in the page cache: a clean shutdown keeps it, a power loss or panic can leave a **torn entry** read back at the next boot. `True` costs a disk flush on the prefix-store path. Inert while `ENABLE_KV_PERSIST` is `False` |
 | `AUTO_PREFIX_MATCH` | `True` | let a request naming **no session** still find a prefix entry, by matching the longest shared prompt prefix instead of an exact key. This is the behaviour `REQUIRE_SESSION_ID` above describes; the server could not turn it off before 2026-09-10. `False` gives an unnamed request **no reuse at all** rather than approximate reuse — on this workload the larger loss. Changes nothing for a request that names its session |
-| `MAX_SEQ_LEN` | `None` *(derived)* | context to plan VRAM for. `None` derives the largest context whose predicted peak fits the reserve floor — the shipped path, and the one every measured figure here was taken at. The one reason to set it: a **shorter** context hands the difference back to the expert cache, the decode bottleneck on both MoE targets. Both failure directions are loud, not silent — above the box's `S_max` the load **refuses** (`VramPlanError`, naming `S_max`); between the derived point and `S_max` it loads while the larger KV reserve eats the pinning budget, and at `0` the engine warns that every layer now streams from disk on every token. On a model with windowed attention layers (gpt-oss-20b) that runs an elastic expert tier, `None` derives a LARGE context (since S50, 2026-10-13: the full-length-parity pricing is dropped so the context grows instead of protecting a static tier) — `None` → **~39,420 tokens** (+19 % over the pre-S50 33,213) with a small static base (~27 experts) and the elastic tier lending the rest up for shorter requests (8k decode ~45 ms/token, logits bit-identical to stock). The derived context carries a 0.30 GiB admission margin below the raw planner maximum so the full window is serviceable, not just advertised. Since 2026-10-10 the VRAM tier on such a model is sized to the request that is running — **no knob**, with `max_tokens` set or omitted — so those tier sizes are what the tier holds while a request runs at the full window, not at 8k: with `None`, 8k decode is 44.4 ms/token (56.9 with the tier held static in the same runs), and with `40442` it is 45.0 (84.0 static) — a longer plan now costs only the requests that run near its full window (two at 40,374 + 68 tokens: 120 ms/token on both arms, with 30–70 MB of the card left). A request that needs more of the reserve than the last one empties the tier before its prefill (see `TUNING.md`, "The expert VRAM tier follows the running request") |
+| `MAX_SEQ_LEN` | `None` *(derived)* | context to plan VRAM for. `None` derives the largest context whose predicted peak fits the reserve floor — the shipped path, and the one every measured figure here was taken at. The one reason to set it: a **shorter** context hands the difference back to the expert cache, the decode bottleneck on both MoE targets. Both failure directions are loud, not silent — above the box's `S_max` the load **refuses** (`VramPlanError`, naming `S_max`); between the derived point and `S_max` it loads while the larger KV reserve eats the pinning budget, and at `0` the engine warns that every layer now streams from disk on every token. On a model with windowed attention layers (a windowed-attention MoE) that runs an elastic expert tier, `None` derives a LARGE context (since S50, 2026-10-13: the full-length-parity pricing is dropped so the context grows instead of protecting a static tier) — `None` → **~39,420 tokens** (+19 % over the pre-S50 33,213) with a small static base (~27 experts) and the elastic tier lending the rest up for shorter requests (8k decode ~45 ms/token, logits bit-identical to stock). The derived context carries a 0.30 GiB admission margin below the raw planner maximum so the full window is serviceable, not just advertised. Since 2026-10-10 the VRAM tier on such a model is sized to the request that is running — **no knob**, with `max_tokens` set or omitted — so those tier sizes are what the tier holds while a request runs at the full window, not at 8k: with `None`, 8k decode is 44.4 ms/token (56.9 with the tier held static in the same runs), and with `40442` it is 45.0 (84.0 static) — a longer plan now costs only the requests that run near its full window (two at 40,374 + 68 tokens: 120 ms/token on both arms, with 30–70 MB of the card left). A request that needs more of the reserve than the last one empties the tier before its prefill (see `TUNING.md`, "The expert VRAM tier follows the running request") |
 | `ENABLE_EXPERT_USAGE` | `False` | record which experts are routed and which are evicted, for a triage bundle. **MoE-only by construction** — on a dense checkpoint the engine warns that no tracker will be built and does nothing (there are no experts to count, not a dense second-class default). Off because its cost is **unmeasured**: it puts `track_evicted_keys` on the expert-cache path, which decode hits on every layer visit. Measure your own decode both ways before leaving it on |
-| `DECODE_TOP_K` | `None` | decode-time expert budget. `None` is off (lossless); an int is a fixed clamp; **`"auto"` measures this checkpoint once at first load — a fixed k if one fits `DECODE_TOP_K_BUDGET`, otherwise a per-token routing-mass cutoff — applies the fastest in-budget setting and caches it per checkpoint.** The only knob here that changes the model's output: greedy ids diverge by design. The first load of each checkpoint is slower (≈6.5 min Qwen3-Next-80B, ≈21 min Qwen3-235B, ≈26 min MiniMax-M2.7) and no endpoint answers meanwhile; later loads apply the cached pick instantly. `/health` → `decode_top_k` shows the active pick and its measured cost. The safe value is per model and not derivable from geometry, so do not guess an int — see [TUNING.md §5c](TUNING.md) |
-| `DECODE_TOP_K_BUDGET` | `0.035` | the perplexity cost `"auto"` may spend, as a fraction. At 3.5 %: Qwen3-Next-80B → fixed k=8, **+23.1 % tok/s** for +3.43 %; MiniMax-M2.7 → cutoff p=0.90, **+8.4 %** for +2.25 %. At 2 %: Qwen3-Next → k=9, +17.0 % for +1.47 %. Changing it re-measures on the next load; ignored for an explicit int |
-| `KEEP_AWAKE` | `"auto"` | hold the CPU package out of deep idle while a generation runs: a `SCHED_IDLE` busy loop on each detected **E-core**, up for the whole generation and down when it returns. **Measured through the server (row 27): +23.1 % decode tok/s on Qwen3-235B** (0.9229 → 1.1363 tok/s, n=3, greedy ids identical), TTFT −22.3 %; MiniMax-M2.7 +1.3 %, Llama-3.3-70B +2.9 %, Llama-3.2-1B unchanged. `"auto"` = every detected E-core, an int = that many, `False` = off. Costs one E-core's power per spinner, never engine time. A non-hybrid CPU gets no spinner and a printed warning |
-| `NVME_MAX_SQES_PER_ENTER` | **`2`** *(0 = unlimited)* | **Not a tuning knob — a workaround for a KERNEL bug that hard-hung this box.** On 2026-11-08 a blk-mq race (**CVE-2026-64017**) oopsed inside `nvme_queue_rqs`, in one of Vaayu's io_uring reader threads, inside an RCU read-side critical section: the grace period never ended, the dead task held the io_uring context mutex forever, and the machine had to be power-cycled. **The real fix is a patched kernel** (`dc278e9bf2b9`; `linux-hwe-7.0` ≥ 7.0.0-28) — turn this back to `0` once yours has moved. Vaayu is the trigger because both of the race's preconditions are ours, hundreds of times per token: io_uring starts a block plug only when one `io_uring_enter` submits **more than 2** SQEs (`io_submit_state_start`: `need_plug = max_ios > 2`), and the plug's cached-request list is what the race corrupts; the crashing frame had `to_submit = 32`. **`2` removes the plug**, so the cached-request list the race needs is never populated. **Measured caveat (2026-11-17):** this does NOT stop the process entering `nvme_queue_rqs` — that is driven by the plug's DISPATCH list, which fills under any plug, including the `nr_ios == 1` plug the direct-IO path starts, so its hit count is flat at every `to_submit` (238k in 5 s at both 32 and 1). Being in that function is not the hazard; being handed a request with `mq_hctx == NULL` is. **Proved 2026-11-17:** `nr_ios > 1` and the batch request allocation that fills `cached_rqs` are both present at `to_submit` 32 and 3 and both **absent** at 2 and 1, tracking each other 1:1 — so at `2` nothing allocates a batch, the list the race corrupts is never populated, and its peek finds nothing. The `> 2` threshold is empirical, not read off kernel source: 3 plugs, 2 does not. **This ships ON** because the cost is nothing: MiniMax-M2.7 **+0.14 %** decode, dense **−0.16 %**, output bit-identical in all 20 arms. **Set it back to `0` once your kernel is patched (≥ 7.0.0-28)** — past that it is 16 extra syscalls per expert read for no benefit. The wave is unchanged — every chunk of an expert is still in flight together and the device still sees the same reads, just across more enters. Cost on its own: `ceil(N/2)` enters per read instead of 1 (**16 at N=32**), which is why you normally set `NVME_MAX_CHUNKS_PER_WAVE` with it |
-| `NVME_MAX_CHUNKS_PER_WAVE` | `0` *(fill the ring, 32)* | how many chunks one read is cut into, i.e. how many SQEs its wave needs at all. **This is what makes the cap above cheap:** with `2`, one expert read is **2 enters instead of 16** (real segment layouts: Qwen3-Next 31 chunks/16 enters → 3/2; MiniMax-M2.7 32/17 → 3/2; DeepSeek-V4 31/16 → 2/2; gpt-oss-20b 31/16 → 6/4). Floored at the read's segment count — a chunk may never cross a segment — and capped at the ring depth. It makes reads **bigger**, not more numerous, which is the direction this drive prefers: measured straight through the expert read path (O_DIRECT, one ring, 8 MiB reads, ABBA, warm block), 2 chunks vs 32 is **5.61/5.60 vs 5.62/5.62 GiB/s — Δ −0.3 %, inside noise**. Same bytes, same destinations, bit-identical output. Inert unless the cap above is set, and pointless without it |
+| `DECODE_TOP_K` | `None` | decode-time expert budget. `None` is off (lossless); an int is a fixed clamp; **`"auto"` measures this checkpoint once at first load — a fixed k if one fits `DECODE_TOP_K_BUDGET`, otherwise a per-token routing-mass cutoff — applies the fastest in-budget setting and caches it per checkpoint.** The only knob here that changes the model's output: greedy ids diverge by design. The first load of each checkpoint is slower (≈6.5 min a hybrid (linear-attention) MoE, ≈21 min a second streamed MoE, ≈26 min a streamed MoE) and no endpoint answers meanwhile; later loads apply the cached pick instantly. `/health` → `decode_top_k` shows the active pick and its measured cost. The safe value is per model and not derivable from geometry, so do not guess an int — see [TUNING.md §5c](TUNING.md) |
+| `DECODE_TOP_K_BUDGET` | `0.035` | the perplexity cost `"auto"` may spend, as a fraction. At 3.5 %: a hybrid (linear-attention) MoE → fixed k=8, **+23.1 % tok/s** for +3.43 %; a streamed MoE → cutoff p=0.90, **+8.4 %** for +2.25 %. At 2 %: a hybrid (linear-attention) MoE → k=9, +17.0 % for +1.47 %. Changing it re-measures on the next load; ignored for an explicit int |
+| `KEEP_AWAKE` | `"auto"` | hold the CPU package out of deep idle while a generation runs: a `SCHED_IDLE` busy loop on each detected **E-core**, up for the whole generation and down when it returns. **Measured through the server (row 27): +23.1 % decode tok/s on a second streamed MoE** (0.9229 → 1.1363 tok/s, n=3, greedy ids identical), TTFT −22.3 %; a streamed MoE +1.3 %, a large (70B) dense model +2.9 %, a small dense model unchanged. `"auto"` = every detected E-core, an int = that many, `False` = off. Costs one E-core's power per spinner, never engine time. A non-hybrid CPU gets no spinner and a printed warning |
+| `NVME_MAX_SQES_PER_ENTER` | **`2`** *(0 = unlimited)* | **Not a tuning knob — a workaround for a KERNEL bug that hard-hung this box.** On 2026-11-08 a blk-mq race (**CVE-2026-64017**) oopsed inside `nvme_queue_rqs`, in one of Vaayu's io_uring reader threads, inside an RCU read-side critical section: the grace period never ended, the dead task held the io_uring context mutex forever, and the machine had to be power-cycled. **The real fix is a patched kernel** (`dc278e9bf2b9`; `linux-hwe-7.0` ≥ 7.0.0-28) — turn this back to `0` once yours has moved. Vaayu is the trigger because both of the race's preconditions are ours, hundreds of times per token: io_uring starts a block plug only when one `io_uring_enter` submits **more than 2** SQEs (`io_submit_state_start`: `need_plug = max_ios > 2`), and the plug's cached-request list is what the race corrupts; the crashing frame had `to_submit = 32`. **`2` removes the plug**, so the cached-request list the race needs is never populated. **Measured caveat (2026-11-17):** this does NOT stop the process entering `nvme_queue_rqs` — that is driven by the plug's DISPATCH list, which fills under any plug, including the `nr_ios == 1` plug the direct-IO path starts, so its hit count is flat at every `to_submit` (238k in 5 s at both 32 and 1). Being in that function is not the hazard; being handed a request with `mq_hctx == NULL` is. **Proved 2026-11-17:** `nr_ios > 1` and the batch request allocation that fills `cached_rqs` are both present at `to_submit` 32 and 3 and both **absent** at 2 and 1, tracking each other 1:1 — so at `2` nothing allocates a batch, the list the race corrupts is never populated, and its peek finds nothing. The `> 2` threshold is empirical, not read off kernel source: 3 plugs, 2 does not. **This ships ON** because the cost is nothing: a streamed MoE **+0.14 %** decode, dense **−0.16 %**, output bit-identical in all 20 arms. **Set it back to `0` once your kernel is patched (≥ 7.0.0-28)** — past that it is 16 extra syscalls per expert read for no benefit. The wave is unchanged — every chunk of an expert is still in flight together and the device still sees the same reads, just across more enters. Cost on its own: `ceil(N/2)` enters per read instead of 1 (**16 at N=32**), which is why you normally set `NVME_MAX_CHUNKS_PER_WAVE` with it |
+| `NVME_MAX_CHUNKS_PER_WAVE` | `0` *(fill the ring, 32)* | how many chunks one read is cut into, i.e. how many SQEs its wave needs at all. **This is what makes the cap above cheap:** with `2`, one expert read is **2 enters instead of 16** (real segment layouts: a hybrid (linear-attention) MoE 31 chunks/16 enters → 3/2; a streamed MoE 32/17 → 3/2; a fixed-cache streamed MoE 31/16 → 2/2; a windowed-attention MoE 31/16 → 6/4). Floored at the read's segment count — a chunk may never cross a segment — and capped at the ring depth. It makes reads **bigger**, not more numerous, which is the direction this drive prefers: measured straight through the expert read path (O_DIRECT, one ring, 8 MiB reads, ABBA, warm block), 2 chunks vs 32 is **5.61/5.60 vs 5.62/5.62 GiB/s — Δ −0.3 %, inside noise**. Same bytes, same destinations, bit-identical output. Inert unless the cap above is set, and pointless without it |
 | `PIN_ENGINE_THREADS` | `True` | pin the engine's threads to the **P-cores** for the duration of a generation and restore their masks after. Composes with `KEEP_AWAKE` (in-process: −7.6 % time per token on its own, −21.5 % together). Threads started inside a generation inherit the mask, which is how it reaches the io_uring readers. Skipped automatically on a CPU with no P/E split |
 
 > **Not every engine parameter is a server knob, and that is a decision, not an
@@ -619,18 +619,18 @@ holds one model for its whole life and should fill the box.
 > that only works on an unquantized dense checkpoint (`compression`: `__init__`
 > refuses it with a warning on a quantized, MoE or originals-deleted one, which is
 > every production model this server is tested with; only the small unquantized
-> Llama-3.2-1B smoke checkpoint keeps it), a flag `__init__` refuses
+> A small dense model smoke checkpoint keeps it), a flag `__init__` refuses
 > with a warning because it crashes on CUDA (`use_torch_compile`: its cudagraphs
 > are replayed once per layer with no step boundary; without them it measured
-> 24–35 % slower on Qwen3-Next), and HF auth, which belongs in the environment. The list is
+> 24–35 % slower on a hybrid (linear-attention) MoE), and HF auth, which belongs in the environment. The list is
 > enforced: `tests/test_engine_param_reachability.py` fails the suite when a new
 > engine parameter appears with **neither** a knob **nor** a written-down decline.
 
 
 > **`DRAFTER_MODEL_PATH` requires a vocabulary match.** The drafter and target must
 > have identical vocab sizes; the server refuses the pairing at load otherwise, before
-> any weights are read. Llama-3.2-1B drafts for Llama-3.3-70B (both 128256). It does
-> **not** draft for MiniMax (200064) — that mismatch used to surface as a CUDA
+> any weights are read. A small dense model drafts for a large (70B) dense model (both 128256). It does
+> **not** draft for a streamed MoE (200064) — that mismatch used to surface as a CUDA
 > `CUBLAS_STATUS_INTERNAL_ERROR` several frames away.
 
 ---
@@ -854,7 +854,7 @@ Do not try to "optimise" by trimming or summarising history mid-conversation —
 breaks the prefix and forces a full prefill. If you must trim, trim from the **end**,
 never the beginning.
 
-On a model whose cache cannot be cropped (hybrid / linear-attention models, DeepSeek-V4) the rule is stricter: only a request that contains the previous turn's **whole** prompt and reply is reused. Editing or dropping anything earlier in the history, or starting a new task under the same system prompt, prefills in full; `/health` counts each as `recurrent_partial`. On DeepSeek-V4, reuse needs thinking off (`ENABLE_THINKING = False`, the default, and no per-request `"enable_thinking": true`): with thinking on, the checkpoint's own prompt encoder re-renders the previous assistant turn without its reasoning, so the new prompt no longer contains the stored entry and every turn prefills in full; `ENABLE_PREFIX_CACHE = False` then avoids parking a session for nothing.
+On a model whose cache cannot be cropped (hybrid / linear-attention models, a fixed-cache streamed MoE) the rule is stricter: only a request that contains the previous turn's **whole** prompt and reply is reused. Editing or dropping anything earlier in the history, or starting a new task under the same system prompt, prefills in full; `/health` counts each as `recurrent_partial`. On a fixed-cache streamed MoE, reuse needs thinking off (`ENABLE_THINKING = False`, the default, and no per-request `"enable_thinking": true`): with thinking on, the checkpoint's own prompt encoder re-renders the previous assistant turn without its reasoning, so the new prompt no longer contains the stored entry and every turn prefills in full; `ENABLE_PREFIX_CACHE = False` then avoids parking a session for nothing.
 
 `session_id` is required (see §4). Give each independent agent stream its own: it makes
 the match exact instead of a scan. An unrecognised `session_id` still falls back to auto-match,
@@ -935,18 +935,18 @@ Check `/v1/models` at startup and budget against the real number:
 
 | checkpoint | derived `max_seq_len` (sdpa) |
 |---|---|
-| Qwen3-235B | 8192 |
-| MiniMax-M2.7 | 8192 |
-| Llama-3.3-70B | 8192 |
-| Llama-3.2-1B | 90639 |
-| Qwen3-Next-80B int4 | 65536 (flash) |
+| a second streamed MoE | 8192 |
+| a streamed MoE | 8192 |
+| a large (70B) dense model | 8192 |
+| a small dense model | 90639 |
+| a hybrid (linear-attention) MoE | 65536 (flash) |
 
 8192 is **tight** for a tool-using agent: system prompt plus a few MCP tool schemas can
 be 1.5–3k before any code is read. Keep tool schemas terse, and read files in slices.
 `ATTN_IMPLEMENTATION = "flash_attention_2"` derives more context at the same reserve.
 
 A **hybrid-attention** checkpoint derives far more than its size suggests, because only some
-of its layers store KV at all: Qwen3-Next-80B has 12 attention layers among 48, so a token
+of its layers store KV at all: a hybrid (linear-attention) MoE has 12 attention layers among 48, so a token
 costs a quarter of what the layer count implies. The engine counts those layers off the model
 itself — there is no knob, and nothing to set.
 
@@ -962,7 +962,7 @@ The call format is detected by **probing the chat template**, never by model nam
 the template has no tool support, a request carrying `tools` is a `400` with a named
 reason — deliberately, rather than silently dropping the tools and leaving your agent
 waiting for a call the model was never told about. A model that renders its own prompts
-instead of shipping a template (DeepSeek-V4 today) refuses every request carrying `tools`
+instead of shipping a template (a fixed-cache streamed MoE today) refuses every request carrying `tools`
 the same way, because its tool-call format is not parsed yet.
 
 Check before you rely on it:
@@ -1000,7 +1000,7 @@ occupies capacity it is not using. Aborting is also safe for the cache: closing 
 connection stops generation cooperatively, so the turn ends as an ordinary, shorter one
 and its entry is stored at the prompt plus the partial reply — real KV the next turn can
 reuse. On a model whose cache cannot be cropped (hybrid / linear-attention models,
-DeepSeek-V4) that entry serves only a request that contains all of it, so a retry of the
+A fixed-cache streamed MoE) that entry serves only a request that contains all of it, so a retry of the
 same request prefills in full. A request that continues from the partial reply is reused
 only if its history carries the reply exactly as far as the server got, which can be a
 token or more past what the client received. The entry a turn was reusing is **dropped**
@@ -1021,7 +1021,7 @@ Measured on this box (16 GB VRAM, 32 GB RAM), same-day A/B.
 
 ### 7.0 What the defaults are worth, end to end
 
-Measured on Qwen3-235B, 2 concurrent sessions x 3 rounds, ~4.6k-token shared prefix,
+Measured on a second streamed MoE, 2 concurrent sessions x 3 rounds, ~4.6k-token shared prefix,
 24 decode tokens per turn — an agent-shaped workload. Same box, same day. The only
 difference between the arms is configuration:
 
@@ -1052,12 +1052,12 @@ touch the NVMe again. At `0` the budget sits idle and every layer streams per to
 
 | checkpoint | `MAX_PINNED_LAYERS = 0` | `-1` (default) | gain | what actually pinned |
 |---|---|---|---|---|
-| Llama-3.2-1B | 6.40 tok/s | **83.27 tok/s** | **13.0×** | 16 of 16 layers — fully resident |
-| MiniMax-M2.7 (MoE) | 0.760 tok/s | **1.537 tok/s** | **2.02×** | non-expert parts of all 62 layers |
-| Llama-3.3-70B (dense) | 0.131 tok/s | **0.167 tok/s** | **1.27×** | 1 of 80 layers |
+| a small dense model | 6.40 tok/s | **83.27 tok/s** | **13.0×** | 16 of 16 layers — fully resident |
+| a streamed MoE (MoE) | 0.760 tok/s | **1.537 tok/s** | **2.02×** | non-expert parts of all 62 layers |
+| a large (70B) dense model (dense) | 0.131 tok/s | **0.167 tok/s** | **1.27×** | 1 of 80 layers |
 
 **The gain scales with the fraction of the model that fits**, which is why it ranges from
-13× to 1.27×. Llama-3.3-70B's layers are ~460 MB each against a ~2.6 GB pinning budget, so
+13× to 1.27×. A large (70B) dense model's layers are ~460 MB each against a ~2.6 GB pinning budget, so
 only one stays resident and 79 still stream per token — that model is disk-bound no matter
 what this flag says. The 1B fits entirely and never touches the NVMe again.
 
@@ -1080,17 +1080,17 @@ Vaayu is model-agnostic; this needs no code change, only a checkpoint.
 
 | mode | setting | measured |
 |---|---|---|
-| drafter | `DRAFTER_MODEL_PATH = "/path/to/Llama-3.2-1B-Instruct"` | **5.57×** on Llama-3.3-70B (86 % acceptance, byte-identical output) |
+| drafter | `DRAFTER_MODEL_PATH = "/path/to/small-drafter-model"` | **5.57×** on a large (70B) dense model (86 % acceptance, byte-identical output) |
 | prompt lookup | `USE_PROMPT_LOOKUP = True`, `DRAFT_TOKENS = 15` | **1.94×** on the same, zero VRAM |
 
 `USE_PROMPT_LOOKUP` defaults to `"auto"`, which is ON for dense and OFF for MoE. MoE is
-excluded on evidence, not caution: prompt lookup measures **1.285× on MiniMax-M2.7** but
-**0.836× — 16 % slower — on Qwen3-235B**, and the runtime gate's own TRIAL phase costs a
+excluded on evidence, not caution: prompt lookup measures **1.285× on a streamed MoE** but
+**0.836× — 16 % slower — on a second streamed MoE**, and the runtime gate's own TRIAL phase costs a
 fixed **0.932×** on short generations. Defaulting it on would hand one actively-tested model
 a win and the other a loss. Set `USE_PROMPT_LOOKUP = True` to opt a MoE model in anyway.
 
-Both are **refused at load on MoE** — a 6-position verify pass needs 53.4 GB (Qwen) /
-26.4 GB (MiniMax) of expert working set against a 9.1 GB budget. That is a wall, not a
+Both are **refused at load on MoE** — a 6-position verify pass needs 53.4 GB (the second streamed MoE) /
+26.4 GB (a streamed MoE) of expert working set against a 9.1 GB budget. That is a wall, not a
 tuning problem.
 
 > The speculative loop is **greedy at every decision point** — `temperature`
@@ -1121,7 +1121,7 @@ margin, at 1.211 bytes/element instead of 1.156. It is automatic, with no knob. 
 ### 7.5 RAM layer caching — and why it is dense-only
 
 Layers that do not fit in VRAM are held in **pageable host RAM** rather than re-read
-from NVMe on every token. It is on by default and it works: on Llama-3.3-70B it holds
+from NVMe on every token. It is on by default and it works: on a large (70B) dense model it holds
 **33 of 80 layers (16.1 GB)** and scores **264 hits / 248 misses** during decode.
 
 The budget is derived from **total** system RAM minus a stated hardware reserve
@@ -1156,22 +1156,22 @@ Pinned pages cannot be swapped, must be found contiguously by the kernel, and th
 allocator rounds a request up to the next power of two — a 9.13 GB arena is charged
 16 GiB. That, not a policy decision, is where the 8.5 GiB ceiling comes from, and it is
 why raising it is an OOM experiment rather than a config change. MoE's non-expert
-weights are already pinned in **VRAM** (all 62 layers on MiniMax-M2.7), so a pageable
+weights are already pinned in **VRAM** (all 62 layers on a streamed MoE), so a pageable
 layer cache would have nothing left to hold.
 
 > **Measured 2026-08-16, and the answer was not what the working-set figures suggested.**
-> Both MoE targets are **disk-bound on expert reads**: Qwen3-235B pulls **4.99 GB/token**
-> from NVMe (422 expert reads), MiniMax-M2.7 **2.62 GB/token** (295) — roughly **72–74 % of
+> Both MoE targets are **disk-bound on expert reads**: a second streamed MoE pulls **4.99 GB/token**
+> from NVMe (422 expert reads), a streamed MoE **2.62 GB/token** (295) — roughly **72–74 % of
 > decode time** at ~5.5 GB/s. And the two models sit in different regimes despite an
 > identical 9.12 GB budget and near-identical share of their expert populations:
 >
 > | model | cache share | measured hit rate | locality |
 > |---|---|---|---|
-> | MiniMax-M2.7 | 6.5 % | **6.6 %** | none — rate equals share |
-> | Qwen3-235B | 6.4 % | **44 %** | strong — 6.9× its share |
+> | a streamed MoE | 6.5 % | **6.6 %** | none — rate equals share |
+> | a second streamed MoE | 6.4 % | **44 %** | strong — 6.9× its share |
 >
-> So a pageable L2 tier behind the pinned cache is promising **on Qwen** and close to
-> worthless on MiniMax. `working_set_bytes` was a misleading guide: it counts ONE decode
+> So a pageable L2 tier behind the pinned cache is promising **on the second streamed MoE** and close to
+> worthless on a streamed MoE. `working_set_bytes` was a misleading guide: it counts ONE decode
 > step's experts, while the union across steps is the whole ~141 GB population.
 
 ### 7.6 What will not help
@@ -1180,11 +1180,11 @@ Do not spend time here; each is measured and settled.
 
 | idea | verdict |
 |---|---|
-| batching beyond `MAX_BATCH_SIZE`'s measured ceiling | not a blanket "won't help": N=2 is **+1.606×** on MiniMax-M2.7 at ~4.15k-token prompts (2026-09-08, gated behind `MAX_BATCH_SIZE` and `sdpa`, **engine-level with the prefix cache OFF** — no server-level A/B run yet) — but N=3 OOMs MiniMax and is slower than N=2 on Qwen3-235B, which still admits N=1 only. See `MAX_BATCH_SIZE` in §3's config table |
+| batching beyond `MAX_BATCH_SIZE`'s measured ceiling | not a blanket "won't help": N=2 is **+1.606×** on a streamed MoE at ~4.15k-token prompts (2026-09-08, gated behind `MAX_BATCH_SIZE` and `sdpa`, **engine-level with the prefix cache OFF** — no server-level A/B run yet) — but N=3 OOMs a streamed MoE and is slower than N=2 on a second streamed MoE, which still admits N=1 only. See `MAX_BATCH_SIZE` in §3's config table |
 | smaller `PREFILL_CHUNK_SIZE` | costs TTFT (+24.7 % MoE, +213 % dense at 128), buys nothing measurable |
 | expert pinning | refuted: eviction share is linear in N and always 2–4× below the pin's cost |
 | TurboQuant KV in the live cache | failed its quality gate 2–7× on both models at 4 bits |
-| speculative decoding on MoE | refused by the working-set gate, before the drafter loads. The gate's bound is 24–51 % (Qwen) / 14–35 % (MiniMax) pessimistic — measured 2026-09-05 — but the real union still buys at most ~1.3× fewer expert routes per token, best case, against a drafter that takes 3.09 of 6.3 GB of expert VRAM cache. EAGLE-3 would not lift it |
+| speculative decoding on MoE | refused by the working-set gate, before the drafter loads. The gate's bound is 24–51 % (the second streamed MoE) / 14–35 % (a streamed MoE) pessimistic — measured 2026-09-05 — but the real union still buys at most ~1.3× fewer expert routes per token, best case, against a drafter that takes 3.09 of 6.3 GB of expert VRAM cache. EAGLE-3 would not lift it |
 | `fp8` KV to save VRAM | `fp8` is **1.5× larger** than bf16 here — it keeps a dequantized mirror |
 
 ---
@@ -1219,13 +1219,13 @@ Do not spend time here; each is measured and settled.
 | generation is ~10× slower than expected | `MAX_PINNED_LAYERS = 0` | set it back to `-1`, the default |
 | `400` naming a token count | prompt exceeds the derived window | shorten by the number the message gives |
 | `400` mentioning tool support | the checkpoint's template cannot render `tools` | use a tool-capable checkpoint |
-| `400` naming `encoding/encoding_dsv4.py`; a startup WARNING naming the same file | a DeepSeek-V4 download without its `encoding/` folder, or with an encoder that cannot load (the WARNING gives the error). The model ships no chat template; its prompt format lives in that file | download the full repository, `encoding/` included. If the WARNING names a missing module, install it and restart |
+| `400` naming `encoding/encoding_dsv4.py`; a startup WARNING naming the same file | a a fixed-cache streamed MoE download without its `encoding/` folder, or with an encoder that cannot load (the WARNING gives the error). The model ships no chat template; its prompt format lives in that file | download the full repository, `encoding/` included. If the WARNING names a missing module, install it and restart |
 | `503` + `Retry-After` | queue full | retry; raise `QUEUE_DEPTH`; reduce client concurrency |
 | a non-streaming request never returns; the client times out with no status | uncapped generation on a slow model — nothing is sent until the last token | set `max_tokens`, or `stream: true`. The startup log carries a WARNING naming the token count |
 | `422` on `n` | `n>1` requested | this server returns one choice |
 | `warnings` on the response naming a sampling param | that request skipped speculation, because the speculative loop would drop the param | nothing to fix — the param was honoured. To speculate instead, send `temperature: 0` and no `top_p`/`top_k`/`stop` |
 | a drafter pairing is refused at load | drafter/target vocab sizes differ | pair within one model family |
-| startup WARNING: `N persistent buffer(s) have no tensor in this checkpoint` | the converted checkpoint dropped tensors the model was trained with (MiniMax-M2.7's EXL3 build: its MoE routing bias) | run `scripts/fetch_missing_buffers.py --repo <original repo> --checkpoint <model dir>` and restart — see [missing_buffers.md](missing_buffers.md) |
+| startup WARNING: `N persistent buffer(s) have no tensor in this checkpoint` | the converted checkpoint dropped tensors the model was trained with (a streamed MoE's EXL3 build: its MoE routing bias) | run `scripts/fetch_missing_buffers.py --repo <original repo> --checkpoint <model dir>` and restart — see [missing_buffers.md](missing_buffers.md) |
 | server exits on startup, no VRAM plan warning | loaded on CPU | check `DEVICE` |
 | killed the server, `nvidia-smi` still shows the VRAM | another process holds it — Vaayu's share goes with the process | `nvidia-smi --query-compute-apps=pid,used_memory --format=csv` names the real holder |
 | `refusing to load -- the GPU is not exclusive` | something else holds GPU memory | run the commands the message prints, then start again. A container needs `docker stop`, not `kill` — `restart=unless-stopped` respawns it |
@@ -1293,7 +1293,7 @@ There are three gates behind that field, and any of them may write it:
   on CUDA are unaffected;
 - **before the drafter loads**, against an *upper bound* of the expert cache
   budget — this is the one that avoids loading a 3 GB drafter only to discard
-  it (measured on Qwen3-235B: **3.85 s** of load, every start);
+  it (measured on a second streamed MoE: **3.85 s** of load, every start);
 - **after the load**, against the real budget, unchanged from before.
 
 The bound can only over-state the budget, so the early gate never refuses a
@@ -1313,13 +1313,13 @@ records why in `calibration`.
 
 Measured 2026-09-05, re-run against the final code (the first measurements
 were taken against a gate that rebuilt itself every request, so they did not
-describe what ships): on MiniMax-M2.7 with thinking suppressed the gate
+describe what ships): on a streamed MoE with thinking suppressed the gate
 self-admits — no measurement hatch — on a real measured union of 12.45 GB
 against a 14.37 GB budget, sees 1.00 acceptance against a 0.61 break-even,
 and keeps a **1.307×** win (1.7795 → 2.3253 tok/s), ids byte-identical to
 plain decode.
 
-On Qwen3-235B, whose answers open with prose, the same shape of
+On a second streamed MoE, whose answers open with prose, the same shape of
 configuration measures **0.836×** (16 % slower) with no gate at all. With
 the gate it correctly detects the low acceptance — 0.351 against a 0.528
 break-even, derived from that run's own routing — and latches off. **That
@@ -1337,7 +1337,7 @@ above were free for that reason). The whole exploration is worth
     (drafted tokens) x (break-even acceptance - measured acceptance)
 
 token-equivalents of decode, at most `48 x break-even` when nothing is accepted:
-**25.3 tokens on Qwen3-235B, 29.3 on MiniMax-M2.7**. Both numbers come from the
+**25.3 tokens on a second streamed MoE, 29.3 on a streamed MoE**. Both numbers come from the
 model's own routing — there is no per-model constant behind them — and both are
 already in the `calibration` object below, so you can compute your own load's
 figure from what the server reports.
@@ -1361,7 +1361,7 @@ wrong way round.
 ```python
 # vaayu/server/config_local.py
 USE_PROMPT_LOOKUP = True     # zero VRAM; the runtime gate decides whether it runs
-DRAFT_TOKENS      = 3        # measured best on MiniMax-M2.7
+DRAFT_TOKENS      = 3        # measured best on a streamed MoE
 ```
 
 Nothing else. `ENABLE_THINKING` already defaults to `False`, and that default is
@@ -1375,7 +1375,7 @@ Three conditions have to hold together, and they are not independent:
 
 | condition | why | if it does not hold |
 |---|---|---|
-| MiniMax-M2.7, not Qwen3-235B | Qwen opens its answers with prose | the gate latches off, once, after paying ≤25 token-equivalents of decode (6.8 % of a 128-token run; under 1 % of a ~900-token process) |
+| a streamed MoE, not a second streamed MoE | the second streamed MoE opens its answers with prose | the gate latches off, once, after paying ≤25 token-equivalents of decode (6.8 % of a 128-token run; under 1 % of a ~900-token process) |
 | thinking suppressed | the copy phase never starts inside a think block | same — the gate latches off |
 | copy-heavy work (re-emitting a file with an edit) | PLD drafts from n-grams already in the context | no matches, no speedup, near-zero overhead |
 
@@ -1422,7 +1422,7 @@ has one row per request including the refusals, no absolute path leaked into
 either file, and that the token summary's `gb_tok=` figures are consistent with
 what the run's own `[Vaayu-Pin]` output says it did -- nonzero if some layers
 stream, zero if every transformer layer was VRAM-pinned (a checkpoint small
-enough to fully pin, e.g. Llama-3.2-1B on a 16 GB box, legitimately reads
+enough to fully pin, e.g. a small dense model on a 16 GB box, legitimately reads
 nothing from NVMe per token; that is not a bug). It does **not** run a
 teacher-forced perplexity check -- see `todo.md`'s on-device gates section for
 that gate's status. See `todo.md`'s on-device gates section for the full

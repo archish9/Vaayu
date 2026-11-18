@@ -8,14 +8,14 @@ when only 2 of N are ever used per token.
 
 ## 1. Problem Statement
 
-For a MoE model like Kimi-K2.6 (256 experts, top-2) or Mixtral 8x7B (8 experts, top-2),
+For a MoE model like a large MoE (256 experts, top-2) or a small MoE (8 experts, top-2),
 each layer shard on disk contains ALL expert weights. Vaayu's base streaming engine reads
 the entire shard for every token, even though 99.2% of the data is unused.
 
 | Model | Experts | top-k | Shard size | Useful bytes | Waste |
 |-------|---------|-------|------------|--------------|-------|
-| Mixtral 8x7B | 8 | 2 | ~1.3 GB | ~325 MB | 75% |
-| Kimi-K2.6 | 256 | 2 | ~9.7 GB | ~77 MB | 99.2% |
+| a small MoE | 8 | 2 | ~1.3 GB | ~325 MB | 75% |
+| a large MoE | 256 | 2 | ~9.7 GB | ~77 MB | 99.2% |
 
 **Latency math at 6.5 GB/s NVMe:**
 - Without expert streaming: 594 GB ÷ 6.5 GB/s = **91.3 s/token**
@@ -64,7 +64,7 @@ This avoids disk format changes and follows Vaayu's layered design principle.
 
 Generic detection in `detect_moe_blocks()` finds any module containing both a gate Linear and an expert ModuleList — regardless of the MoE model architecture.
 
-This covers Mixtral (`block_sparse_moe`), DeepSeek (`mlp`), Kimi, Qwen MoE,
+This covers the known fused and module-list MoE families (probed from the module tree, not matched by name),
 and any architecture following the `.experts.N.` naming convention.
 
 ---
@@ -152,7 +152,7 @@ def _inject_expert_weights(expert_mod, raw, expert_idx, layer_name, device, dtyp
 Some checkpoints do not store one tensor per expert. They store **one tensor per projection
 per layer**, with the expert count as the leading axis (`...mlp.experts.gate_up_proj_blocks`
 of shape `[num_experts, …]`), and their experts module is handed to a grouped-GEMM kernel
-that does the routing **inside** the kernel — `gpt-oss-20b` (MXFP4) is the example on this
+that does the routing **inside** the kernel — A windowed-attention MoE (MXFP4) is the example on this
 box. The kernel is handed the whole tensor — every expert's rows — whether one token routed
 to an expert or five hundred did, so the module cannot be given one expert at a time. It only
 READS the routed experts' rows, though, so where Vaayu can prove that (routed delivery, below)
@@ -189,9 +189,9 @@ you got:
 - `WARNING: routed fused-3D delivery OFF for … — <reason>` — the proof failed or could not run
   (for example an experts call that carries no per-expert histogram). The model
   keeps whole-layer delivery: correct, and slow — every token moves every expert (10.17 GB per
-  token on gpt-oss-20b).
+  token on a windowed-attention MoE).
 
-On gpt-oss-20b routed delivery routes top_k × layers = 96 experts (1.27 GB) per token instead of
+On a windowed-attention MoE routed delivery routes top_k × layers = 96 experts (1.27 GB) per token instead of
 10.17 GB, and after warm-up all of its experts sit in the RAM cache, so decode no longer waits on
 the disk. The routed experts that are already in the VRAM expert cache are not uploaded again:
 about 58 % of them at 8k context (53 % at 30.7k) on this model when its cache holds the about 184 of
@@ -205,7 +205,7 @@ Two log lines belong to this path. `Expert VRAM cache budget A -> B GB (~N exper
 fused-3D buffers (… B) were allocated from it after it was sized` — the kernel buffer's bytes are
 taken out of the cache's budget. And, when a request arrives: `admission: evicted X GiB of the expert VRAM
 tier to admit N tokens … and capped its budget A -> B GB` — a full cache had left less than the
-context reserve free, so part of it was given up for the request and stays given up. On gpt-oss-20b a
+context reserve free, so part of it was given up for the request and stays given up. On a windowed-attention MoE a
 single request is admitted by the elastic tier instead, and the line is `elastic tier: granted N of M
 tokens; tier budget A -> B GB` — a cache that has to give bytes back is emptied (a partial eviction
 would not return them to the driver), and its budget is measured again at every request.
@@ -232,7 +232,7 @@ bytes (the same entries the VRAM expert cache holds), so nothing extra is stored
   `WARNING`.
 - **Numerics:** every intermediate is rounded where the per-expert path rounds; outputs
   differ from it only in the last bit of rare elements (measured 99.87 % identical on
-  Qwen3-Next). Expert contributions are summed in expert-id order either way, so decoding
+  a hybrid (linear-attention) MoE). Expert contributions are summed in expert-id order either way, so decoding
   stays deterministic regardless of which experts were cached.
 - There is no setting for it: it is on wherever it passes its check.
 
@@ -242,7 +242,7 @@ three small matrix products and a scatter per routed expert. The call's (token, 
 pairs are grouped by expert into 16-row blocks; two kernels compute the gated MLP for
 every block straight from the packed bytes, and a third sums each token's experts in
 expert-id order.
-Measured on Qwen3-Next-80B int4 (2026-10-03, one stream): time to first token on a cold
+Measured on a hybrid (linear-attention) MoE (2026-10-03, one stream): time to first token on a cold
 8k-token prompt 27.65 s → 12.42 s, on a cold 2k-token prompt 10.29 s → 6.97 s, and on a
 prefix-reuse turn at 8k 2.99 s → 2.49 s; on a prefix-reuse turn most of the remaining time is reading experts
 off disk.
@@ -263,7 +263,7 @@ off disk.
   stray unquantized expert, mixed formats) runs the per-expert arithmetic for that call.
 - **Numerics:** every intermediate is rounded where the per-expert path rounds. The
   results still differ from it, because the per-expert path's half-precision matrix
-  product is not correctly rounded at every size (at Qwen3-Next's shape, 2 to 32 rows give
+  product is not correctly rounded at every size (at a hybrid (linear-attention) MoE's shape, 2 to 32 rows give
   about 58 % correctly rounded outputs); the kernels measure 99.7–99.9 % and are the more
   accurate side. A token's expert output no longer depends on which other tokens share
   its call, and expert contributions are summed in expert-id order, so prefill stays

@@ -174,7 +174,7 @@ With 28 layers pinned, each token saves 28 × ~380 MB = ~10.6 GB of NVMe reads, 
 Every weight a decode token needs sits in exactly one tier, checked in this order:
 
 1. **VRAM-pinned** — the planner's phase 1 (norm, `lm_head`, and the embedding when it fits
-   the budget: every on-device target except gpt-oss) and phase 2 (transformer layers, or
+   the budget: every on-device target except the windowed-attention MoE) and phase 2 (transformer layers, or
    their non-expert tensors on a MoE model), within the pinning budget.
 2. **CPU-resident embedding** — only when the VRAM pinning budget cannot hold the embedding
    (it would otherwise be re-read and re-uploaded whole every token) the table is held in
@@ -187,8 +187,8 @@ Every weight a decode token needs sits in exactly one tier, checked in this orde
    attention weights) is copied once, at load, into pinned host memory, entry by entry, as
    long as it fits in RAM **the expert arena cannot use** (the slabs the arena's
    model-size cap refused). That RAM also bounds the cross-turn prefix-cache pool, but only
-   while non-expert weights still stream: on gpt-oss-20b before S14 3c the tier held
-   2.95 GB and the pool was 8.06 GB. Since 3c gpt-oss streams nothing (`lm_head` and all
+   while non-expert weights still stream: on a windowed-attention MoE before S14 3c the tier held
+   2.95 GB and the pool was 8.06 GB. Since 3c the windowed-attention MoE streams nothing (`lm_head` and all
    attention layers sit in VRAM), the tier is empty and the pool keeps its full
    12.81 GB (measured). Where the arena needs all the RAM the tier is empty and the
    load prints a WARNING naming the GB per token that still stream.
@@ -197,9 +197,9 @@ Every weight a decode token needs sits in exactly one tier, checked in this orde
 Eager attention's VRAM cost is measured at load, on the model's own attention module
 (`vaayu/eager_attn_cost.py`), rather than charged at sdpa's fitted 10.9 bytes per score
 element. Eager buffers live in each model's own code and differ: 6.0 B/element on
-gpt-oss-20b, 10.0 on the Llamas, each plus the GQA `repeat_kv` copies per key. And eager
+A windowed-attention MoE, 10.0 on the dense models, each plus the GQA `repeat_kv` copies per key. And eager
 builds only the `[new tokens, past + new]` block of its causal mask, never the square.
-On gpt-oss-20b this frees enough of the reserve (13.86 -> 9.49 GiB) for the
+On a windowed-attention MoE this frees enough of the reserve (13.86 -> 9.49 GiB) for the
 embedding, `lm_head` and all 24 attention layers to stay in VRAM. Decode goes from
 198.5 to 93.0 ms/token at 8k context, bit-identical, and tiers 2 and 3
 are then idle on that model. Load lines to look for:
@@ -212,12 +212,12 @@ the pin budget an MoE load's non-expert weights need: `_protected_pin_bytes()` (
 layers plus, unless `max_pinned_layers` is 0, every layer's non-expert bytes, read from
 the safetensors headers) is subtracted from the ceiling (free VRAM less one expert and one layer), and a requested
 `max_seq_len` caps the parity the floor buys. A model can also supply its own costs.
-DeepSeek-V4 derives its attention charge from config (1.00 B per score element, the DSA
+A fixed-cache streamed MoE derives its attention charge from config (1.00 B per score element, the DSA
 indexer scoring compressed keys, instead of 10.9) and measures its own KV cache on the
-meta device (6.7 KiB/token instead of 86). Measured on DeepSeek-V4, server config: reserve
+meta device (6.7 KiB/token instead of 86). Measured on a fixed-cache streamed MoE, server config: reserve
 8.03 -> 3.50 GiB, pinning budget 3.30 -> 7.80 GiB, `max_seq_len` 16,766 -> 61,439,
 non-expert-pinned layers 8 -> 39, decode 1.6476 -> 0.5604 s/token (0.607 -> 1.784 tok/s,
-greedy ids identical). Qwen3-Next, MiniMax and gpt-oss plan identically before and after.
+greedy ids identical). A hybrid (linear-attention) MoE, a streamed MoE and the windowed-attention MoE plan identically before and after.
 
 ## 5. Speculative Decoding
 
@@ -273,8 +273,8 @@ Vaayu acts as the **Verifier**. A resident drafter generates K candidates; the v
 | Streaming buffer | ~0.5 GB |
 | **Free for drafter** | **~2.1 GB** |
 | EAGLE-3 head | 0.1–0.2 GB ✅ |
-| Qwen2.5-0.5B | ~0.3 GB ✅ |
-| Qwen2.5-1.5B | ~1.0 GB ✅ |
+| a ~0.5B drafter | ~0.3 GB ✅ |
+| a ~1.5B drafter | ~1.0 GB ✅ |
 | 3B fp16 | ~6 GB ❌ |
 
 ### Tuning
@@ -288,14 +288,14 @@ Vaayu acts as the **Verifier**. A resident drafter generates K candidates; the v
 ## 6. MoE Expert-Aware Streaming
 
 For Mixture-of-Experts (MoE) models, default layer-streaming loads all expert weights
-per token (99.2% wasted for Kimi-K2.6). Expert-aware streaming reduces this to only
+per token (99.2% wasted for a large MoE). Expert-aware streaming reduces this to only
 the top-k active experts per token via three layers of optimization:
 
 1. **ExpertRAMCache** (`vaayu/persist/expert_cache.py`) — LRU RAM cache keyed by `(layer_idx, expert_idx)`. 70–90% of tokens reuse the same experts.
 2. **Speculative prefetch** — After each MoE layer, current token's routing history predicts next layer's experts. Prefetch fires in background, overlapping with attention compute.
 3. **Sparse io_uring** (`load_expert_sparse` in safetensor_model_persister.py) — On cache miss, precise byte-range read for only the active expert bytes.
 
-Implementation uses monkey-patch (`vaayu/moe_patch.py`): replace each MoE block's `forward()` at init time. Generic detection via `detect_moe_blocks()` covers Mixtral, DeepSeek, Kimi, Qwen MoE. Dense models unaffected (`is_moe=False`).
+Implementation uses monkey-patch (`vaayu/moe_patch.py`): replace each MoE block's `forward()` at init time. Generic detection via `detect_moe_blocks()` covers the common MoE families generically (probed from the module tree, not matched by name). Dense models unaffected (`is_moe=False`).
 
 See `documentation/moe_expert_aware_streaming.md` for full technical reference.
 
@@ -315,7 +315,7 @@ therefore replays each resident decoder layer's static work as CUDA graphs
 - **When.** Only on eligible forwards: one token, batch 1, CUDA, no speculative decoding,
   no `profiling_mode`, no `output_hidden_states`. The KV cache must also be one of Vaayu's
   own seamed cache classes (`FP8DynamicCache` and its subclasses); a model that brings its
-  own cache class — DeepSeek-V4's `DeepseekV4Cache` today — is never eligible, and no
+  own cache class — A fixed-cache streamed MoE's `DeepseekV4Cache` today — is never eligible, and no
   decode-graph line appears in its log at all. The same is true with the prefix cache OFF
   (`enable_prefix_cache=False`, the library default): `generate()` falls through to
   transformers' own generation, which builds its own plain `DynamicCache` rather than a
@@ -334,7 +334,7 @@ therefore replays each resident decoder layer's static work as CUDA graphs
   layer only ever serves a graph result outright once both checks pass. A layer is refused
   for the process — stock forward from then on — the first time any of these happens: its
   capture raises (including attention that never reaches transformers' attention-function
-  registry, e.g. `attn_implementation="eager"` as gpt-oss uses — `cache.update` runs but
+  registry, e.g. `attn_implementation="eager"` as the windowed-attention MoE uses — `cache.update` runs but
   nothing closes the attention core, so every layer of such a model is refused); its
   checked tokens disagree bitwise with the stock forward; it needs a third capture within
   one request (an input is changing shape every token); or a forward kwarg hides a tensor
@@ -354,7 +354,7 @@ therefore replays each resident decoder layer's static work as CUDA graphs
 
 ## 8. Windowed attention layers' KV (S35)
 
-A layer that attends only its last W positions (gpt-oss-20b: 12 of 24 layers, W = 128)
+A layer that attends only its last W positions (a windowed-attention MoE: 12 of 24 layers, W = 128)
 needs only the last W−1 of them for the next token. When the load's KV cache mode is
 `bf16` (the default) or `fp8`, Vaayu stores such layers in `WindowedKVCache`
 (`vaayu/windowed_kv.py`): a VRAM ring of `(W−1) + 2 × prefill_chunk_size` positions, with

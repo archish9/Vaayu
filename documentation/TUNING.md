@@ -26,11 +26,11 @@ which overstates the budget several-fold and under-recommends compression.
 > The server's defaults differ from the library's on purpose: `max_pinned_layers` is `-1`
 > (not `0`) and `enable_prefix_cache` is on (not off), because a server holds one model for
 > its whole life and should fill the box. Getting the first one wrong costs **13x** on
-> Llama-3.2-1B, **2.0x** on MiniMax-M2.7 and **1.27x** on Llama-3.3-70B, measured — the gain
+> A small dense model, **2.0x** on a streamed MoE and **1.27x** on a large (70B) dense model, measured — the gain
 > scales with how much of the model fits in the pinning budget.
 >
 > The dense **RAM** layer cache is likewise derived from TOTAL RAM rather than momentary
-> free RAM, so a server's throughput is reproducible: the old form swung Llama-3.3-70B
+> free RAM, so a server's throughput is reproducible: the old form swung a large (70B) dense model
 > between 0.167 and 0.232 tok/s (**38 %**) purely on what else was running at boot.
 > Override with `RAM_CACHE_BUDGET_GB`. MoE is unaffected — its experts live in the
 > **pinned** expert RAM cache, a different and scarcer resource.
@@ -65,7 +65,7 @@ sessions, and **332 s → 9.8 s** at 8k.
 Those two figures are the *over-budget* case — sessions that would otherwise be
 recomputed from scratch. An ordinary single-session second turn on a **streamed**
 MoE gains less, because the reused prefill still routes ~every expert per layer:
-measured on Qwen3-235B, a full hit is worth **−6.6 % of TTFT at 2.7k tokens** and
+measured on a second streamed MoE, a full hit is worth **−6.6 % of TTFT at 2.7k tokens** and
 **−53 % at 7.4k**. The benefit grows with context; it is never negative. Keep it on.
 
 It does nothing if your requests are unrelated to each other; the cache cannot hit
@@ -78,7 +78,7 @@ longer fit the RAM pool.
 
 Pooled KV is TurboQuant-packed on the way into the pool and rebuilt on the way
 out — once per turn, never per decoded token. Decode throughput is unaffected
-(measured Qwen 0.86 → 0.86, MiniMax 1.53 → 1.56 tok/s).
+(measured the second streamed MoE 0.86 → 0.86, a streamed MoE 1.53 → 1.56 tok/s).
 
 **When it pays.** Only when **≥2 sessions** together exceed the pool budget:
 
@@ -95,7 +95,7 @@ a fraction. Measured: bf16 scored 0/4 and 0/3 hits in the two over-budget tests,
 never a partial score. This is why the crossover matters more than it looks.
 
 **Use 9, not 8.** At 8 bits both models fail the quality bar against real decode queries
-(Qwen 0.0934, MiniMax 0.0546, against 0.05). Anything below 9 prints a warning. 9 is also
+(the second streamed MoE 0.0934, a streamed MoE 0.0546, against 0.05). Anything below 9 prints a warning. 9 is also
 the highest the quantizer goes — `bits_total=10` does not exist — so there is no setting
 above this one.
 
@@ -103,7 +103,7 @@ above this one.
 queries: the persisted KV format stores keys and values but not queries, so the bar was
 scored with a K-row query *proxy*. A 2026-09-06 re-run with **real** post-RoPE decode
 queries at a ~4.16k-token context found that proxy is 2.5–13.7× optimistic on
-Qwen3-235B, where uniform 9-bit packing **failed**. It is not a long-context effect: it
+A second streamed MoE, where uniform 9-bit packing **failed**. It is not a long-context effect: it
 failed at every context length from 256 to 4096.
 
 The engine therefore does not pack uniformly. It keeps each layer's **8 highest-variance
@@ -112,8 +112,8 @@ outlier split, on by default whenever `prefix_compress` is set:
 
 | model | forward | uniform 9-bit | **what ships: 9 bits + 8 exact channels** |
 |---|---|---|---|
-| Qwen3-235B | fused EXL3 | 0.0683 — **over the 0.05 bar** | **0.0281 — under it** |
-| MiniMax-M2.7 | module-list | 0.0428 — under | **0.0263 — under** |
+| a second streamed MoE | fused EXL3 | 0.0683 — **over the 0.05 bar** | **0.0281 — under it** |
+| a streamed MoE | module-list | 0.0428 — under | **0.0263 — under** |
 | bytes/element | | 1.156 (0.578×) | **1.211 (0.605×)** |
 
 That costs about 11 % of the saving and is what makes `prefix_compress=9` usable on a
@@ -136,7 +136,7 @@ Full measurements are summarised above; the raw arms live in this repo's working
 
 **Default:** `False`. Writes the KV to `~/.cache/vaayu/kv` so a session survives a
 process restart. Measured **TTFT 27.6 s → 3.0 s** on a restored session. Costs disk
-(~130 MB per 700-token Qwen session) and a little CPU. `kv_persist_sync=False`
+(~130 MB per 700-token the second streamed MoE session) and a little CPU. `kv_persist_sync=False`
 (the default) is the faster, production-shaped choice.
 
 Not compatible with `kv_cache_mode="turboquant"` — the writer refuses that layout
@@ -156,7 +156,7 @@ at 8k tokens it is ~0.24 GB against the 1.61 GB/session the KV term alone reserv
 two no longer agree exactly.)
 
 So lowering it hands RAM to the expert cache, which is the decode bottleneck on a streamed
-MoE. On Qwen3-235B the default reservation is **4.74 GB** of a ~20.7 GB budget; at
+MoE. On a second streamed MoE the default reservation is **4.74 GB** of a ~20.7 GB budget; at
 `prefix_sessions=1` that falls to 1.58 GB and the expert cache grows 12.26 → 15.42 GB.
 
 **It reserves nothing on a model whose prefix cache cannot run.** A model loaded with
@@ -164,13 +164,13 @@ MoE. On Qwen3-235B the default reservation is **4.74 GB** of a ~20.7 GB budget; 
 then gets that RAM, and `prefix_sessions` has no effect.
 
 **A hybrid model pays the reservation again since 42-B.** Until then a hybrid with recurrent
-(linear-attention) layers, such as Qwen3-Next, was refused at load and reserved nothing: on
+(linear-attention) layers, such as a hybrid (linear-attention) MoE, was refused at load and reserved nothing: on
 that model 4.83 GB of expert cache had been held for a pool that could not exist, and
 returning it measured **+17.2 % decode tok/s** (2026-09-19). 42-B made cross-turn reuse work
 on hybrids, so the reservation is live on them once more, at that same 4.83 GB — budget for
 it on a hybrid exactly as you would on any other model.
 
-**Measured on Qwen3-235B, through the server, prefix cache on** (`prefix_sessions=1` vs the
+**Measured on a second streamed MoE, through the server, prefix cache on** (`prefix_sessions=1` vs the
 default 3):
 
 | workload | effect of `prefix_sessions=1` |
@@ -200,7 +200,7 @@ exactly the runs where reuse has collapsed. Read the `[Vaayu-Prefix] HIT … mat
 line instead: what matters is X, not that it says HIT. `prefix_match_tokens`, beside
 `prompt_tokens` in `requests.jsonl`, shows the same X.
 
-**Hybrid-attention models (e.g. Qwen3-Next).** Since 42-B these reuse prefixes
+**Hybrid-attention models (e.g. a hybrid (linear-attention) MoE).** Since 42-B these reuse prefixes
 too, with one restriction that follows from how they work: their
 linear-attention layers keep a fixed-size summary of everything they have seen
 rather than a per-token history, so an entry can only be resumed at exactly the
@@ -226,7 +226,7 @@ attention implementation:
   on-device MoE models the reserve already sits **on it** at the derived context. Requesting
   4096 returns **zero** VRAM and does not lift the `Restricting VRAM cache to the first
   65/94 MoE layers` warning (row 31, 2026-09-12; that was measured on flash loads).
-- **Score-materializing loads (sdpa, and eager: gpt-oss and DeepSeek-V4 on the server
+- **Score-materializing loads (sdpa, and eager: the windowed-attention MoE and a fixed-cache streamed MoE on the server
   default; dense included):** the floor is the reserve that gives flash-parity context. A
   requested `max_seq_len` below flash parity caps that parity, so the floor falls and the
   difference goes back to pinning and the expert cache (since S15 L-b, 2026-10-01). Above
@@ -234,9 +234,9 @@ attention implementation:
   and its larger reserve comes out of pinning and the expert cache. The floor is also never
   allowed to take the pin budget an MoE load's non-expert weights need (`protected pin demand`
   in the load log).
-  gpt-oss is the eager example. Through 2026-10-10 its floor was priced at the full-length KV
+  The windowed-attention MoE is the eager example. Through 2026-10-10 its floor was priced at the full-length KV
   cost of its cache, which held `None` at 33,213 tokens with a large static expert VRAM tier
-  (184 experts, 8k decode 60.1 ms/token). **Since S50 (2026-10-13) an elastic gpt-oss load
+  (184 experts, 8k decode 60.1 ms/token). **Since S50 (2026-10-13) an elastic the windowed-attention MoE load
   derives context instead of protecting that static tier:** the full-length-parity pricing is
   dropped, so `None` derives **~39,420 tokens** (+19 %) with a small static base (~27 experts)
   and the elastic tier lends the rest up for shorter requests — 8k decode **~45 ms/token**,
@@ -247,16 +247,16 @@ attention implementation:
   longer `MAX_SEQ_LEN` (up to `S_max`) is still allowed and costs the static base further. A
   MoE load whose
   floor is already held at the 3.50 GiB base by that protection gets **nothing** back from
-  a shorter context: DeepSeek-V4 today (its 8.24 GiB protected demand exceeds the 7.82 GiB
+  a shorter context: a fixed-cache streamed MoE today (its 8.24 GiB protected demand exceeds the 7.82 GiB
   above the base floor; requests of None / 32,768 / 16,384 / 4,096 all plan floor 3.50,
   reserve 3.50, pin 7.80 GiB).
 
 **The expert VRAM tier follows the running request (since 2026-10-10).** On a load whose VRAM
-reserve is larger than the 3.5 GiB base floor — gpt-oss-20b today, because eager attention needs
+reserve is larger than the 3.5 GiB base floor — A windowed-attention MoE today, because eager attention needs
 a large prefill buffer at the full window — that reserve is sized for a request at `max_seq_len`,
 and a shorter request cannot use most of it. The engine lends the unused part to the expert VRAM
 tier while that request runs, and takes it back before a longer one can need it. Measured on
-gpt-oss-20b (decode, median ms/token, static tier → sized to the request, `max_tokens` omitted on
+A windowed-attention MoE (decode, median ms/token, static tier → sized to the request, `max_tokens` omitted on
 both): **56.7 → 39.6 at 2k, 58.2 → 44.4 at 8k, 71.0 → 55.0 at 16k** (with `max_tokens=64` on both:
 56.0 → 39.4, 56.9 → 43.9, 70.3 → 54.2). At 30.7k there is nothing left to lend when `max_tokens` is
 omitted, and the request gets what the static tier gives it (86.8 against 86.5); with
@@ -277,13 +277,13 @@ There is no setting for it. It works with `max_tokens` set or omitted: with it o
 request is granted context in steps of four prefill chunks (2,048 tokens on the default chunk)
 and the grant is extended before the forward that would pass it. `MAX_SEQ_LEN` caps the context
 exactly as before. A load whose reserve already sits on the base floor has nothing to lend and
-nothing changes for it — on this box that is Qwen3-Next, MiniMax-M2.7 and DeepSeek-V4 at their
+nothing changes for it — on this box that is a hybrid (linear-attention) MoE, a streamed MoE and a fixed-cache streamed MoE at their
 derived context (their load logs show `reserve=3.50 GiB`), and the dense models, which have no
 expert tier. Raising `MAX_SEQ_LEN` on those three does not turn it on either. The tier stays static on
-a load with decode graphs (MiniMax-M2.7 and DeepSeek-V4 run with them), with speculative decoding (a
-drafter or prompt lookup), or with a KV cache allocated for `max_seq_len` up front (DeepSeek-V4's), and
+a load with decode graphs (a streamed MoE and a fixed-cache streamed MoE run with them), with speculative decoding (a
+drafter or prompt lookup), or with a KV cache allocated for `max_seq_len` up front (a fixed-cache streamed MoE's), and
 the load log then says `elastic expert tier OFF:` and why; a load whose reserve sits only a little
-above the floor (Qwen3-Next at `MAX_SEQ_LEN=131072`: 0.37 GiB) has too little to lend and prints
+above the floor (a hybrid (linear-attention) MoE at `MAX_SEQ_LEN=131072`: 0.37 GiB) has too little to lend and prints
 nothing.
 
 What it costs: a partly evicted tier does not hand its VRAM back to the driver (PyTorch returns
@@ -341,15 +341,15 @@ Recorded so nobody spends an afternoon on them:
 - **`use_torch_compile`** — refused at load with a warning, on every device. On
   CUDA its `reduce-overhead` cudagraphs crashed the first generation ("accessing
   tensor output of CUDAGraphs that has been overwritten by a subsequent run") on
-  Qwen3-Next and on Llama-3.2-1B: the engine replays one compiled callable per
+  a hybrid (linear-attention) MoE and on a small dense model: the engine replays one compiled callable per
   layer with no step boundary. Without cudagraphs it ran, but 24–35 % slower on
-  Qwen3-Next.
+  a hybrid (linear-attention) MoE.
 - **`VAAYU_LOOKAHEAD`** — deliberately disabled; raises on use.
 
 ## 5b. `keep_awake` / `pin_engine_threads` — leave both on
 
 Streamed decode sleeps on disk reads — roughly 800 read completions per token on
-Qwen3-235B — and every one of them wakes a CPU out of a deep idle state. On this
+A second streamed MoE — and every one of them wakes a CPU out of a deep idle state. On this
 box that state is `C2_ACPI`, whose declared exit latency is **127 µs**, and decode
 leaves the CPU only ~7.5 % busy, so the package keeps falling back into it.
 
@@ -364,12 +364,12 @@ greedy, identical outputs in every arm:
 
 | model | off | on | decode |
 |---|---|---|---|
-| Qwen3-235B (fused-EXL3 MoE) | 0.9229 tok/s | **1.1363** | **+23.1 %** |
-| MiniMax-M2.7 (module-list MoE) | 1.7405 | 1.7625 | +1.3 % |
-| Llama-3.3-70B (streamed dense) | 0.2745 | 0.2824 | +2.9 % |
-| Llama-3.2-1B (fully VRAM-pinned) | 111.7 | 111.2 | none — it reads no disk |
+| a second streamed MoE (fused-EXL3 MoE) | 0.9229 tok/s | **1.1363** | **+23.1 %** |
+| a streamed MoE (module-list MoE) | 1.7405 | 1.7625 | +1.3 % |
+| a large (70B) dense model (streamed dense) | 0.2745 | 0.2824 | +2.9 % |
+| a small dense model (fully VRAM-pinned) | 111.7 | 111.2 | none — it reads no disk |
 
-Directly visible in the kernel's own counters over one Qwen request: C2 residency
+Directly visible in the kernel's own counters over one the second streamed MoE request: C2 residency
 1.142 s → 0.492 s, wakes 1.74 M → 1.22 M.
 
 **Turn `keep_awake` off only to save power**, and expect to pay up to ~23 % of
@@ -379,7 +379,7 @@ so the win is the package leaving deep idle, not the individual core.
 
 **On a CPU with no P/E split Vaayu declines and prints a warning** rather than
 guessing: every core a spinner could take there is an SMT sibling of one the
-engine wants, and that arrangement measured **27 % slower** on MiniMax.
+engine wants, and that arrangement measured **27 % slower** on a streamed MoE.
 
 ### Root-only alternatives (they cover the whole machine, not just Vaayu)
 
@@ -400,21 +400,21 @@ same idea: it is active only while a generation is running.
 MoE models route each token to several experts. Routing to fewer of them at decode is a large speed
 lever — and the only **lossy** knob Vaayu has: output changes, greedy ids diverge. How much quality it
 costs is a property of the model, and it is **not predictable** from expert count or top-k (a 10 % cut
-cost Qwen3-Next 1.47 % perplexity; a 12.5 % cut cost MiniMax-M2.7 6.34 %). So do not guess a number.
+cost a hybrid (linear-attention) MoE 1.47 % perplexity; a 12.5 % cut cost a streamed MoE 6.34 %). So do not guess a number.
 
 **Set `DECODE_TOP_K = "auto"`.** On the first load of a checkpoint Vaayu measures it on a built-in code text and a prose passage: it tries fewer experts one step at a time and keeps the fastest setting whose perplexity cost stays within `DECODE_TOP_K_BUDGET` (default `0.035` = 3.5 %) on **both** texts. If no fixed expert count fits, it tries a per-token cutoff instead, which drops an expert only on tokens where it carries little weight. The result is cached next to the checkpoint's split files, so every later load applies it instantly.
 
 | model | pick at 3.5 % | decode tok/s | perplexity cost (worse of code and prose) | one-time first load |
 |---|---|---|---|---|
-| Qwen3-Next-80B int4 | fixed k = 8 of 10 | **+23.1 %** | +3.43 % | ≈ 6.5 min |
-| MiniMax-M2.7 | cutoff p = 0.90 | **+8.4 %** | +2.25 % | ≈ 26 min |
-| Qwen3-235B | fixed k = 7 of 8 | **+11.2 %** (one sample) | +3.40 % | ≈ 21 min |
+| a hybrid (linear-attention) MoE | fixed k = 8 of 10 | **+23.1 %** | +3.43 % | ≈ 6.5 min |
+| a streamed MoE | cutoff p = 0.90 | **+8.4 %** | +2.25 % | ≈ 26 min |
+| a second streamed MoE | fixed k = 7 of 8 | **+11.2 %** (one sample) | +3.40 % | ≈ 21 min |
 
 These picks were measured by `"auto"` itself on 2026-09-14; your checkpoint's pick is the one its load log prints. **While the first load measures, the server is not reachable** — like a long load.
 Watch `server.log` for one `DECODE_TOP_K=auto:` line per trial and a final WARNING naming the pick and its
 cost (or a line saying no setting fits the budget, when none does); afterwards `/health` → `decode_top_k` reports it.
 
-- **Tighter quality needs:** lower `DECODE_TOP_K_BUDGET` (at 0.02 Qwen3-Next picks k = 9, +17.0 % for
+- **Tighter quality needs:** lower `DECODE_TOP_K_BUDGET` (at 0.02 a hybrid (linear-attention) MoE picks k = 9, +17.0 % for
   +1.47 %). A changed budget re-measures on the next load.
 - **Output must match the model exactly** (evaluation, reproducibility): leave `DECODE_TOP_K = None`.
 - **The budget is a perplexity budget.** Perplexity moves long before text visibly degrades; a short
@@ -446,7 +446,7 @@ KV bytes per token = layers × 2 × kv_heads × head_dim × bytes_per_element
 sessions that fit = pool_budget / (tokens_per_session × bytes_per_token)
 ```
 
-Worked example, MiniMax (62 layers, 8 KV heads, head_dim 128) with a 4.2 GB pool:
+Worked example, a streamed MoE (62 layers, 8 KV heads, head_dim 128) with a 4.2 GB pool:
 
 | | bf16 | 9-bit |
 |---|---|---|
@@ -489,7 +489,7 @@ installed: model device … is not the current CUDA device …` (a device mismat
 since the M4 fix, `decode graphs not installed: <ExcType>: <message>; decode runs
 eagerly` (the runner's own construction — e.g. capturing its anchor graph — raised; the
 model load still succeeds). **No line at all is a third, silent outcome, not a bug**: a
-model whose KV cache is not one of Vaayu's own seamed cache classes — DeepSeek-V4's
+model whose KV cache is not one of Vaayu's own seamed cache classes — A fixed-cache streamed MoE's
 `DeepseekV4Cache` today — is never eligible for decode graphs in the first place, and
 nothing is logged either way. The same is true with the prefix cache OFF
 (`enable_prefix_cache=False`, the library default): `generate()` falls through to
@@ -503,8 +503,8 @@ Nothing to set. On a CUDA load the embedding table moves to host RAM only when t
 pinning budget cannot hold it, and then only the rows a forward needs are uploaded; on a MoE
 model, non-expert weights the VRAM budget cannot hold are kept in pinned host RAM that the
 expert arena cannot use. That RAM also bounds the cross-turn prefix-cache pool, but only
-while non-expert weights still stream (any load whose VRAM budget cannot hold them; gpt-oss-20b
-before S14 3c: pool 8.06 GB). Since 3c gpt-oss streams nothing, keeps the full pool
+while non-expert weights still stream (any load whose VRAM budget cannot hold them; a windowed-attention MoE
+before S14 3c: pool 8.06 GB). Since 3c the windowed-attention MoE streams nothing, keeps the full pool
 (12.81 GB measured vs 8.06 GB before). Both are bit-identical to the old path.
 
 What the load log tells you:
@@ -515,9 +515,9 @@ What the load log tells you:
   says `kernel table: measurement failed (...)`, the plan fell back to the conservative
   table value, and that load's context and pinning are what they were before the
   measurement existed; the reason is on the line. A model may charge its own derived cost
-  instead (DeepSeek-V4: `1.00 B/score-element + 0.0 KiB/key (DSA indexer)`, from its config).
+  instead (a fixed-cache streamed MoE: `1.00 B/score-element + 0.0 KiB/key (DSA indexer)`, from its config).
 - `[Vaayu-VRAM] KV cost: X KiB/token (bucketed|exact; source)` -- what the plan charges one
-  token of KV. The config figure, or a model's own measurement of its cache (DeepSeek-V4:
+  token of KV. The config figure, or a model's own measurement of its cache (a fixed-cache streamed MoE:
   6.7 KiB/token, exact, measured on the meta device).
 - `[Vaayu-VRAM] protected pin demand: X GiB (...)` -- the MoE non-expert weights the reserve
   floor may not take. It prints on flash MoE loads too, where the floor is the base floor
@@ -550,11 +550,11 @@ checkpoint the RAM layer cache (`RAM_CACHE_BUDGET_GB`; by default total RAM minu
 
 Why it matters: before 2026-10-04 the expert cache was not subtracted, so a MoE checkpoint a
 little over twice the free RAM was read buffered although the expert cache then left the
-page cache almost nothing. Measured on Qwen3-Next-80B (48 GB checkpoint, 27 GiB free, 16 GB
+page cache almost nothing. Measured on a hybrid (linear-attention) MoE (48 GB checkpoint, 27 GiB free, 16 GB
 VRAM): the page cache served 1-3 % of the bytes read, and a prefix-HIT agent turn took
 22.4 s against 17.9 s with O_DIRECT (-20 %; -17 % with the RAM budget held equal), same
 output tokens. The dense layer cache was not subtracted either until 2026-10-07: on
-Llama-3.3-70B (41 GB checkpoint, 27 GiB free) the rule said "50 % cacheable" and went
+A large (70B) dense model (41 GB checkpoint, 27 GiB free) the rule said "50 % cacheable" and went
 buffered, but the layer cache then took 16 GB and ~17 GB of layers streamed per token through
 what was left; the page cache served at most 0.6 % of the bytes read, and decode took 2.48
 s/token against 1.96 with O_DIRECT (-21 %, TTFT -21 %), same output tokens. If a load of a
