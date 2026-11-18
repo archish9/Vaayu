@@ -603,6 +603,12 @@ The server takes **no command-line arguments** — set `MODEL_PATH` in
 ./venv/bin/python -m vaayu.server
 ```
 
+> **Desktop Linux:** launching by hand in a terminal puts Vaayu in the GNOME session's
+> `user.slice`, which `systemd-oomd` SIGKILLs under sustained memory pressure (it takes the
+> whole terminal with it). Run it as a systemd service instead — same on-demand
+> `start`/`stop`, no boot-start — see
+> [documentation/remote-access.md](documentation/remote-access.md#recommended-run-vaayu-as-a-systemd-service).
+
 ```bash
 # streams by default (DEFAULT_STREAM = True) -- -N keeps curl from buffering it
 # session_id is REQUIRED: give each independent agent stream its own

@@ -35,6 +35,11 @@ shadows it — then:
 
 With `MODEL_PATH` empty the server exits and names the file to edit.
 
+On a **desktop Linux** box, do not leave this terminal launch running for real work:
+`systemd-oomd` watches the GNOME session's `user.slice` and SIGKILLs the whole terminal scope
+under sustained memory pressure. Run Vaayu as a systemd service (on-demand `start`/`stop`, no
+boot-start) — [remote-access.md § systemd service](remote-access.md#recommended-run-vaayu-as-a-systemd-service).
+
 The load is **not** instant — pinning, slab arena, NVMe warmup and expert-cache
 sizing all happen at boot. Expect seconds for a small dense checkpoint and minutes
 for a large MoE one. The server is ready when it prints:
