@@ -29,12 +29,12 @@ crowded GPU triggers, since a smaller budget pins fewer layers:
 
 | model class | nothing pinned | budget filled | penalty |
 |---|---|---|---|
-| small dense (1B) | 6.40 tok/s | **83.27 tok/s** | **13.0×** |
-| large MoE | 0.760 tok/s | **1.537 tok/s** | **2.02×** |
-| large dense (70B) | 0.131 tok/s | **0.167 tok/s** | **1.27×** |
+| a small dense model | 6.40 tok/s | **83.27 tok/s** | **13.0×** |
+| a streamed MoE | 0.760 tok/s | **1.537 tok/s** | **2.02×** |
+| a large (70B) dense model | 0.131 tok/s | **0.167 tok/s** | **1.27×** |
 
 A shared GPU lands you somewhere on that scale — the less VRAM free at load, the closer to
-the left column. (One observation, not yet an isolated A/B: the large MoE decoded at 0.631 tok/s
+the left column. (One observation, not yet an isolated A/B: the streamed MoE decoded at 0.631 tok/s
 on a box where 9.3 GiB was held by unrelated containers, against 1.537 tok/s on record.)
 
 **Before starting Vaayu:**
@@ -137,7 +137,7 @@ We have structured the entire architectural knowledge, installation guides, and 
 * [**📂 Quantization & Pluggable Strategies**](documentation/quantization_and_strategies.md): Explaining our decoupled `LoaderStrategy` pattern (Peeking safetensors headers to auto-detect strategies), compiling custom ExLlamaV3 4-bit CUDA kernels, managing heap memory safety, and executing `quantize.py`.
 * [**🔮 Speculative Decoding & MoE Roadmap**](documentation/speculative_decoding_and_moe.md): Our technical blueprint detailing drafting-verification loops, Mixture-of-Experts routing gates, and expert-aware byte-offset disk streaming.
 * [**🍎 Apple Silicon & The Unified Memory Paradigm**](documentation/mac_unified_memory_paradigm.md): Exploring UMA zero-copy superpowers (`gpu_load` drops to 0s), analyzing the 16 GB MacBook VM swap thrashing constraint, and outlining a Mac manual swap manager using Metal (MPS) and `F_NOCACHE` (via `fcntl`).
-* [**🌐 Running Vaayu as a Server**](documentation/server.md): The complete OpenAI-compatible server reference — every CLI flag and request field, curl examples for streaming and tool calling, the coding-agent integration checklist, the measured speed levers (layer pinning is worth 13x on a small dense model, 2.0x on a large MoE and 1.27x on a large dense model), and the troubleshooting table.
+* [**🌐 Running Vaayu as a Server**](documentation/server.md): The complete OpenAI-compatible server reference — every CLI flag and request field, curl examples for streaming and tool calling, the coding-agent integration checklist, the measured speed levers (layer pinning is worth 13x on a small dense model, 2.0x on a streamed MoE and 1.27x on a large (70B) dense model), and the troubleshooting table.
 * [**⚙️ Tuning Guide: what to set, and when**](documentation/TUNING.md): The decision guide for the caching knobs — when `prefix_compress` pays (and when it is pure cost), why the pool budget is not free RAM, and which knobs currently do nothing. Pairs with `tune_advisor.py`, which computes the crossover for your own model and box.
 * [**🧩 Missing Buffers**](documentation/missing_buffers.md): What the load-time "persistent buffer(s) have no tensor in this checkpoint" WARNING means, why a dropped MoE routing bias (`e_score_correction_bias`, missing from some EXL3 MoE builds) changes which experts run, and how to fetch just those tensors from the original repo with `scripts/fetch_missing_buffers.py`.
 * [**🏆 The Bugfix & Maintenance Victory Log**](documentation/bugfix_log.md): A massive, structured developer ledger detailing every single code fix and API migration (including DynamicCache transitions, RoPE positional overrides, multi-modal remappings, 0-indexed non-sequential caching, and Triton compiler resolutions).
@@ -430,7 +430,7 @@ USE_PROMPT_LOOKUP  = True
 
 ---
 
-### Speeding up MoE with prompt lookup (1.31× on a large MoE)
+### Speeding up MoE with prompt lookup (1.31× on a streamed MoE)
 
 Speculative decoding used to be refused outright on MoE checkpoints. It is now
 decided at **runtime**, per model, from that model's own behaviour — so on the
@@ -441,15 +441,15 @@ decode in every arm:**
 
 | model | result | what the gate decided |
 |---|---|---|
-| large MoE (this box) | **1.307×** (1.7795 → 2.3253 tok/s) | `run` — acceptance 1.00 against a 0.61 break-even |
-| another large MoE | **0.932×** (1.080 → 1.0064 tok/s) | `off_acceptance` — acceptance 0.351 against a 0.528 bar |
+| a streamed MoE (this box) | **1.307×** (1.7795 → 2.3253 tok/s) | `run` — acceptance 1.00 against a 0.61 break-even |
+| a second streamed MoE | **0.932×** (1.080 → 1.0064 tok/s) | `off_acceptance` — acceptance 0.351 against a 0.528 bar |
 
 #### Enabling it
 
 ```python
 # vaayu/server/config_local.py
 USE_PROMPT_LOOKUP = True     # zero VRAM; the gate decides whether it runs
-DRAFT_TOKENS      = 3        # measured best on the large MoE
+DRAFT_TOKENS      = 3        # measured best on the streamed MoE
 ```
 
 That is the whole change. `ENABLE_THINKING` is already `False` on the server,
@@ -457,7 +457,7 @@ which matters more than it looks — see below.
 
 #### The three conditions. All of them, or you get nothing
 
-1. **The right model.** The large MoE on this box wins. **Another large MoE lost
+1. **The right model.** The streamed MoE on this box wins. **A second streamed MoE lost
    6.8 %** — the gate catches it and switches off, but the trial costs something.
    If the gate's calibration shows no gain for your model, leave `USE_PROMPT_LOOKUP` off.
 2. **Thinking suppressed.** Both MoE templates end their assistant turn with a
@@ -496,7 +496,7 @@ The same object is written to `logs/latest/env.json` for a support bundle.
 #### What it costs when it says no
 
 The gate cannot know a model's acceptance rate without trying, so it spends its
-calibration steps and up to 64 drafting rounds finding out. On the losing MoE over a
+calibration steps and up to 64 drafting rounds finding out. On the second streamed MoE over a
 128-token run that is the 6.8 % above. It is paid **once per process**, not per
 request — but on short generations against a model you already know does not
 pay, switching `USE_PROMPT_LOOKUP` off by hand still beats letting the gate
@@ -664,7 +664,7 @@ It ships for time-to-first-token visibility, early abort, and mid-stream tool-ca
 
 ### What the defaults buy
 
-Measured end-to-end on a large MoE — 2 concurrent sessions x 3 rounds, ~4.6k-token shared
+Measured end-to-end on a streamed MoE — 2 concurrent sessions x 3 rounds, ~4.6k-token shared
 prefix, agent-shaped. Same box, same day; only configuration differs:
 
 | | first working config | shipped defaults | |
@@ -682,11 +682,11 @@ Full breakdown and the per-lever numbers: [documentation/server.md §7](document
 | `MODEL_PATH` | `""` | required. One model per process — a load costs minutes, so swapping is a restart |
 | `SERVED_MODEL_NAME` | `None` (checkpoint path) | short stable `id` for clients to hardcode |
 | `QUEUE_DEPTH` | `8` | waiting requests before `503`. One runs at a time regardless |
-| `MAX_PINNED_LAYERS` | **`-1`** | auto-fills VRAM with transformer layers. Setting `0` costs **13× on a small dense model, 2.0× on a large MoE, 1.27× on a large dense model** — the gain scales with how much of the model fits |
+| `MAX_PINNED_LAYERS` | **`-1`** | auto-fills VRAM with transformer layers. Setting `0` costs **13× on a small dense model, 2.0× on a streamed MoE, 1.27× on a large (70B) dense model** — the gain scales with how much of the model fits |
 | `ENABLE_PREFIX_CACHE` | **`True`** | leave it on. Reuse is the largest lever here |
 | `PREFIX_COMPRESS` | `None` (set `9`) | ~1.6× the pooled sessions (0.605× bf16: 9 bits plus 8 exact channels per layer, which is what clears the quality bar on both MoE forwards). Reuse collapses to **zero**, not gradually, once the pool is over capacity |
 | `DRAFTER_MODEL_PATH` | `None` | **5.57×** on streamed dense. Still refused at load on MoE (a weighted drafter costs VRAM the expert cache needs) |
-| `USE_PROMPT_LOOKUP` | `"auto"` | `"auto"` = ON for dense, OFF for MoE, resolved at load. **1.94×** on streamed dense, zero VRAM. On MoE a runtime gate decides per model — **1.31× on a large MoE**, correctly refused on another. See [Speeding up MoE with prompt lookup](#speeding-up-moe-with-prompt-lookup-131-on-a-large-moe) |
+| `USE_PROMPT_LOOKUP` | `"auto"` | `"auto"` = ON for dense, OFF for MoE, resolved at load. **1.94×** on streamed dense, zero VRAM. On MoE a runtime gate decides per model — **1.31× on a streamed MoE**, correctly refused on a second. See [Speeding up MoE with prompt lookup](#speeding-up-moe-with-prompt-lookup-131-on-a-streamed-moe) |
 | `RAM_CACHE_BUDGET_GB` | `None` *(derived from total RAM)* | pageable RAM holding layers that don't fit VRAM. On the 70B: 33/80 layers, 264 hits/248 misses. Dense only — MoE experts use the **pinned** expert cache, a scarcer resource with its own 8.5 GiB ceiling |
 | `--prefix-sessions` | `3` | concurrent sessions the prefix pool must hold before the MoE expert cache claims the rest. Lower = faster decode, fewer cached sessions |
 | `ATTN_IMPLEMENTATION` | `None` (sdpa) | `"flash_attention_2"` derives more context at the same reserve |
