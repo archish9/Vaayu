@@ -89,20 +89,6 @@ refusal is narrowed. Library callers (`AutoModel.from_pretrained`) get the same 
 
 ---
 
-## 🚀 Our Engineering Victories & Breakthroughs
-
-Through months of hardware-software co-design, we have systematically targeted and eliminated every major bottleneck. Here are our hard-won victories:
-
-* **⚡ The NVMe Queue Depth Surge (+323% Speed)**: Standard sequential file reading is locked at a queue depth of 1 (QD1), capping NVMe drives at ~2.8 GB/s. We engineered a **16-thread parallel preadv reader** releasing the Python GIL to submit parallel requests, pushing speeds to **4.4 GB/s**. We then built a native **Rust `io_uring` kernel-bypass module** (`vaayu_rust`) to push asynchronous zero-copy reads to **6.0–6.7 GB/s**!
-* **📦 The Double-Buffering Victory (Saves 41.5s/token)**: Allocating pinned memory host buffers dynamically inside the layer loop forced the OS kernel to lock contiguous pages on every call, costing ~0.5s per layer. We replaced this with **two static global pinned memory double-buffers** allocated once at startup, reducing dynamic allocation overhead to **0.0 seconds**.
-* **🧠 The KV Cache Resurrection**: We tracked down and squashed a critical legacy cache bug where the engine was silently recomputing the entire prompt history on every step. By patching cache subscripts, subsequent tokens only evaluate the single new token, saving massive computation time.
-* **🧹 CPU Cleanse (Saves 1.4s/token)**: We stripped defensive garbage collection sweeps (`gc.collect()`) and configured CUDA Host-to-Device memory copies to run asynchronously (`non_blocking=True`), completely flattening CPU latency spikes.
-* **🔥 FP8 KV Cache Quantization (~50% VRAM savings)**: The KV cache accumulates at full BF16 precision during generation—2.68 GB for a 70B model at 8k context, silently eating VRAM that should go to layer pinning and speculative decoding. We implemented `FP8DynamicCache`, a drop-in replacement storing K/V tensors in `torch.float8_e4m3fn` with per-head per-token scales. Pure PyTorch, zero new dependencies. KV footprint drops from **2.68 GB → 1.38 GB** at 8k context, freeing ~1.3 GB for the phases ahead.
-* **📌 Asymmetric Layer Pinning (15–25% Faster Prefill)**: Previously only 3 shared layers (embed, norm, lm_head, ~1 GB) were pre-loaded into VRAM, leaving ~11 GB of available budget unused. We rewrote `_init_pinned_layers()` with topology-aware two-phase pinning: Phase 1 pins shared layers; Phase 2 fills the remaining VRAM budget with the first N transformer layers in order, using `break` on budget exhaustion (homogeneous layer sizes mean if one doesn't fit, none will). On a 16 GB GPU with FP8 KV cache, this permanently eliminates **~35% of all NVMe reads per token**—delivering faster prefill on long prompts and more stable streaming throughput. Pass `max_pinned_layers=-1` to auto-fill, or `max_pinned_layers=N` to pin exactly N transformer layers.
-* **🔮 Phase H: Speculative Decoding (2–4× Tokens/Second)**: Standard generation streams 80 layers once per token (~5 s/token). Speculative Decoding inserts a **resident drafter** (EAGLE-3 self-speculation ~0.1 GB VRAM, or any small HuggingFace model) that guesses 5 tokens instantly, then Vaayu verifies all 5 in **one forward pass** and accepts the correct prefix. A 60–80% acceptance rate yields **2–4× effective throughput**. Configure via `EAGLE_HEAD_PATH` or `DRAFTER_MODEL_PATH` in `test_quick.py`.
-
----
-
 ## 🛠️ The Definitive Speed Guide: Setup in 4 Steps
 
 To run Vaayu at its absolute hardware-ceiling sequential speeds, you must configure both your environment and your physical hardware correctly.
@@ -138,31 +124,6 @@ sudo bash scripts/vaayu_optimize_os.sh /path/to/your/model/directory
 ```
 * **I/O Scheduler**: Changes your NVMe block scheduler from `mq-deadline` (which wastes CPU reordering requests) to `none` (FIFO pass-through).
 * **APST Power Management**: Stops the SSD from entering low-power states when idle. Optional: measured with no decode or TTFT cost, because generation keeps the drive's idle gaps shorter than APST's sleep timeout.
-
----
-
-## 🗺️ Next Frontiers: Roadmaps to Interactive Speeds
-
-The remaining phases follow a strict dependency chain. Each one unlocks the next.
-
-### ✅ Phase E + F: VRAM Reclamation
-**E — FP8 KV Cache** ✅ done: ~1.3 GB freed at 8k context (see Engineering Victories above).  
-**F — Asymmetric Layer Pinning** ✅ done: First 28 transformer layers permanently pinned in VRAM (not just embed/norm/lm_head), delivering **15–25% faster prefill**. See [Architecture: Asymmetric Layer Pinning](documentation/architecture.md#4-asymmetric-layer-pinning).
-
-### ✅ Phase G: Chunked Prefill
-**Done.** Large code file ingestion (4,000+ tokens) caused VRAM spikes that OOM. Processing prompts in 512-token chunks flattens the spike, making long-context use reliable. Controlled via `PREFILL_CHUNK_SIZE` in `test_quick.py` (default 512 tokens; set to 0 to disable).
-
-### ✅ Phase H: Speculative Decoding
-Implemented. Vaayu acts as the **Verifier** — a tiny drafter (EAGLE-3 self-speculation for near-zero VRAM, or any small HuggingFace model) guesses N tokens; Vaayu verifies all N in **one forward pass**. ExLlamaV3 native EAGLE bridge tried first; manual weight loader fallback. Configure in `test_quick.py`:
-
-```python
-EAGLE_HEAD_PATH    = "/path/to/eagle3-head-for-your-model"
-DRAFTER_MODEL_PATH = "/path/to/small-drafter-model"   # fallback or standalone
-DRAFT_TOKENS       = 5
-```
-
-### Phase D: Rust `io_uring` Polish (Final)
-Update `vaayu_rust` with `IORING_REGISTER_BUFFERS` and fixed file descriptors for the final 10–15% NVMe throughput squeeze. Done last because access patterns finalize only after EXL3 + speculative decoding are locked in.
 
 ---
 
