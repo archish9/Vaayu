@@ -698,6 +698,29 @@ regardless, so pool RAM is unaffected. Do NOT pad in `to_cpu`: that charges the 
 `max|split − hit|`: the fix lands when MiniMax reports `bitwise_eq_hit=True`, with the determinism floor
 still 0 and dense still 0.
 
+## [ ] PREFIX-HIT-GATE — make the prefix-cache replay check a STANDING gate, at the shape-matched bar
+
+**Why it is its own row.** This obligation was living in the prose of `SDPA-PREFIX-HIT`, which is `[x]`
+closed — open work parked inside a closed row is exactly what §6 forbids, so it is hoisted here.
+
+**What exists today.** `plans/probes/prefix_replay_check.py` (manual, server-level, `requests.jsonl` as the
+premise oracle) and `plans/probes/prefix_hit_logits.py` (library-level, logits + layouts + determinism
+floor). Both gitignored. Neither runs in the suite, so nothing re-checks that a prefix HIT agrees with a
+no-pool run after any change to the cache, the stager or an attention path.
+
+**The bar MUST be shape-matched.** A HIT compared against a single-call prefill of the whole prompt fails on
+CORRECT code — the HIT does strictly less arithmetic in a different shape, and the bf16 rounding differs
+(that wrong bar is what produced the retracted `SDPA-PREFIX-HIT` row). The gate compares a HIT against a
+no-pool replay SPLIT AT THE SAME POINT (`head_len = match_len`), with a determinism-floor control arm
+(same split run twice, which measured exactly 0).
+
+**Blocked-ish on `PREFIX-CAPACITY-RESIDUE` for the strong form.** Dense passes `bitwise_eq` today; MiniMax
+carries 2.68 of logit residue purely from buffer capacity. So either land the residue fix first and assert
+BITS on both, or land the gate dense-only now and widen it after. Prefer the former — a gate with a
+similarity threshold nobody can defend is the thing this row is trying to avoid.
+
+**§8.** Needs no knob (a test, not a feature); state it in the commit either way.
+
 ## [x] ATTN-AB — sdpa vs flash_attention_2, measured through the server — DONE 2026-11-17; the figure on record HOLDS
 
 **Verdict: `sdpa` is FASTER on MiniMax. `flash_attention_2` costs +2.2 % on decode.** So `config.py:269`'s
