@@ -946,7 +946,25 @@ cgroup OOM, peak 12.7 G vs `MemoryMax=28G`.
     three-line guard change. Cost of leaving it: an operator watching a ~2 min cold load sees nothing, then a wall
     of text, and any future boot-time pause is invisible again. Needs its own before/after check on a real load
     (and a thought about `\r` progress frames, which line buffering does not flush).
-- [ ] **Bug 2 — cgroup `MemoryHigh` throttle starves decode (root-caused, STOP-RULED).** Full TASK:
+- [~] **Bug 2 — cgroup-aware ("dynamic") budgeter — CODE MERGED to `main` 2026-11-22 (`801dcd0..b051c03`, 5 commits);
+  ON-DEVICE ACCEPTANCE STILL PENDING (user-driven).** STOP-RULE MOOT (see 2026-11-22 update below). Design:
+  `docs/superpowers/specs/2026-11-22-dynamic-cgroup-aware-budgeter-design.md`. Plan:
+  `docs/superpowers/plans/2026-11-22-cgroup-aware-budgeter.md`. All 4 tasks + a final-review fix wave, each
+  subagent-reviewed clean; 20/20 off-device cgroup tests green.
+  `[x]` T1 `effective_available_bytes()` reader (`vaayu/cgroup_limits.py`: `max(0,min(host,cap−unreclaimable))`, cap=min
+  over leaf+ancestors of min(memory.high,memory.max), no-op when uncapped; trap `reclaimable=file−shmem`) + 12-case unit
+  matrix · `[x]` T2 wire 3 vaayu_base sites (spec-preload :3061, expert ceiling+budget :3220/:3230, prefix :3662) +
+  AST guard · `[x]` T3 wire O_DIRECT `_should_use_direct_io` + flip test · `[x]` T4 envinfo `host.cgroup_memory_cap_bytes`
+  + `host.effective_available_bytes` + shared `cgroup_cap_bytes()` · `[x]` fix wave: dense RAM layer cache
+  (`vaayu_base:~2995`) also routed through the basis (final-review Important), O_DIRECT log prints effective basis.
+  **STILL OPEN (user drives, under the capped `vaayu.service`):** no cgroup OOM over a sustained Rudra run ·
+  generated ids identical to a pre-fix run · dense gate `tests/test_dense_gate.py` FOREGROUND both Llama ckpts ·
+  full suite floor. This removes the OOM + over-commit; it does NOT change MiniMax's 130 s/token (model floor —
+  separate, see `docs/handoff/2026-11-22-vaayu-rudra-slow-decode-handoff.md`).
+  **[bug] RESIDUAL (tracked, NOT fixed — pre-existing, out of plan scope):** the pinned expert buffer pool
+  (`vaayu/persist/safetensor_model_persister.py:~504`) sizes from HOST `available − 27GB`, not the cgroup basis. On
+  this 28G box the 27GB reserve collapses it to ~1 buffer (negligible); re-open if a bigger capped end-user box pins
+  up to ~4 GB above the basis's view. Original (now partly stale) TASK:
   `docs/2026-11-02-SVC-REGRESSION-bug2-cgroup-aware-budgets-TASK.md`. Budgets derive from HOST free RAM with **zero
   cgroup awareness**, so they sum to ~26 GB against the unit's `MemoryHigh=26G` → RSS walks into the cap → kernel
   throttles into direct reclaim with no swap. Stalled tokens: `total=170.8s compute=170.3s io_wait=0.0s
@@ -986,6 +1004,28 @@ cgroup OOM, peak 12.7 G vs `MemoryMax=28G`.
     **generated ids identical** to a pre-fix run (caches are exact; sizing must not move output) · dense decode not
     regressed (guards the O_DIRECT flip). Gates: `test_dense_gate.py` on BOTH Llama checkpoints, FOREGROUND; suite
     floor `1 failed, 4131 passed, 92 skipped`.
+  - **UPDATE 2026-11-21/22 — the failure mode FLIPPED from throttle to KILL; `high`-climb STOP RULE is now MOOT, and
+    the budgeter root is RE-CONFIRMED + GENERALISED to "make it dynamic/elastic" (user, 2026-11-22).** `MemoryHigh`
+    was REMOVED from the unit 2026-11-19 (its throttle hung `/health`); only `MemoryMax=28G` remains, a HARD ceiling.
+    So the original stop rule (build only once `memory.events` `high` climbs during a live >10 s token) can NEVER be
+    met — there is no `MemoryHigh` to climb. The over-commit it was guarding is REAL and now KILLS instead of
+    throttling: box journal shows the service **cgroup-OOM-KILLED twice on 2026-11-21** (14:39 + 15:55 IST,
+    `oom_memcg=/system.slice/vaayu.service`, `total-vm:145GB`, `status=9/KILL`), `Restart=always` relaunched each.
+    That is exactly the cgroup-unaware over-commit this Bug 2 describes (budgeter sums host-free, ignores the 28 G
+    cap). **Separately** — and NOT this bug — when the restarted process survived, the 2026-11-21 Rudra "clarify"
+    stress run (`logs/run-2026-11-21T10-26-17Z/`) decoded at **130–200 s/token at `rss≈10.78 GB`, well UNDER the
+    cap**, so that stall is the model's streaming/arena-size floor (≈11 GB arena, expert hit-rate 9–56 %), NOT a
+    reclaim throttle. Rudra read the resulting >300 s wire silence as "Vaayu crashing" (it was `200 OK`,
+    `finish=cancelled`, client closed the stream). Self-contained cross-team writeup (safe to share with Rudra):
+    `docs/handoff/2026-11-22-vaayu-rudra-slow-decode-handoff.md`.
+    **User decision 2026-11-22:** proceed with THIS Bug 2 fix (`effective_available_bytes()` cgroup-aware basis),
+    but GENERALISE it — the budgeter must be **dynamic/elastic**: size the expert arena (and VRAM tier) to
+    `min(host-free, cgroup cap) − unreclaimable − headroom`, using the MAX available on a bigger end-user box
+    (automatically grows the arena → higher hit-rate → faster) and never exceeding the real hard limit. Smaller model
+    still REJECTED for now (MiniMax is the deliberate stress target); user's belief "large-runs-crash-free ⟹
+    small-runs-easily" CONFIRMED (a 39/52 G model fits with headroom → crash-free AND fast). The fix removes the OOM
+    kills and the over-commit; it does NOT by itself drop MiniMax's 130 s/token on this 28 G box — only a model that
+    fits does. Rudra-side item (its own timeout + data-chunk heartbeat handling) is spelled out in the handoff doc.
 - [x] **No longer blocks `OOMD-KILL` item 3** — that block was "a server in a boot loop cannot be profiled", and
   Bug 1 is fixed + verified on-device (2026-11-02), so the sustained repro carrying Bug 2's probe is now RUNNABLE.
   It is the next action and belongs to the user (Rudra drives the load). **REJECTED as the fix** (user, 2026-11-02):
