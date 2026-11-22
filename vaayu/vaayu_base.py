@@ -2992,8 +2992,12 @@ class VaayuBaseModel(GenerationMixin):
                 _cache_budget = 0
                 _budget_note = "0.0 GB budget (MoE: experts use the pinned expert RAM cache)"
             else:
-                _cache_budget = auto_detect_cache_budget(override_bytes=ram_cache_budget)
-                _budget_note = describe_cache_budget(override_bytes=ram_cache_budget)
+                # cgroup-aware live basis (total stays the host hardware figure)
+                _eff_avail = effective_available_bytes()
+                _cache_budget = auto_detect_cache_budget(
+                    available_bytes=_eff_avail, override_bytes=ram_cache_budget)
+                _budget_note = describe_cache_budget(
+                    available_bytes=_eff_avail, override_bytes=ram_cache_budget)
             self.ram_cache = LayerRAMCache(_cache_budget)
             print(f"[Vaayu-Cache] {_budget_note}")
             self._prepopulate_ram_cache()

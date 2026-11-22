@@ -331,10 +331,10 @@ def _should_use_direct_io(model_dir: str, ram_cache_budget: int | None = None) -
         use_direct = cacheable_fraction < 0.40
 
         if not use_direct:
-            print(f"[Vaayu] Sufficient RAM detected ({mem.available / 1024**3:.1f} GB free). "
+            print(f"[Vaayu] Sufficient RAM detected ({eff / 1024**3:.1f} GB free, host {mem.available / 1024**3:.1f} GB). "
                   f"Disabling O_DIRECT to leverage page cache for {cacheable_fraction*100:.0f}% of model.")
         else:
-            print(f"[Vaayu] Limited RAM ({mem.available / 1024**3:.1f} GB free). "
+            print(f"[Vaayu] Limited RAM ({eff / 1024**3:.1f} GB free, host {mem.available / 1024**3:.1f} GB). "
                   f"Using O_DIRECT to avoid wasteful page cache copies.")
 
         return use_direct

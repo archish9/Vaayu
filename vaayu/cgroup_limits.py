@@ -48,6 +48,8 @@ def cgroup_cap_bytes(
     proc_cgroup: str = "/proc/self/cgroup",
 ) -> int | None:
     """Binding cgroup memory cap in bytes, or None when uncapped. Never raises."""
+    # Intentionally returns the raw binding cap even when cap >= mem_total: it reports
+    # the true cgroup cap; effective_available_bytes no-ops to host in that case.
     try:
         resolved = _resolve_cap(cgroup_root, proc_cgroup)
         return None if resolved is None else resolved[1]

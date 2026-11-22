@@ -13,6 +13,8 @@ HELPERS = {
     "compute_expert_budget": ("available_bytes", 0),
     "compute_prefix_cache_budget": ("free_ram_bytes", 0),
     "spec_preload_refusal": ("available_bytes", 2),
+    "auto_detect_cache_budget": ("available_bytes", 1),  # dense RAM layer cache
+    "describe_cache_budget": ("available_bytes", 1),
 }
 
 
