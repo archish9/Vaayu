@@ -28,6 +28,7 @@ from .telemetry import VaayuTelemetry, LayerTiming
 from .persist.safetensor_model_persister import get_and_clear_pinned_timings as _get_layer_disk_timings
 from .persist.safetensor_model_persister import get_expert_pool_size
 from .prefix_cache import PrefixCacheStore
+from .cgroup_limits import effective_available_bytes
 from .keepawake import KeepAwake
 from . import turboquant
 
@@ -3057,8 +3058,7 @@ class VaayuBaseModel(GenerationMixin):
             # static pre-check.
             if drafter_model_path and self.is_moe and self._moe_geometry is not None:
                 try:
-                    import psutil as _ps
-                    _avail = _ps.virtual_memory().available
+                    _avail = effective_available_bytes()
                 except Exception:            # noqa: BLE001 -- sizing, not correctness
                     _avail = None
                 if _avail is not None:
@@ -3189,6 +3189,7 @@ class VaayuBaseModel(GenerationMixin):
             self._moe_stager_capable = moe_supports_prefill_stager(_styles_detected, _is_exl3)
 
             _mem = _psutil.virtual_memory()
+            _eff_avail = effective_available_bytes()   # cgroup-aware budget basis
             # RAM arbitration ledger (diagnostic): what is already resident before
             # any expert/prefix cache allocates. On a constrained box this load-time
             # footprint — model non-expert weights, pinned layers, checkpoint
@@ -3218,17 +3219,18 @@ class VaayuBaseModel(GenerationMixin):
                 _kv_tok = 0        # D3: a sizing helper must not become the crash
             _prefix_on = bool(getattr(self, "enable_prefix_cache", False))
             _ceiling = derive_expert_ceiling(
-                available_bytes=_mem.available,
+                available_bytes=_eff_avail,
                 prefix_sessions=self.prefix_sessions,
                 kv_bytes_per_token=_kv_tok,
                 max_seq_len=self.max_seq_len or 0,
                 prefix_enabled=_prefix_on)
             print(f"[Vaayu-MoE] Expert cache ceiling {_ceiling / 1e9:.2f} GB "
-                  f"(derived: available {_mem.available / 1e9:.2f} GB, reserving "
+                  f"(derived: available {_eff_avail / 1e9:.2f} GB "
+                  f"[host {_mem.available / 1e9:.2f} GB], reserving "
                   f"{self.prefix_sessions if _prefix_on else 0} prefix session(s) of "
                   f"{(_kv_tok * (self.max_seq_len or 0)) / 1e9:.2f} GB each)")
             _expert_budget, _ne_budget, _max_per_layer = compute_expert_budget(
-                available_bytes=_mem.available,
+                available_bytes=_eff_avail,
                 working_set_bytes=_geo["working_set_bytes"],
                 num_moe_layers=_geo["num_moe_layers"],
                 expert_bytes=_geo["expert_bytes"],
@@ -3658,8 +3660,7 @@ class VaayuBaseModel(GenerationMixin):
         # reserve RAM for a pool that is never built.
         self._prefix_cache = None
         if getattr(self, "enable_prefix_cache", False):
-            import psutil as _ps
-            _free_ram = _ps.virtual_memory().available
+            _free_ram = effective_available_bytes()
             _pc_budget = compute_prefix_cache_budget(_free_ram)
             self._prefix_cache = self._build_prefix_store(_pc_budget)
             print(f"[Vaayu] cross-turn prefix cache ENABLED: "
