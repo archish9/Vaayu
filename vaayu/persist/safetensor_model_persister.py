@@ -9,6 +9,8 @@ from pathlib import Path
 
 import psutil
 
+from vaayu.cgroup_limits import effective_available_bytes
+
 import torch
 from safetensors.torch import load_file, save_file
 
@@ -294,7 +296,12 @@ def _should_use_direct_io(model_dir: str, ram_cache_budget: int | None = None) -
         mem = psutil.virtual_memory()
 
         # Reserve 8GB for OS + PyTorch + pinned buffers
-        available_for_cache = max(0, mem.available - (8 * 1024**3))
+        # Cgroup-aware basis (a systemd MemoryHigh/Max cap below host RAM). Safe
+        # against double-count: this runs at LOAD START, before the expert arena
+        # is pinned, so the arena is not yet `shmem` in memory.current. mem.total
+        # stays the HOST total below.
+        eff = effective_available_bytes()
+        available_for_cache = max(0, eff - (8 * 1024**3))
         # The engine's own expert RAM cache is sized from this same free RAM a
         # moment later and PINS it -- up to every expert on disk -- so only what
         # is left can ever be page cache. Counting it twice sent Qwen3-Next
@@ -317,7 +324,7 @@ def _should_use_direct_io(model_dir: str, ram_cache_budget: int | None = None) -
             # which only leans it to O_DIRECT, the safe default.
             from .ram_cache import auto_detect_cache_budget
             available_for_cache -= min(available_for_cache, auto_detect_cache_budget(
-                total_bytes=mem.total, available_bytes=mem.available,
+                total_bytes=mem.total, available_bytes=eff,
                 override_bytes=ram_cache_budget))
         cacheable_fraction = available_for_cache / max(1, model_total_bytes)
 
