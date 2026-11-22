@@ -22,6 +22,39 @@ def _level_cap(directory: str):
     return min(vals) if vals else None
 
 
+def _resolve_cap(cgroup_root: str, proc_cgroup: str):
+    """(leaf_dir, binding_cap) for our cgroup v2 leaf, or None when there is
+    no v2 hierarchy or no level caps memory. The cap is the min over leaf..root
+    of min(memory.high, memory.max). May raise on unreadable /proc/self/cgroup."""
+    lines = [ln for ln in _read(proc_cgroup).splitlines() if ln.strip()]
+    if len(lines) != 1 or not lines[0].startswith("0::"):
+        return None
+    rel = lines[0][3:].strip("/")
+    parts = [p for p in rel.split("/") if p]
+
+    cap = None
+    for depth in range(len(parts), -1, -1):  # leaf .. root
+        lvl = _level_cap(os.path.join(cgroup_root, *parts[:depth]))
+        if lvl is not None:
+            cap = lvl if cap is None else min(cap, lvl)
+    if cap is None:
+        return None
+    return os.path.join(cgroup_root, *parts), cap
+
+
+def cgroup_cap_bytes(
+    *,
+    cgroup_root: str = "/sys/fs/cgroup",
+    proc_cgroup: str = "/proc/self/cgroup",
+) -> int | None:
+    """Binding cgroup memory cap in bytes, or None when uncapped. Never raises."""
+    try:
+        resolved = _resolve_cap(cgroup_root, proc_cgroup)
+        return None if resolved is None else resolved[1]
+    except Exception:
+        return None
+
+
 def effective_available_bytes(
     *,
     host_available: int | None = None,
@@ -42,21 +75,13 @@ def effective_available_bytes(
             host = vm.available if host is None else host
             mem_total = vm.total if mem_total is None else mem_total
 
-        lines = [ln for ln in _read(proc_cgroup).splitlines() if ln.strip()]
-        if len(lines) != 1 or not lines[0].startswith("0::"):
+        resolved = _resolve_cap(cgroup_root, proc_cgroup)
+        if resolved is None:
             return host
-        rel = lines[0][3:].strip("/")
-        parts = [p for p in rel.split("/") if p]
-
-        cap = None
-        for depth in range(len(parts), -1, -1):  # leaf .. root
-            lvl = _level_cap(os.path.join(cgroup_root, *parts[:depth]))
-            if lvl is not None:
-                cap = lvl if cap is None else min(cap, lvl)
-        if cap is None or cap >= mem_total:
+        leaf, cap = resolved
+        if cap >= mem_total:
             return host
 
-        leaf = os.path.join(cgroup_root, *parts)
         current = int(_read(os.path.join(leaf, "memory.current")))
         stat = {}
         for ln in _read(os.path.join(leaf, "memory.stat")).splitlines():

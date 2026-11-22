@@ -56,6 +56,8 @@ from datetime import datetime
 from dataclasses import fields as dc_fields, is_dataclass
 from pathlib import Path
 
+from vaayu.cgroup_limits import cgroup_cap_bytes, effective_available_bytes
+
 _GB = 1e9                       # decimal, to match the startup prints
 _GIB = 1024 ** 3                # binary, to match the VRAM plan's own units
 
@@ -272,6 +274,8 @@ def _host_section(c):
         "ram_total_gb": lambda: round(meminfo("MemTotal:") / _GB, 2),
         "ram_avail_at_load_gb": lambda: round(meminfo("MemAvailable:") / _GB, 2),
         "swap_total_gb": lambda: round(meminfo("SwapTotal:") / _GB, 2),
+        "cgroup_memory_cap_bytes": lambda: cgroup_cap_bytes(),
+        "effective_available_bytes": lambda: effective_available_bytes(),
     })
 
 
