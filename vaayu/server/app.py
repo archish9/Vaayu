@@ -1050,14 +1050,15 @@ async def _sse(engine, req, model_name, warning, cancel=None, session_id=None,
     # and the silence it measures is the span since the last data CHUNK
     # (comments do not end it). That leaves two places it can really fire:
     #   (a) the prefill/queue window with keepalive ON -- the timeout branch
-    #       wakes every `keepalive_s` and writes only COMMENTS, so the span
-    #       keeps growing past the threshold;
+    #       wakes every `keepalive_s` and now writes a heartbeat CHUNK, but only
+    #       AFTER the check runs, so it fires only when the loop itself was
+    #       held up past the threshold;
     #   (b) the buffered tool-call window with keepalive OFF -- each arriving
     #       token wakes the check, and nothing writes a chunk.
-    # The buffered check does NOT fire with keepalive ON: heartbeat chunks reset
-    # the span every `keepalive_s`, and the threshold `max(3*keepalive_s, 45)`
-    # is always above that, so it is dead code in practice under the default
-    # config. Debug (a), not the buffered branch, for a keepalive-on warning.
+    # With keepalive ON both windows write heartbeat chunks that reset the span
+    # every `keepalive_s`, and the threshold `max(3*keepalive_s, 45)` is always
+    # above that, so under the default config the check is dead code in
+    # practice in either window.
     # With keepalive off `job.out.get()` has no timeout, so an empty-queue
     # silence has no wakeup to print from at all. That is a limit of the
     # design, not a bug (tests/test_server_app.py pins it).
@@ -1160,9 +1161,10 @@ async def _sse(engine, req, model_name, warning, cancel=None, session_id=None,
             if keepalive_s and keepalive_s > 0:
                 # The prefill/queue window is silent: job.out stays empty from
                 # submit() until the first token (26 s on a cold MiniMax load,
-                # minutes on a large prompt). A `: keepalive` comment -- legal
-                # SSE, ignored by every client -- refreshes a proxy/tunnel idle
-                # timer so the stream is not dropped before the answer starts.
+                # minutes on a large prompt). An empty-content data chunk
+                # refreshes a proxy/tunnel idle timer AND the client's own
+                # chunk timer so the stream is not dropped before the answer
+                # starts.
                 # Once tokens flow they arrive well inside the interval, so the
                 # timeout never fires during decode. A cancelled get() leaves no
                 # item behind (asyncio.Queue), so nothing is lost on timeout.
@@ -1170,24 +1172,17 @@ async def _sse(engine, req, model_name, warning, cancel=None, session_id=None,
                     item = await asyncio.wait_for(job.out.get(), keepalive_s)
                 except asyncio.TimeoutError:
                     _warn_if_silent()
-                    # A comment is enough while the client is still waiting for
-                    # the answer to START -- but once a tool call is being
-                    # buffered the client is mid-answer and counting CHUNKS, so
-                    # the same silence has to be broken with one (see below).
-                    beat = (_chunk(cid, created, model_name,
-                                   session_id=session_id,
-                                   delta={"content": ""}) if suppressing
-                            else ": keepalive\n\n")
+                    # A data CHUNK, not a `: keepalive` comment: clients that
+                    # time out on "no data chunk for N s" ignore comments, so
+                    # they gave up mid-queue. Empty content, no finish_reason:
+                    # it cannot end the stream or change the answer.
+                    beat = _chunk(cid, created, model_name,
+                                  session_id=session_id,
+                                  delta={"content": ""})
                     yield beat
                     last_write = time.monotonic()
                     if meter is not None:
-                        # A chunk mid-answer, a comment while the client is
-                        # still waiting for it to start -- and only the chunk
-                        # ends a silence span.
-                        if suppressing:
-                            meter.note_heartbeat(len(beat))
-                        else:
-                            meter.note_comment(len(beat))
+                        meter.note_heartbeat(len(beat))
                     continue
             else:
                 item = await job.out.get()

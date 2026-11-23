@@ -317,16 +317,21 @@ def _live_client(engine=None, **cfg_overrides):
     return TestClient(create_app(config=cfg, engine=engine))
 
 
-def test_a_slow_first_token_gets_sse_keepalive_comments():
+def test_a_slow_first_token_gets_sse_heartbeat_chunks():
     # Prefill (TTFT) is a silent window: _sse waits on an empty job.out before
-    # the first delta. With keepalive on, it must emit a `: keepalive` SSE
-    # comment so an idle-timeout proxy/tunnel keeps the connection open.
+    # the first delta. With keepalive on, it must emit an empty-content data
+    # CHUNK (not a comment: clients that time out on "no chunk" ignore
+    # comments) so a proxy/tunnel idle timer and client chunk timers both reset.
     with _live_client(sse_keepalive_s=0.03, delta_delay=0.2) as c:
         r = c.post("/v1/chat/completions", json=dict(BODY, stream=True))
     assert r.status_code == 200
-    assert ": keepalive" in r.text               # fired during the prefill gap
-    # And the real answer still arrives intact after the keepalives.
-    contents = [e["choices"][0]["delta"].get("content") for e in _sse_events(r.text)]
+    assert ": keepalive" not in r.text
+    events = _sse_events(r.text)
+    beats = [e for e in events if e["choices"][0]["delta"] == {"content": ""}]
+    assert len(beats) >= 1                       # fired during the prefill gap
+    assert all(e["choices"][0].get("finish_reason") is None for e in beats)
+    # And the real answer still arrives intact after the heartbeats.
+    contents = [e["choices"][0]["delta"].get("content") for e in events]
     assert "".join(c for c in contents if c) == "hello"
     assert r.text.rstrip().endswith("data: [DONE]")
 
@@ -338,6 +343,8 @@ def test_sse_keepalive_off_emits_no_keepalive_comments():
         r = c.post("/v1/chat/completions", json=dict(BODY, stream=True))
     assert r.status_code == 200
     assert ": keepalive" not in r.text
+    assert not [e for e in _sse_events(r.text)
+                if e["choices"][0]["delta"] == {"content": ""}]
 
 
 def test_sse_keepalive_does_not_fire_when_tokens_flow():
@@ -346,6 +353,8 @@ def test_sse_keepalive_does_not_fire_when_tokens_flow():
     with _live_client(sse_keepalive_s=0.5, delta_delay=0.0) as c:
         r = c.post("/v1/chat/completions", json=dict(BODY, stream=True))
     assert ": keepalive" not in r.text
+    assert not [e for e in _sse_events(r.text)
+                if e["choices"][0]["delta"] == {"content": ""}]
 
 
 def _minimax_fmt():
@@ -1241,7 +1250,7 @@ def test_the_warning_also_fires_from_the_keepalive_timeout(monkeypatch, capsys):
     _metered_clock(monkeypatch, step=30.0)
     with _live_client(sse_keepalive_s=0.05, delta_delay=0.3) as c:
         r = c.post("/v1/chat/completions", json=dict(BODY, stream=True))
-    assert ": keepalive" in r.text
+    assert ": keepalive" not in r.text
     assert capsys.readouterr().out.count(_SILENT) == 1
 
 

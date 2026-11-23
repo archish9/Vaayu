@@ -124,9 +124,11 @@ DEFAULT_STREAM = True
 # scratch, is minutes of wasted compute on this hardware. Too LOW is nearly free
 # (a few extra bytes). It does NOT help a stream dropped by a TOTAL-duration
 # limit (bytes are flowing then); only model choice or a shorter answer does.
-# Default 15 s clears a cold MiniMax prefill with one or two frames and sits
+# Default 10 s clears a cold MiniMax prefill with a couple of frames and sits
 # well under a 30-60 s idle cutoff and under every client chunk timeout seen.
-SSE_KEEPALIVE_S = 15
+# The heartbeat is an empty-content data CHUNK (not a comment), so clients that
+# time out on "no data chunk for N s" count it.
+SSE_KEEPALIVE_S = 10
 
 # Where logs are written. One directory per process, `<LOG_DIR>/run-<UTC>/`,
 # with `<LOG_DIR>/latest` always pointing at the newest. Within it,
