@@ -1032,6 +1032,36 @@ cgroup OOM, peak 12.7 G vs `MemoryMax=28G`.
   "serve a smaller model" — 16 GB VRAM + 32 GB RAM must be used to the max and MiniMax-M2.7 is a deliberate stress
   target.
 
+## [~] SSE-PREFILL-HEARTBEAT — queue/prefill keepalive was a COMMENT clients ignore → perceived death in the QUEUE; CODE MERGED to `main` 2026-11-23 (`dffdde5..dc77870`, 4 commits); ON-DEVICE ACCEPTANCE PENDING (user)
+
+**Provenance:** Rudra retest `logs/run-2026-11-23T05-23-12Z` (after the 2026-11-22 handoff). Vaayu did NOT crash and did
+NOT OOM (cgroup fix held: 5h50m, rss 4–10 G < 28 G cap). But `/health` showed `queue_depth 8 queued 5`; every request
+`finish=cancelled cancel_reason=abandoned_queued`, `heartbeats_sent=0 comments_sent=36`, first_byte 181 s, max_silence
+611 s. Root cause: the server does ONE request at a time; MiniMax decodes 130–200 s/token, so requests sit minutes in
+the QUEUE + prefill, and in THAT window the keepalive was a `: keepalive` SSE **comment** — clients counting "no data
+chunk for N s" ignore comments → they abandon in the queue. (RUN-E fixed the *buffered tool-call* window to a chunk in
+2026-11-08; this is the sibling PREFILL/QUEUE window, missed then.) Design `docs/superpowers/specs/2026-11-23-sse-chunk-heartbeat-design.md`,
+plan `docs/superpowers/plans/2026-11-23-sse-chunk-heartbeat.md`, handoff refreshed `docs/handoff/2026-11-22-vaayu-rudra-slow-decode-handoff.md` (§9/§10/§11).
+
+**Shipped (approach #3 + 2c; subagent-driven, whole-branch review APPROVE):** `[x]` prefill/queue keepalive now emits an
+empty-content DATA chunk (`delta={"content":""}`, no `finish_reason`, `meter.note_heartbeat`), not a comment, unifying
+both silent windows on the chunk heartbeat (`vaayu/server/app.py`); `[x]` `SSE_KEEPALIVE_S` default 15→10 (config.py +
+app.py dataclass + README); `[x]` dropped a now-racy keepalive-timeout warning test; `[x]` docstring/byte-cost accuracy.
+135 server-suite tests pass off-device; ids unchanged by construction (empty content).
+
+**STILL OPEN (user drives, under `vaayu.service`; needs ONE restart to load the merged code):** a Rudra run shows
+`heartbeats_sent > 0`, keepalive `comments_sent = 0`, no `abandoned_queued` for a chunk-honoring client with a raised
+timeout; ids identical to a pre-fix run; full-suite floor. Rudra-side (in the handoff): serialize to concurrency 1
+(`recommended_client_concurrency=1`; streamed-MoE batching is a net loss), raise the chunk/read timeout minutes-safe,
+keep stream=true. Does NOT change MiniMax's 130 s/token (model floor).
+
+**[bug] DEFERRED (approach 2a, not built):** under heavy decode the module-list MoE forward holds the GIL in bursts, so
+the event loop (hence `/health` AND heartbeat cadence) is serviced only ~every 15 s — `/health` took 9.2 s on 2026-11-23,
+and heartbeat cadence under load is floored ~15 s regardless of `SSE_KEEPALIVE_S`. Fix = a per-decode-step `time.sleep(0)`
+GIL yield in the forward (touches the hottest path → needs a decode A/B + dense gate). RE-OPEN when a strict health probe
+or load balancer sits in front, or sub-15 s cadence under load is needed. No consumer needs it today (single box, one
+client, Rudra timeout raised).
+
 ## [x] RUN-E-STALL — "stream starts, 10 chunks, then 300 s of silence" — ROOT-CAUSED + FIXED 2026-11-08; its telemetry item CLOSED 2026-11-09 (nothing open in this row)
 
 **Verdict:** the report's PRIMARY surface (`VAAYU-RUN-E-REPORT.md` §2.1) is a **Vaayu bug in `_sse`, now fixed**:
