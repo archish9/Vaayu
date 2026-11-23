@@ -153,7 +153,7 @@ class WireMeter:
             self._first_byte = now
 
     def note_heartbeat(self, nbytes: int) -> None:
-        """One empty-content chunk from the buffered-tool-call heartbeat.
+        """One empty-content heartbeat chunk -- from the prefill/queue keepalive or the buffered-tool-call window.
 
         A data CHUNK, which is why it is one on the wire too (`656e3e2`): it
         counts in `chunks_sent` and it ends the silence span, because a
