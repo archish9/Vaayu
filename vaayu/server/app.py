@@ -142,12 +142,13 @@ class ServerConfig:
     # What `stream` means when the request omits it. True here, NOT OpenAI's
     # false: nothing is sent until the last token otherwise.
     default_stream: bool = True
-    # Seconds of silence on a stream before a `: keepalive` SSE comment is sent.
+    # Seconds of silence on a stream before an empty-content DATA CHUNK
+    # (`delta={"content": ""}`, not a `: keepalive` comment) is sent.
     # Covers the prefill/queue window, where _sse waits on an empty job.out and
     # emits nothing -- 26 s on a cold MiniMax load, minutes on a large agentic
     # prompt. That silence trips an idle-timeout proxy/tunnel (e.g. ngrok) and
     # drops the connection before the first token. 0 disables it. See config.py.
-    sse_keepalive_s: float = 15.0
+    sse_keepalive_s: float = 10.0
     # SQE-PLUG: caps on io_uring submission granularity that keep the kernel from
     # starting a block plug, working around CVE-2026-64017 (see config.py). 0 =
     # unlimited = pre-workaround behaviour. Applied to the persister BEFORE the
