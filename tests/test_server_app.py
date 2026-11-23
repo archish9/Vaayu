@@ -1243,15 +1243,11 @@ def test_a_healthy_stream_warns_not_at_all(monkeypatch, capsys, fmt_key):
     assert "WARNING" not in capsys.readouterr().out
 
 
-def test_the_warning_also_fires_from_the_keepalive_timeout(monkeypatch, capsys):
-    # The other wakeup: an empty queue (prefill) with keepalive ON. The fake
-    # engine waits 0.3 s against a 0.05 s keepalive, so the timeout branch runs
-    # several times -- the clock, not the sleep, supplies the 45 s.
-    _metered_clock(monkeypatch, step=30.0)
-    with _live_client(sse_keepalive_s=0.05, delta_delay=0.3) as c:
-        r = c.post("/v1/chat/completions", json=dict(BODY, stream=True))
-    assert ": keepalive" not in r.text
-    assert capsys.readouterr().out.count(_SILENT) == 1
+# (Removed: a test that the silence warning fires from the prefill keepalive
+# timeout. That window now writes heartbeat CHUNKS, which end the silence span,
+# so the warning is dead code there under keepalive ON and any assertion on it
+# is a timing race. The surviving warning path -- the buffered window with
+# keepalive OFF -- is pinned by the tests above.)
 
 
 def test_with_keepalive_off_the_warning_can_only_come_from_the_buffered_window(
