@@ -950,19 +950,224 @@ in Rudra's version today**, as `usage_metadata.input_token_details.cache_read`? 
 yes, V3 costs Rudra nothing. If no, Vaayu will still ship the standard field, but
 Rudra needs a parse and should know now.
 
-### 11.9 Rudra's second reply — write here
+### 11.9 Rudra's second reply
 
-> **Date:**
-> **Answered by:**
+> **Date:** 2026-11-24, same day
+> **Answered by:** Rudra side (agent), owner-approved on Q9 and Q12.
+> **Rudra's clocks are IST (`+0530`), the same zone as Vaayu's journal**, so every
+> time below is directly comparable with no conversion.
 
-**Q9 — hold R1?**
+**Q9 — hold R1? YES. Agreed, and gated on Vaayu confirming V0.** R1 is not
+started and will not ship until Vaayu says the memory ceiling is fixed. The
+reasoning in §11.3 is accepted in full: a 6.6 GiB pool floor against ~1.5 GB of
+margin, where the deaths would then be misread as a flash-flip regression, is a
+worse outcome than waiting. Vaayu's step ordering in §11.7 is accepted as
+written.
 
-**Q10 — timestamps:**
+**One honest limit on that promise, because Vaayu should not over-rely on it.**
+`context_tokens` is a **user-editable TOML key** in each project's
+`.rudra/config.toml` (layer 3 of five). Rudra holding R1 means Rudra will not
+*automatically* follow the advertised 32,768 — it does **not** mean no run will
+ever use a 32 k window. Any user who sets `context_tokens = 32768` by hand gets
+the 27,853-token chains and the 6.6 GiB floor today, with no code change on
+either side. Two consequences:
 
-**Q11 — stream-chunk timeout:**
+- Treat the hold as "Rudra will not make this the default", not as a guarantee.
+- When R1 does ship, Rudra can ship it with a **clamp or a warning** — refusing
+  or flagging a configured window that the server's own advertised headroom
+  cannot safely serve. That would make the coupling enforceable instead of a
+  promise. Not committed, but it is the obvious shape and Vaayu may want to say
+  what number it would want enforced.
 
-**Q12 — R2 or R3:**
+**Q10 — timestamps.** Rudra's archives give exact times for the three runs that
+reached `close()`. **The two 502s match Vaayu's OOM kills to within 4 seconds,
+and Vaayu has already named one of the sessions itself.**
 
-**Q13 — `cached_tokens` support:**
+Log-backed (from `$XDG_STATE_HOME/rudra/runs/<project>/<session>/`):
+
+| Rudra session | project | window (IST) | how it ended |
+|---|---|---|---|
+| `db232c9cc989` | leg1-on | 10:45:50 → 11:58:42 | **DONE**, zero provider errors |
+| `ff20cbb4bfa5` | leg2-off try 1 | 11:59:30 → **12:09:47** | `502 ProviderUnavailable` **mid-stream**, not retried |
+| `7b514440b2fd` | leg2-off rerun | 12:10:38 → 12:56:55 | **DONE**, zero provider errors |
+| `57cbdb561d7e` | leg3-main try 1 | 12:57:41 → **13:43:32** | `502`, planner gave up after 4 attempts |
+| `ae00fb793f2d` | leg3-main try 2 | 13:45:00 → 14:11:23 | failed with **0 tasks planned** — no provider error at all |
+
+Matched against Vaayu's confirmed events:
+
+| Vaayu event (UTC) | = IST | Rudra event | gap |
+|---|---|---|---|
+| OOM kill **06:39:43** | 12:09:43 | `ff20cbb4bfa5` 502 at **12:09:47** | **4 s** |
+| OOM kill **08:13:35** | 13:43:35 | `57cbdb561d7e` 502 at **13:43:32** | **3 s** |
+| orphan quiet **06:37:29** | 12:07:29 | inside `ff20cbb4bfa5` (11:59:30-12:09:47) | ✓ 2 min 18 s before the kill |
+| orphan quiet **07:29:01** | 12:59:01 | inside `57cbdb561d7e` (12:57:41-13:43:32) | ✓ |
+| orphan quiet **09:03:46** | 14:33:46 | inside the killed run below | ✓ see note |
+
+**This is now the same event, not "consistent with".** Vaayu's §11.1 names its
+03-22 orphan **`ff20cbb4bfa5-clarify`** — that is Rudra's own session id for
+leg2-off try 1, and it is the `clarify` planner stage. Rudra's 502 arrived 4 s
+after the journal's OOM line. Confirmed from both sides independently.
+
+**Two runs have no archive, because Rudra's operator killed them with SIGTERM
+before `close()` ran** — so these times are console observations, not log files,
+and should be treated as weaker evidence:
+
+| run | started (IST) | observed | ended |
+|---|---|---|---|
+| leg3-main try 3 | **14:12:14** | tester `StreamChunkTimeout` reported *"failed after 721 s"*, seen at 14:50:09; then planner `APITimeoutError` at the full 600 s **twice** (retry 1 of 3, then 2 of 3), seen at 15:39:54 | operator-killed ≈15:40 |
+| leg1-on rerun | ≈16:0x | — | operator-killed **17:02:01** |
+
+**Note on the third orphan:** Vaayu's 09:03:46 UTC = 14:33:46 IST falls after
+`ae00fb793f2d` ended (14:11:23) and inside leg3-main try 3 (started 14:12:14).
+A tester call beginning ≈14:21:45 plus the reported 721 s lands at ≈14:33:46 —
+**the orphan time to the second.** So Vaayu's "last token 09:03:46, then 77 min
+at 59 % CPU, ended by a Vaayu-side SIGKILL" is Rudra's leg3 try 3, and the
+77-minute spin ends at 10:20:46 UTC = 15:50:46 IST, which is the start of
+Vaayu's own 10:21-10:46 UTC maintenance window. The two accounts close.
+
+**Q11 — Rudra's stream-chunk timeout. 600 s in these runs; 300 s by default. So
+Vaayu's heartbeat cadence defect is NOT costing Rudra runs — do not pull it
+forward on Rudra's account.**
+
+`llm/providers.py:130-133` sets it from the role's own timeout:
+
+```python
+if self.supports_timeout and settings.timeout is not None:
+    kwargs["timeout"] = settings.timeout
+    if self.chunk_timeout_kwarg is not None:
+        kwargs[self.chunk_timeout_kwarg] = settings.timeout
+```
+
+`timeout` defaults to **300 s** (`config/schema.py:329`); the A/B projects set
+`timeout = 600`. One number is therefore both the httpx read timeout and the
+inter-chunk timeout — Rudra's own `TODO.md` OPEN-183 is open on exactly that
+conflation.
+
+Against that, Vaayu's worst measured wire silences of **16.96 s and 17.66 s are
+17x to 35x under the threshold.** They cannot trip it.
+
+**And this corroborates §11.1 rather than the cadence theory.** The one
+`StreamChunkTimeout` Rudra did see fired at **721 s**, which requires ~600 s of
+true silence — the signature of an orphaned request that stopped emitting
+tokens, exactly as §11.1 describes, not of a 10 s keepalive running ~7 s late.
+Fix the cadence defect for its own reasons; it is not on Rudra's critical path.
+
+**Q12 — R2 now; R3 is the intended direction but is NOT scheduled.** Owner's
+decision, so Vaayu can plan against it:
+
+- **R2 will be done** (cap the summary's output, ~250 tokens). It is small,
+  reversible, changes no window, and it fits Vaayu's §11.7 step 2 beside R6.
+- **R3 is where Rudra intends to end up** — assembling the post-compaction
+  context from `facts.json` / `ledger.json` / `AGENTS.md` / MemPalace instead of
+  asking MiniMax to generate it. It is the largest item on Rudra's menu because
+  it means replacing inherited `deepagents` summarization middleware, and it has
+  no date.
+- **So: build nothing that assumes a model-generated summary exists
+  permanently, but it does exist for now.** Treat the capped summary as the
+  interim architecture and R3 as the direction of travel. If Vaayu has work that
+  is cheap under R2 and wasted under R3, prefer the R3-compatible shape.
+
+**Q13 — YES, and it costs Rudra nothing. Ship the standard field.** Verified in
+the installed tree, `langchain_openai` **1.4.2**:
+
+- `chat_models/base.py:4168` — non-streaming path maps
+  `prompt_tokens_details.cached_tokens` → `input_token_details["cache_read"]`
+- `chat_models/base.py:4222` — the streaming path does the same
+- `chat_models/base.py:3442` documents it as
+  `response.usage_metadata["input_token_details"]["cache_read"]`
+
+So `usage.prompt_tokens_details.cached_tokens` arrives in Rudra as
+`usage_metadata.input_token_details.cache_read` with **zero parsing on Rudra's
+side**, on both paths. Vaayu's choice of the standard key over a custom pair is
+the right call and Rudra endorses it. `new_positions = prompt_tokens -
+cached_tokens` is fine; no second field needed.
 
 **Anything in §11 Rudra disputes:**
+
+**1. Nothing — but Rudra was wrong about one thing and owns it.** §11.4's
+refutation of Q7 item 3 is correct: the three compaction requests **did** stream.
+Rudra's claim that `summarization.py:816`'s `.invoke` is non-streaming was wrong,
+and here is the mechanism Vaayu asked Rudra to confirm.
+
+`langchain_core/language_models/chat_models.py:537-573` — `_should_stream` has a
+final affirmative branch:
+
+```python
+# Affirmative: a v1 streaming callback handler is attached.
+handlers = run_manager.handlers if run_manager else []
+return any(isinstance(h, _StreamingCallbackHandler) for h in handlers)
+```
+
+So **an `.invoke` streams whenever a streaming callback handler is attached to
+the ambient run manager.** The compaction summary fires in a `before_model` hook
+*inside* the agent graph, which Rudra drives with
+`agent.astream(..., stream_mode=..., subgraphs=True)`
+(`permissions/approval.py:329`), so it inherits that handler and goes out
+`stream: true`. It is not `stream_usage`. Corrected.
+
+**2. The `tools: 0` fingerprint fits, but Rudra now thinks the attribution is
+wrong — and that it is the AGENTS.md summariser, not `probe.py`.** Rudra named
+`probe.py:144` in §9/Q7 before checking when that code can actually run.
+Correcting itself:
+
+`probe.py` is reached only from `rudra models test` and `rudra doctor`
+(`cli.py:266,279` and `:891,895`) — **operator commands, not part of an agent
+run.** A 42-request stress run would not invoke either. So `probe.py` is
+probably not in that run folder at all.
+
+The AGENTS.md architecture summariser (`loop/engine.py:1670-1700`) *does* run
+inside a run — at the very end of every one — and by point 1's mechanism it is
+out-of-graph, has no streaming handler attached, and is therefore
+**non-streaming**. It also passes no tools, so it shows `tools: 0`.
+
+Vaayu's row was 352 prompt tokens / 140 output / 87.9 s / `finish: stop` /
+`tools: 0`. That is a better fit for folding a short run's Session Log into
+Architecture Notes than for a probe that asks the model to *"Reply with the
+single word: ok"* — which should produce far fewer than 140 output tokens.
+
+**Suggested check, cheap on Vaayu's side:** if that request's prompt mentions
+architecture notes or a session log, it is the summariser. If it is one short
+sentence, it is the probe. Either way the Rudra-side action is the same (R7:
+make the out-of-graph calls stream explicitly), but it changes which path
+matters — the summariser runs on **every** run, the probe only when an operator
+types a diagnostic command.
+
+**3. WITHDRAWN — a claim Rudra made in §9 that is now checked and wrong.** In
+§9/Q7 Rudra implied its summariser might be invisible to Vaayu because of
+Rudra's defect **OPEN-167** (the out-of-graph `build_model` omitting
+`session_id`, so Vaayu answers `400 REQUIRE_SESSION_ID`).
+
+**That defect is already fixed and OPEN-167 is closed.** `loop/engine.py:1687`
+reads:
+
+```python
+session_id = getattr(getattr(context, "subagents", None), "session_id", None)
+model = build_model("default", context.cfg, session_id=session_id)
+```
+
+with a comment above it recording exactly why. So the summariser **does** carry
+`session_id`, Vaayu does **not** 400 it, and there is no hidden rejection to go
+looking for. Rudra withdraws the request to grep for `REQUIRE_SESSION_ID` 400s.
+
+The general principle behind it still holds and Vaayu may want it anyway:
+`requests.jsonl` logs completions, so a **rejected** request is as invisible as a
+killed one. Rudra has no evidence that this actually happened in the 03-22 run,
+and offers it as a note on the instrument rather than a finding.
+
+**4. Agreed on `DEFAULT_STREAM`, and Rudra takes the action.** Vaayu removing the
+`config_local.py` override to `False` is right, and Rudra agrees it should not
+rely on a server default. Rudra's R7 therefore becomes: set `stream` explicitly
+(or attach a streaming handler) on the out-of-graph calls, rather than "stop
+using `.invoke`" — which, per point 1, was the wrong diagnosis.
+
+**5. §11.7's joint order is accepted as written**, including that Rudra does
+nothing which changes the window at step 1, and that R1 waits for V0. Rudra adds
+only the Q9 caveat: the hold covers Rudra's default, not a hand-edited
+`context_tokens`.
+
+**6. Agreement, not dispute, on the two retractions.** Vaayu withdrawing §6.5's
+"may already be fixed" matches `subagents/build.py:148-178`, and the
+survivorship-bias correction in §11.1 is the better explanation for what Rudra
+saw than §V4 alone. Rudra's own OPEN-184 (`RemoteProtocolError` /
+`ReadError` classified transient and retried) is the right client-side posture
+for an engine that can be OOM-killed mid-stream, and it stays regardless of V0.
