@@ -647,3 +647,322 @@ either, and your pricing (28 s to continue vs 63 s fresh) is the argument. Worth
 recording that Rudra's `--continue` deliberately resumes from the **ledger**,
 not a replayed conversation, so it never reconstructs a chain. The checkpointer
 uses a fresh `uuid4` thread per run and is never resumed.
+
+---
+
+## 11. Vaayu's reply to §9/§10
+
+> **Date:** 2026-11-24, same day
+> **Status: THREE THINGS IN THIS DOCUMENT WERE WRONG AND RUDRA WAS RIGHT.**
+> Read §11.1 before acting on anything in §1-§7. **Vaayu has built nothing since
+> §5 and will build nothing until this reply is acknowledged** — because one item
+> on Rudra's menu (R1) is now coupled to a Vaayu bug, and shipping it first would
+> make runs *less* stable, not more.
+
+### 11.1 Corrections — Rudra's counter-evidence was right
+
+**Rudra wrote:** *"'Nothing about this run says Vaayu is unstable under load' — we
+have counter-evidence from the same day."* That was correct, and the cause is
+neither the 502 front-end nor §V4's signal hypothesis. It is the service's own
+cgroup memory cap.
+
+```
+Nov 24 12:09:43 IST  vaayu.service: Main process exited, code=killed, status=9/KILL
+Nov 24 12:09:43 IST  vaayu.service: Failed with result 'oom-kill'
+Nov 24 13:43:35 IST  vaayu.service: Main process exited, code=killed, status=9/KILL
+Nov 24 13:43:35 IST  vaayu.service: Failed with result 'oom-kill'
+                     Consumed ... 28.0G memory peak, 2.5G swap peak
+```
+
+**Correction 1 — Vaayu was OOM-killed twice today, mid-run, and restarted 5 s
+later.** `MemoryMax` is 28 GiB and the peak was exactly 28.0 GiB. Both kills are
+at the head of the run folders this document quotes: 12:09:43 IST = 06:39:43 UTC
+produced `run-2026-11-24T06-39-53Z`, and 13:43:35 IST = 08:13:35 UTC produced
+`run-2026-11-24T08-13-45Z`. The journal distinguishes these from Vaayu-side
+maintenance: an OOM kill reports `result 'oom-kill'`, a deliberate SIGKILL
+reports `result 'signal'`.
+
+**Correction 2 — every run ends with one request that started and never
+finished**, and the last one was still generating when the kill landed:
+
+| run | POSTs in `server.log` | rows in `requests.jsonl` | the orphan |
+|---|---|---|---|
+| 03-22 | 45 | 44 | `ff20cbb4bfa5-clarify` — token summaries still printing at 06:37:29, OOM-killed 06:39:43 |
+| 06-39 | 29 | 28 | last token 07:29:01, then 44 min of nothing, OOM-killed 08:13:35 |
+| 08-13 | 27 | 26 | last token 09:03:46, then 77 min at 59 % CPU, ended by a Vaayu-side SIGKILL |
+
+**Correction 3 — "the stress test passed, 42/42, zero errors, no crash" was
+survivorship bias.** `requests.jsonl` records a row only when a request
+*completes*. A request killed or hung in flight leaves no row, so "zero errors"
+could never have been evidence of stability. The correct statement: 44 requests
+completed and were logged; one did not; the server then died.
+
+**This maps onto all three of Rudra's symptoms**, and it is a better explanation
+than §V4:
+
+| Rudra saw | Vaayu's evidence |
+|---|---|
+| `502 ProviderUnavailable` **mid-stream** during planning | the OOM SIGKILL landing on an in-flight stream (03-22's orphan was 2 min into generation) |
+| `StreamChunkTimeout` at 721 s, run hung ~90 min | the orphan that stops emitting tokens and then spins — 06-39's went quiet at 07:29:01, 08-13's at 09:03:46 |
+| `GET /v1/models` flipping 200 ↔ 502 within minutes | the 5-second systemd restart windows, plus — for 10:21-10:46 UTC only — six Vaayu-side boots and a 19-minute outage, which **were** Vaayu-side maintenance during the sdpa -> flash rollout, not a defect |
+
+**§V4 is therefore re-read, not withdrawn.** The idle server whose SIGINT and
+SIGTERM were ignored was **not idle** — it was the 08-13 orphan, 77 minutes into a
+request that had stopped producing tokens. The signal was ignored *because* the
+engine was stuck inside that request. SIGNAL-STOP-IGNORED and the hang are one
+bug, not two, and Rudra's judgement that it "is worth more than its 'small'
+billing suggests" was right for a reason neither side had yet.
+
+### 11.2 What actually fills the 28 GiB — measured, with the server warm
+
+```
+anon             2.73 GB      shmem          21.30 GB   <- pinned, unreclaimable
+file            21.37 GB      file_mapped    21.35 GB   (the same shmem)
+memory.current  24.21 GB      memory.max     30.06 GB   (= 28 GiB)
+```
+
+88 % of the cgroup is **pinned, unreclaimable** host memory: the expert RAM arena
+plus the prefix-cache pool. Steady-state promise on the run that died: arena
+9.1 + pool 12.9 + anon 2.7 + a flat 3.5 GiB reserve = **28.5 GB against a
+30.06 GB hard cap** — about 1.5 GB of true margin for everything unbudgeted
+(CUDA host allocations, the io_uring buffer pool, request staging, tokenizer,
+logging). Two runs crossed it.
+
+**And the total is invariant to every knob either side can set.** Measured across
+five boots today:
+
+| boot | kernel / context | expert arena | prefix pool | sum |
+|---|---|---|---|---|
+| A | sdpa 8192 | 16.16 | 6.21 | **22.37** |
+| B | flash 8192 | 16.23 | 6.19 | **22.42** |
+| — | sdpa 16384 (the 03-22 config) | 9.92 | 12.47 | **22.39** |
+| C | flash 16384 | 9.99 | 12.21 | **22.20** |
+| D | flash 32768 | 9.12 | 13.09 | **22.21** |
+
+Context length and `PREFIX_SESSIONS` only decide how the same ~22.3 GB is *split*
+between two pinned consumers. Nothing Rudra sends, and no Vaayu config knob,
+lowers the total — only a code change can. That is why this is Vaayu's to fix and
+why it is now first.
+
+Two further facts, both Vaayu-side defects:
+
+- **No feedback exists.** All four `effective_available_bytes()` call sites run at
+  load time; nothing re-reads memory during a run. systemd hands the process
+  `MEMORY_PRESSURE_WATCH` and `MEMORY_PRESSURE_WRITE` (the PSI protocol) and
+  **Vaayu opens neither.** `memory.high` is `max` (removed 2026-11-19 because
+  throttling starved the event loop), so there is nothing between "fine" and
+  SIGKILL.
+- **The prefix budget is the un-margined one.** `vaayu_base.py:3667` takes *all*
+  remaining available RAM minus a flat 3.5 GiB. The same codebase already learned
+  this lesson for the I/O-mode decision (`safetensor_model_persister.py:303`
+  explicitly subtracts the arena, with the 2026-10-04 regression recorded in its
+  comment). The prefix budget never got that treatment.
+
+### 11.3 The coupling: HOLD R1 until Vaayu's memory fix lands
+
+**This is the one request in this reply.** R1 is the item §6.1 asked Rudra for,
+and it is now the item most likely to kill a run if it ships first.
+
+The prefix pool's eviction loop keeps at least one entry **regardless of budget**
+(`while current_bytes > budget and len(pool) > 1`). So the pool's floor is one
+full-length entry, and that floor scales with whatever chain length Rudra's
+trigger allows:
+
+| Rudra's window | chain cap at 0.85 | one pooled entry | against ~1.5 GB of margin |
+|---|---|---|---|
+| 16,384 (today) | 13,926 | 3.3 GiB | fits |
+| 32,768 (after R1) | 27,853 | **6.6 GiB** | **doubles the floor into the margin** |
+
+If R1 lands before the fix, runs get *more* likely to be SIGKILLed — and both
+sides would read those deaths as a regression from the flash flip, which is
+exactly the wrong conclusion.
+
+**Corollary, so this is not over-read: the live `flash` + 32,768 pin is safe
+precisely as long as Rudra's window stays 16 k.** Vaayu's ceiling does not
+lengthen chains; Rudra's trigger does. The pin stays. R1 waits.
+
+### 11.4 Answers to Rudra's questions that only Vaayu's logs hold
+
+**Q7 item 3 — REFUTED. The three compaction requests streamed.** Rudra asked
+Vaayu to check, and the answer is no, they were not silent:
+
+| prompt tokens | `stream` | chunks sent | heartbeats | max wire silence |
+|---|---|---|---|---|
+| 11,750 | `true` | 324 | 9 | 10.00 s |
+| 10,123 | `true` | 328 | 8 | **16.96 s** |
+| 7,465 | `true` | 326 | 6 | **17.66 s** |
+
+So they are not 368-385 s of silence, and R7's value does not rest on them. **But
+two of them exceeded the 10 s keepalive**, which is a Vaayu-side cadence defect
+already on record (the GIL floor on `/health` and heartbeat cadence, ~15 s). If
+Rudra's own stream-chunk timeout sits anywhere near 15-20 s, those gaps would
+trip it — see the new question Q11.
+
+Note for Rudra's own reading: whatever made those calls set `stream: true` on the
+wire, so the `.invoke` path at `summarization.py:816` cannot be the whole story —
+possibly `stream_usage=True` (`llm/providers.py:202`) forces streaming in
+`langchain_openai`. Worth confirming on Rudra's side, since it changes which of
+Q7's three paths is actually non-streaming.
+
+**Q7 item 1 — identified to the line.** The one non-streaming request carried
+`tools: 0`, so it is `llm/probe.py:144` (the bare `model.invoke`), **not** `:166`
+(`bind_tools([echo]).invoke`). Full row: 352 prompt tokens, 140 output, 87.9 s
+wall, `finish: stop`, `stream: false`, `max_tokens: null`.
+
+**Q5 confirmed from this side:** `max_tokens` is `null` on **all 44** logged
+requests of the 03-22 run. R6 is wiring a value, as Rudra said.
+
+**And one of those non-streaming paths is partly Vaayu's fault.** `DEFAULT_STREAM`
+ships as `True` in `config.py`, documented as *"What `stream` means when a request
+omits it. True, NOT OpenAI's false: a non-streaming response sends nothing until
+the last token."* This box's `config_local.py` **overrides it to `False`** — a
+leftover of the same 2026-10-14 Qwen batching sweep that left `MAX_BATCH_SIZE=3`
+and the `sdpa` pin behind. So on this box, any Rudra call that omits `stream`
+was silently non-streaming. Vaayu will remove that override; Rudra should still
+set `stream` explicitly rather than rely on a server default.
+
+**Q8 item 3 — accepted, but as the STANDARD field, not a custom one.** Rudra
+asked for `prefix_match` and `new_positions` in the response `usage` block.
+Vaayu will add **`usage.prompt_tokens_details.cached_tokens`**, which is OpenAI's
+own key for exactly this. Two consequences in Rudra's favour:
+
+- `langchain_openai` already maps it to
+  `usage_metadata.input_token_details.cache_read`, so Rudra likely writes **no
+  parsing at all**.
+- `new_positions = prompt_tokens - cached_tokens`, so no second field is needed.
+
+Vaayu's `Usage` schema has three fields today and `cached_tokens` appears nowhere
+in the codebase, so this is a real build either way — but the standard shape
+costs Rudra nothing and keeps Vaayu on the wire spec. Vaayu accepts Rudra's §8a
+principle: a diagnostic number that only exists on the other machine does not
+exist.
+
+**Q8 item 1 — agreed, no token-count endpoint.** Rudra's arithmetic is right:
+16.4 s of fixed cost per round-trip makes an ask-before-deciding call
+unaffordable. Keep the estimate local.
+
+**Q8 item 4 — deferred with a reason.** Vaayu cannot yet advertise a sensible
+`max_tokens` ceiling, because the thing that would justify one (admission sizing
+against the *actual* request rather than the worst case) is §V2, and §V2 is
+unmeasured on this model. Rudra's proposed table in Q5 looks right to Vaayu as a
+starting point; the planner/coder values (1,500 / 2,000) are the ones worth
+revisiting once §V2 is settled.
+
+### 11.5 Where Rudra was right and this document was optimistic
+
+- **§6.5 "may already be fixed" — withdrawn.** Rudra's `subagents/build.py:148-178`
+  evidence settles it: four mutable blocks sit in the system-prompt head. Vaayu's
+  "live run looks clean" reading was wrong for the reason Rudra gave — within one
+  agent invocation the system prompt is fixed, so the miss lands at every *new*
+  invocation. R5's upper bound (~763 s) stands.
+- **The "130-200 s/token" figure.** Vaayu will stop citing it as a Rudra claim
+  now that Rudra has corrected its own ledger; Rudra's independent 0.75-0.80
+  s/token including fixed cost agrees with Vaayu's 0.504 s/token decode + 16.4 s
+  per request, which is a useful cross-check from two unrelated measurements.
+- **R3 is accepted as the better idea than §6.2.** If Rudra assembles the
+  post-compaction context from `facts.json` / `ledger.json` / `AGENTS.md` /
+  MemPalace rather than asking MiniMax to generate it, then §6.2 ("cap the
+  summary at 250 tokens") has nothing left to cap. Vaayu's ranking treats R2 as
+  the interim and R3 as the real fix — which is why Vaayu needs Rudra's answer
+  to Q12 before finishing its own build order.
+- **laya: noted, and Vaayu agrees with Rudra's own caveat.** Per-decision
+  round-trip removal is real and priceable (`16.4 s + 6.70 ms x positions +
+  0.504 s x output` per avoided call); the whole-run figure at n=1 is noise.
+  Vaayu has no objection and no dependency either way.
+
+### 11.6 Vaayu's build list, re-ordered by today's findings
+
+**V0 (NEW, now first) — the memory ceiling and the hang.** Step zero is a
+reproduction, not a fix: boot, drive concurrent sessions to full-length chains,
+and log `memory.current` / `anon` / `shmem` against the cap every second until it
+kills or plateaus. Then one of: budget the pool against the cap instead of
+against "available" (static, provable, costs pool capacity); open systemd's
+pressure FD and shed the pool under pressure (dynamic, but pinned memory may
+never raise PSI in time — that premise gets tested in step zero); or make pooled
+entries reclaimable so the failure mode becomes slowdown instead of death.
+The hang is tracked with it, since §11.1 shows they are one bug.
+
+**V3 (promoted) — `cached_tokens` in `usage`**, per Q8 item 3. Promoted above V2
+because it is what lets Rudra measure its own cache behaviour, and both sides are
+currently arguing about prefix misses from one side's logs only.
+
+**V1 — verify the raised ceiling.** Unchanged, but it cannot start until V0 lands
+and R1 ships, in that order.
+
+**V2 — elastic expert tier on MiniMax.** Unchanged, still an investigation that
+may be refuted.
+
+**V4 — graceful shutdown.** Folded into V0 per §11.1.
+
+**V5 — prefix budget at the new ceiling.** Subsumed by V0; the keep-one floor in
+§11.3 is the same defect seen from the other end.
+
+**Not building** — the §7 table stands unchanged, and Rudra requested nothing on
+it.
+
+### 11.7 Proposed joint order
+
+Both sides now interlock, so sequence matters more than speed. One change per
+measured run, or neither side can attribute the result.
+
+| step | Vaayu | Rudra |
+|---|---|---|
+| 1 | **V0** — reproduce and fix the memory ceiling + hang | nothing that changes the window |
+| 2 | — | **R6** (`max_tokens`) and **R2** (summary cap): both are wiring that exists, both reduce load, neither changes the window |
+| 3 | **V3** — `cached_tokens` in `usage` | — |
+| 4 | — | **R1** — window from `/v1/models`. One run, one change. Gated on step 1 |
+| 5 | **V1** — verify the ceiling against §V1's acceptance criteria | — |
+| 6 | V2 if still warranted | **R5**, then **R3** — the big ones, with evidence from step 3 |
+
+Stopgaps considered and rejected today, recorded so nobody retries them:
+`PREFIX_SESSIONS = 3 -> 2` saves **zero** against the cap (§11.2's table: the sum
+is invariant) and moves the pool toward the measured over-capacity cliff, where
+reuse collapses to zero rather than degrading — at 7.4 k a turn-2 match fell
+7422/7517 to 44/7517 and TTFT went 25.0 s to 51.3 s (row 31). Raising `MemoryMax`
+is not available either: 28 GiB of 31 GB total already leaves ~1 GB for the
+desktop.
+
+### 11.8 New questions for Rudra
+
+**Q9. Can R1 be held until Vaayu confirms V0?** This is the one thing Vaayu is
+asking for. If Rudra's window must move sooner for an unrelated reason, say so
+and Vaayu will re-plan around it rather than be surprised by it.
+
+**Q10. Timestamps.** Please send the wall-clock times of the two `502
+ProviderUnavailable` mid-stream failures, the `StreamChunkTimeout` at 721 s, and
+the two 600 s `APITimeoutError`s. Vaayu's confirmed events, all 2026-11-24 UTC:
+OOM kills at **06:39:43** and **08:13:35**; orphaned requests going quiet at
+**06:37:29**, **07:29:01** and **09:03:46**; Vaayu-side maintenance restarts
+between **10:21** and **10:46**. Matching those two lists would turn the
+reconciliation in §11.1 from "consistent with" into "the same event".
+
+**Q11. What is Rudra's stream-chunk timeout, in seconds?** Two compaction
+requests had wire silences of 16.96 s and 17.66 s against Vaayu's 10 s keepalive.
+If the threshold is near that, Vaayu's heartbeat cadence defect is already
+costing Rudra runs and should be pulled forward.
+
+**Q12. R2 or R3 — which is Rudra actually going to do?** Vaayu's own ordering
+depends on it: if R3 is coming, R2 is interim and Vaayu will not build anything
+that assumes a model-generated summary exists.
+
+**Q13. Does `langchain_openai` surface `usage.prompt_tokens_details.cached_tokens`
+in Rudra's version today**, as `usage_metadata.input_token_details.cache_read`? If
+yes, V3 costs Rudra nothing. If no, Vaayu will still ship the standard field, but
+Rudra needs a parse and should know now.
+
+### 11.9 Rudra's second reply — write here
+
+> **Date:**
+> **Answered by:**
+
+**Q9 — hold R1?**
+
+**Q10 — timestamps:**
+
+**Q11 — stream-chunk timeout:**
+
+**Q12 — R2 or R3:**
+
+**Q13 — `cached_tokens` support:**
+
+**Anything in §11 Rudra disputes:**

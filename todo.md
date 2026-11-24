@@ -79,12 +79,80 @@ running. Boot/kill a background server with the Bash tool; `pkill -9 -f "python 
 
 # OPEN
 
+## [bug] HOST-RAM-CEILING — **Vaayu was cgroup-OOM-killed TWICE on 2026-11-24, mid-run, and the two pinned host caches are sized to land ~1.5 GB short of the SIGKILL cap.** This is V0: nothing else builds first
+
+**Evidence (journal, this box).** `Nov 24 12:09:43 IST` and `13:43:35 IST`: `Main process exited,
+code=killed, status=9/KILL` + `Failed with result 'oom-kill'`, `28.0G memory peak, 2.5G swap peak`
+against `MemoryMax=28G` (`memory.max` = 30,064,771,072 B). Each kill is the birth of the next run
+folder: 06:39:43 UTC -> `run-2026-11-24T06-39-53Z`, 08:13:35 UTC -> `run-2026-11-24T08-13-45Z`.
+A deliberate SIGKILL reports `result 'signal'`, so the journal separates Vaayu-side maintenance
+from these.
+
+**Every run ends with one request that started and never completed** (POSTs in `server.log` vs rows
+in `requests.jsonl`): 03-22 **45/44**, 06-39 **29/28**, 08-13 **27/26**. 03-22's orphan
+(`ff20cbb4bfa5-clarify`) was still printing token summaries at 06:37:29 and was killed at 06:39:43.
+**So `requests.jsonl` cannot evidence stability: it records only COMPLETED requests.** The
+"42/42, zero errors, no crash" claim in the Rudra handoff was survivorship bias, now corrected there.
+
+**What fills the cap (measured warm, `memory.stat`):** `anon` 2.73 GB, **`shmem` 21.30 GB**
+(`file_mapped` 21.35, the same pages), `slab` 0.05, `memory.current` 24.21 GB of 30.06 GB.
+**88 % is pinned, unreclaimable** — the expert RAM arena plus the prefix pool. Steady-state promise
+on the run that died: arena 9.1 + pool 12.9 + anon 2.7 + the flat 3.5 GiB
+`_PREFIX_CACHE_RAM_RESERVE` = **28.5 GB against 30.06 GB**, i.e. ~1.5 GB for everything unbudgeted
+(CUDA host allocs, io_uring buffer pool, request staging, tokenizer, logging).
+
+**THE TOTAL IS INVARIANT TO EVERY KNOB.** Five boots, 2026-11-24: sdpa@8192 16.16+6.21=**22.37**;
+flash@8192 16.23+6.19=**22.42**; sdpa@16384 9.92+12.47=**22.39**; flash@16384 9.99+12.21=**22.20**;
+flash@32768 9.12+13.09=**22.21** (expert arena GB + prefix pool GB). `max_seq_len` and
+`PREFIX_SESSIONS` only move the SPLIT — config.py says it outright ("only the product
+`sessions x max_seq_len` is visible downstream"). **So no config change can fix this; only code can.**
+
+**Two defects behind it:**
+- `vaayu_base.py:3667` — `prefix_budget = effective_available_bytes() - 3.5 GiB`, i.e. all remaining
+  RAM minus a flat constant. The same codebase already learned this for the I/O-mode decision
+  (`safetensor_model_persister.py:303` subtracts the arena explicitly, with the 2026-10-04 regression
+  in its comment). The prefix budget never got that treatment.
+- **No feedback anywhere.** All four `effective_available_bytes()` call sites run at LOAD time
+  (`vaayu_base.py:2996,3065,3196,3667`, `safetensor_model_persister.py:303`); nothing re-reads memory
+  during a run. systemd hands the process `MEMORY_PRESSURE_WATCH` + `MEMORY_PRESSURE_WRITE` (PSI) and
+  **Vaayu opens neither**. `memory.high` is `max` (dropped 2026-11-19: throttling starved the event
+  loop), so there is nothing between "fine" and SIGKILL.
+
+**Coupling that gates Rudra (in the handoff as §11.3).** The pool keeps one entry regardless of budget
+(`while current_bytes > budget and len(pool) > 1`), so its floor is ONE full-length entry: 3.3 GiB at a
+13,926-token chain (Rudra's 16 k window x 0.85) but **6.6 GiB at 27,853** (after Rudra reads the new
+32,768 ceiling). That doubles the floor into the 1.5 GB margin. **The live flash+32768 pin is safe only
+while Rudra's own window stays 16 k** — Vaayu's ceiling does not lengthen chains, Rudra's trigger does.
+
+**Tasks**
+- [ ] **Step 0 is a REPRO, not a fix** (systematic-debugging Phase 1): boot, drive concurrent sessions to
+      full-length chains, log `memory.current` / `anon` / `shmem` against the cap every second until it
+      kills or plateaus. -> verify: the pool is shown to reach its budget (or something else overshoots),
+      AND whether PSI rises at all before death — that premise decides task 2's option B.
+- [ ] Then ONE of: (A) budget the pool against the CAP minus arena minus a derived reserve — static,
+      provable, costs pool capacity; (B) open systemd's pressure FD and shed the pool — dynamic, but
+      pinned memory may never raise PSI in time; (C) make pooled entries reclaimable so the failure mode
+      is slowdown, not death. **Recommended: step 0, then A, then re-ask whether B is needed.**
+- [ ] The hang travels with this row — see [bug] SIGNAL-STOP-IGNORED, which is the SAME bug seen from
+      the shutdown end.
+
+**Stop rules.** `PREFIX_SESSIONS 3 -> 2` is REFUTED as a stopgap: zero saving (table above) and it moves
+the pool toward the measured over-capacity cliff where reuse collapses to ZERO rather than degrading —
+at 7.4 k a turn-2 match fell 7422/7517 -> 44/7517, TTFT 25.0 -> 51.3 s (row 31). Raising `MemoryMax` is
+unavailable: 28 GiB of 31 GB total already leaves ~1 GB for the desktop.
+
 ## [~] RUDRA-CTX-COMPACTION — a 78-min Rudra stress run on MiniMax-M2.7 spends **19 % of its wall clock on context compaction forced by `MAX_SEQ_LEN=16384`**. The ceiling can DOUBLE: flash's `S_max` is 32768 (measured on device 2026-11-24) at sdpa-16384's budget profile
 
 **Handoff to Rudra:** `HANDOFF-RUDRA-CONTEXT-2026-11-24.md` (repo root, at the user's explicit request —
 self-contained: both cost laws, the 1125 s decomposition, the 7 ranked Rudra asks with prices, Vaayu's own
 build list V1-V5, the NOT-building table, 8 questions and a reply section Rudra fills in and sends back).
-**Nothing starts building until that reply lands.**
+**Rudra REPLIED (§9/§10) and Vaayu answered (§11, written 2026-11-24).** Vaayu's §11 carries three
+corrections (the two OOM kills, the one orphaned request per run, and "42/42 no crash" as survivorship
+bias), the refutation of Rudra's `stream: false` theory for the compaction calls (all three streamed:
+324/328/326 chunks — but max silence 16.96 / 17.66 s against a 10 s keepalive), the `cached_tokens`
+decision, and the request that **Rudra HOLD R1 until HOST-RAM-CEILING is fixed**. **Nothing builds until
+Rudra answers §11.8 (Q9-Q13).** Build order now: V0 (memory) -> R6+R2 (Rudra wiring) -> V3
+(`cached_tokens`) -> R1 -> V1 (verify ceiling) -> R5/R3.
 
 **Evidence:** `logs/run-2026-11-24T03-22-54Z` (42 requests, snapshot kept at
 `/tmp/.../snap`). Rudra ran off-box (`client.forwarded: true`), so only Vaayu's own telemetry was
@@ -201,7 +269,14 @@ instead of the whole 7.5-11.8 k history) saves ~627 s; both together leave ~166 
 **Stop rule:** do not re-open the MiniMax expert VRAM tier (SETTLED 2026-10-16, reconfirmed by ATTN-AB from
 the opposite direction). This row is about CONTEXT, not about the tier.
 
-## [bug] SIGNAL-STOP-IGNORED — an IDLE server survived both SIGINT and SIGTERM; found 2026-11-24 while cycling boots for RUDRA-CTX-COMPACTION
+## [bug] SIGNAL-STOP-IGNORED — a server survived both SIGINT and SIGTERM; found 2026-11-24 while cycling boots for RUDRA-CTX-COMPACTION. **PREMISE CORRECTED: it was NOT idle**
+
+**CORRECTION 2026-11-24, same day.** This row was filed as "an IDLE server ignored signals". It was not
+idle: `run-2026-11-24T08-13-45Z` logged 27 POSTs against 26 completed rows, and its orphan request went
+quiet at 09:03:46 — so the process had been 77 minutes inside a request that had stopped producing
+tokens, burning 59 % CPU, when the signals were sent. **The hang and the ignored signal are ONE bug**:
+the Python-level handler cannot run because the engine is stuck in the native call. Tracked with
+[bug] HOST-RAM-CEILING, and it is the likely cause of Rudra's `StreamChunkTimeout` reports (721 s).
 
 **What happened.** Server loaded, 69 min idle (last token 09:03:46Z, no request in flight), pid 190431.
 `kill -INT` -> nothing: no log line, pid unchanged 180 s later. `kill -TERM` -> nothing: still alive 30 s
