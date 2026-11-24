@@ -79,6 +79,159 @@ running. Boot/kill a background server with the Bash tool; `pkill -9 -f "python 
 
 # OPEN
 
+## [~] RUDRA-CTX-COMPACTION — a 78-min Rudra stress run on MiniMax-M2.7 spends **19 % of its wall clock on context compaction forced by `MAX_SEQ_LEN=16384`**. The ceiling can DOUBLE: flash's `S_max` is 32768 (measured on device 2026-11-24) at sdpa-16384's budget profile
+
+**Handoff to Rudra:** `HANDOFF-RUDRA-CONTEXT-2026-11-24.md` (repo root, at the user's explicit request —
+self-contained: both cost laws, the 1125 s decomposition, the 7 ranked Rudra asks with prices, Vaayu's own
+build list V1-V5, the NOT-building table, 8 questions and a reply section Rudra fills in and sends back).
+**Nothing starts building until that reply lands.**
+
+**Evidence:** `logs/run-2026-11-24T03-22-54Z` (42 requests, snapshot kept at
+`/tmp/.../snap`). Rudra ran off-box (`client.forwarded: true`), so only Vaayu's own telemetry was
+available — no prompt text, by design (`logs-are-a-support-artifact`).
+
+**What the run actually costs (non-overlapping, 4690 s span, server 97 % busy, strictly serial, N=1):**
+
+| block | s | share |
+|---|---|---|
+| decode, normal turns (0.504 s/token) | 2220 | 47 % |
+| decode, 3 compaction summaries (~600 tok each) | 885 | 19 % |
+| prefill, new-position compute (6.70 ms/position) | 763 | 16 % |
+| prefill, fixed per request (16.4 s x 41) | 672 | 14 % |
+| idle (Rudra think/tool time) | 150 | 3 % |
+
+**Two cost laws, both fitted on this run (rms 2.1 s over 41 requests):**
+- `TTFT = 12.8 s (per-request expert disk read) + 3.6 s (first chunk's 256-expert visit) + 6.70 ms x new_positions`
+- `decode = 0.504 s/token` flat (exp_disk 0.270 + compute 0.200), `gb_tok` 2.62 of a 4.40 GB working set,
+  expert cache 25 % RAM / 29 % VRAM. **At the floor** — consistent with `minimax-vram-tier-refuted` (2026-10-16)
+  and ATTN-AB (flash's 2.4x bigger tier moved `gb_tok` 0.08 %).
+
+**`prefill_chunk_size` is NOT a lever — checked and discarded.** 88 new positions cost the same 3.6 s as a
+full 512 chunk, which looks per-chunk, but 23 chunks cost 81.6 s not 23 x 3.6 + tokens: the per-chunk floor is
+paid ONCE because module-list chunk retention already works (row 45). Only the 3.6 s is chunk-count-bound.
+
+**The compaction block.** 3 requests, ptok 11750 / 10123 / 7465, `prefix_match_tokens = 7`, `finish = stop`,
+out 555 / 595 / 595, wall 372 / 385 / 368 s = **1125 s**. Each is preceded by a chain that had grown to
+14340 / 12818 / 10172 tokens against `cap = max_seq_len - prompt_tokens`, and followed by a shorter chain that
+also matches 7 — the summarize-then-restart signature. Inferred from shape, not from text.
+With the 7 other full-miss requests the full-miss block is **39 % of busy time**; 42 % of all prompt positions
+sent (113911 of 269083) were re-prefilled.
+
+**The lever this row exists for — and ATTN-AB already named it.** That row closed `sdpa` as 2.2 % FASTER than
+`flash_attention_2` on decode, measured `reserve_gib` 8.77 vs 4.69 (−4.08 GiB), and said: *"Flash's real
+advantage is the LARGER DERIVED CONTEXT at the same reserve, which this probe deliberately did not measure
+(`MAX_SEQ_LEN` pinned). If that pin is ever removed, re-open the choice."* **This run is that case.** The
+4.08 GiB sdpa charges as score buffer (48 heads x 512 chunk x 16384 keys x 10.9 B/elem = 4.09 GiB, which is
+most of the 8.77 GiB reserve's 4.89 GiB non-KV half) is worth ~17250 tokens of KV at the measured
+248 KiB/token. Raising `MAX_SEQ_LEN` on `sdpa` cannot be paid for: `pinning_budget` is 4.04 GiB against a
+`protected pin demand` of 3.26 GiB, so +2.18 GiB of KV (16384 -> 25599) would push non-expert weights back
+onto the stream.
+
+**MEASURED ON DEVICE 2026-11-24 — five boots, both kernels.** A boot costs ~30 s (experts stream on
+demand, so the plan line lands 15 s in), so this is cheap to redo. `config_local.py` was restored
+byte-identical afterwards (md5 9492216337655e0781ce2a110369fd38).
+
+| arm | kernel | `MAX_SEQ_LEN` | got | `S_max` | reserve GiB | pinning GiB | expert RAM GB | expert VRAM GB | MoE cache | prefix GB |
+|---|---|---|---|---|---|---|---|---|---|---|
+| run 08-13 | sdpa | 16384 | 16384 | 26111 | 8.77 (KV 3.88) | 4.15 | 9.92 | 3.21 | 45/62 | 12.47 |
+| A | sdpa | unset | **8192** | 26620 | 4.79 (KV 1.94) | 8.22 | 16.16 | 7.56 | all 62 | 6.21 |
+| B | flash | unset | **8192** | **32768** | 3.50 (KV 1.94) | 9.52 | 16.23 | 8.95 | all 62 | 6.19 |
+| C | flash | 16384 | 16384 | 32768 | 4.69 (KV 3.88) | 8.33 | 9.99 | 7.69 | all 62 | 12.21 |
+| D | flash | 32768 | 32768 | 32768 | 8.56 (KV 7.75) | **4.45** | 9.12 | 3.53 | 49/62 | 13.09 |
+| E | sdpa | 26620 | **REFUSED** (`VramPlanError`, exit 3) | — | — | — | — | — | — | — |
+
+- **flash's ceiling is 32768; sdpa's is ~26.1-26.6 k.** Neither is the model's limit — `position_limit` is
+  `max_position_embeddings` = 196608, so both come out of `solve_max_seq_len`, i.e. both are VRAM-bound.
+  flash's lands exactly on a 512-token chunk boundary (64 x 512) and did not move across three boots;
+  sdpa's lands mid-period and DRIFTS with free VRAM — arm E pinned the 26620 arm A had just derived and
+  the next boot refused it. That refusal exits 3, and `RestartPreventExitStatus=3` in `vaayu.service`
+  leaves the unit `failed` with no auto-restart: **a too-large `MAX_SEQ_LEN` takes the box down until a
+  human runs `systemctl start`.** Pin a chunk boundary, not an `S_max` read off an earlier boot.
+- **flash at 32768 costs what sdpa costs at 16384** (arm D vs the 08-13 run): pinning 4.45 vs 4.15 GiB —
+  both clear the 3.26 GiB protected floor — expert VRAM 3.53 vs 3.21 GB, 49/62 vs 45/62 layers cached.
+  **2x the context ceiling for flash's measured +2.2 % decode and nothing else.**
+- **CORRECTION, this paragraph used to say "on `sdpa` the context cannot be raised AT ALL". That was
+  wrong.** The planner does not stop at the 0.78 GiB of slack over the protected floor: it pays the larger
+  score buffer and KV out of the expert VRAM tier, which sits ABOVE that floor. sdpa validates to ~26.1 k.
+  The real sdpa penalty is the smaller, drifting ceiling plus less budget at any shared context — arm C vs
+  the 08-13 run, same 16384: reserve 4.69 vs 8.77 GiB, pinning 8.33 vs 4.15, expert VRAM 7.69 vs 3.21 GB
+  with no partial-caching restriction at all. (That bigger tier is NOT a speed claim — ATTN-AB measured it
+  moving `gb_tok` 0.08 %, and `minimax-vram-tier-refuted` settled it.)
+- **NEW RISK at 32768, absent at 16384:** one full-length prefix entry is 32768 x 248 KiB = 7.75 GiB, so the
+  13.09 GB prefix budget holds ~1.7 of them where 12.47 GB held ~3.2 at 16384. With `PREFIX_SESSIONS=3` the
+  pool can now go over capacity and evict — which the 03-22 run was proved NOT to be doing (no capacity
+  warning). Watch `[Vaayu-Prefix] WARNING: prefix pool over capacity`; compress-on-evict (Plan I, 9-bit) is
+  the existing mitigation and needs >= 2 sessions over budget to engage.
+
+**Ownership split — neither side alone clears the block (1125 s).** Vaayu owns the CEILING: a prompt over
+`max_seq_len` is `ContextTooLong` -> 400 (`server/stopping.py:29`), so Rudra cannot opt out of compacting.
+Rudra owns the APPROACH to the ceiling and the PRICE of each compaction; at any ceiling, chains still grow
+(~1806 tokens/turn here) and compaction still fires. Estimated on this run: Vaayu alone (3 compactions -> 1)
+saves ~750 s; Rudra alone (summary output capped ~250 tok instead of 555-595, and summarising a WINDOW
+instead of the whole 7.5-11.8 k history) saves ~627 s; both together leave ~166 s, i.e. **~959 s of 1125 s
+(85 %)**. They are not additive — each shrinks what the other can still save.
+
+**Tasks**
+- [x] **DONE 2026-11-24** — plan line read on both kernels, `MAX_SEQ_LEN` unset and pinned (table above).
+      flash loads on MiniMax (`✅ Attention implementation: flash_attention_2`, 0.00 B/score-element);
+      its `S_max` is **32768** against sdpa's 26111-26620. Note the UNSET derivation is 8192 on BOTH
+      kernels — `plan_vram` derives "largest context whose predicted peak fits the reserve FLOOR", so
+      unsetting `MAX_SEQ_LEN` HALVES today's context. The ceiling must be pinned, not derived.
+- [~] **PIN IS LIVE 2026-11-24** — `config_local.py` now `ATTN_IMPLEMENTATION = "flash_attention_2"` +
+      `MAX_SEQ_LEN = 32768` (the kernel is NAMED, not `None`: a silent fall back to sdpa would pair this pin
+      with sdpa's 26620 and exit 3). Boot `logs/run-2026-11-24T10-45-20Z`: flash active, 0.00 B/score-element,
+      `max_seq_len=32768` validated against `S_max=32768`, reserve 8.56 GiB (KV 7.75), **pinning 4.12 GiB**
+      over the 3.26 GiB protected floor, expert VRAM 3.2 GB restricted to 44/62 layers (the old sdpa-16384
+      run: 3.21 GB, 45/62 — so the tier is UNCHANGED and none of flash's freed VRAM went to it), prefix
+      12.92 GB, loaded in 18.0 s. `/v1/models` advertises `max_seq_len: 32768`. **The re-run is what is left.**
+      Pin margin: this boot solved 32768 with pinning 4.12 vs arm D's 4.45 GiB at 12.71-12.72 GiB free VRAM,
+      so the headroom really is under one 512-token chunk — see the config comment.
+- [ ] Re-run the same
+      Rudra scenario. At 32768 the three chains that compacted (14340 / 12818 / 10172 prompt tokens plus
+      ~600 out) never reach the cap, so the prediction is the WHOLE 1125 s block goes, not two thirds:
+      −1125 s + 68 s of flash decode tax (6159 tokens x 2.2 % x 0.504 s) = **−1057 s of 4690 s, −22 %
+      wall clock.** -> verify: zero requests with `prefix_match_tokens <= 10` and `finish=stop` and
+      `tokens > 400`; no prefix-pool-over-capacity warning; decode within +3 % of 0.504 s/token.
+- [ ] **Blocker on the Rudra side, and it is the whole ownership point:** Vaayu raising the ceiling changes
+      nothing unless Rudra's own compaction trigger follows it. Vaayu already advertises `max_seq_len` on
+      `/health` and `/v1/models` (`server/app.py:670,723`) and Rudra queried `/v1/models` 3x in the 03-22
+      run — so confirm Rudra reads that field rather than a hardcoded 16 k before crediting this row with
+      the −22 %.
+
+**Stop rule:** do not re-open the MiniMax expert VRAM tier (SETTLED 2026-10-16, reconfirmed by ATTN-AB from
+the opposite direction). This row is about CONTEXT, not about the tier.
+
+## [bug] SIGNAL-STOP-IGNORED — an IDLE server survived both SIGINT and SIGTERM; found 2026-11-24 while cycling boots for RUDRA-CTX-COMPACTION
+
+**What happened.** Server loaded, 69 min idle (last token 09:03:46Z, no request in flight), pid 190431.
+`kill -INT` -> nothing: no log line, pid unchanged 180 s later. `kill -TERM` -> nothing: still alive 30 s
+later, no `Shutting down` from uvicorn, nothing new in `server.log` or the journal. `SIGKILL` was the only
+thing that worked. Main thread was `R` at 59 % CPU the whole time (the 17 other threads `S`).
+
+**Why it matters.** `vaayu.service` sets `KillSignal=SIGINT` and `TimeoutStopSec=120`, so a `systemctl
+stop` or `restart` on this box waits the full 120 s and then SIGKILLs — the graceful path
+(`_install_signal_cancel` -> uvicorn's handler -> lifespan `_teardown`, `server/app.py:274`) does not run,
+so the last KV appends are never flushed and `engine.cancel_all()` never fires.
+
+**Hypothesis, NOT yet proved:** a Python-level signal handler only runs between bytecodes, so a native
+call that holds the GIL (the main thread was burning CPU with nothing to serve) defers it indefinitely.
+Same family as the GIL floor already recorded on `/health` (SSE-PREFILL-HEARTBEAT 2a, deferred).
+
+**Next step:** reproduce on an idle load (any model), then `py-spy dump` is NOT available here
+(`io_uring_cqe_overflow_bug`: ptrace profilers corrupt the ring) — use `faulthandler.dump_traceback_later`
+or a SIGQUIT-free in-process watchdog thread to name the native call that is spinning.
+
+## [bug] RUDRA-RUN-TELEMETRY — two small holes found while reading `run-2026-11-24T03-22-54Z`; neither affects serving
+
+- [ ] A non-streaming request (`stream: false`, `wire: null`) logs **`ttft_s: null`** — the one such row in
+      the run (session `db232c9cc989`, ptok 352, 140 tokens, wall 87.9 s, `finish stop`, no error) carries no
+      TTFT at all, so it drops out of every prefill fit. Streaming rows are fine.
+      -> verify: a `stream:false` request's `requests.jsonl` row has a real `ttft_s`.
+- [ ] Rudra still has at least one **non-streaming** call path (the row above). `rudra-perceived-death-stream-false`
+      says that was to be fixed Rudra-side; it is not fixed on every path. Vaayu side: nothing to do but
+      record it — a `stream:false` request is wire-silent for its whole wall time by construction
+      (87.9 s here), and heartbeats cannot help it. Hand back to Rudra.
+
 ## [bug] HARD-HANG 2026-11-08 — box hung mid Rudra run E; ROOT CAUSE = KERNEL blk-mq bug (CVE-2026-64017), NOT Vaayu. Fixed kernel already on disk, GRUB pinned to the broken one
 
 **Two self-contained documents carry this work:** diagnosis + the kernel-upgrade path is
