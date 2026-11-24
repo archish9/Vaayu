@@ -332,27 +332,318 @@ the next run, this gets built; if not, it stays unbuilt. **Watch for it.**
 
 ---
 
-## 9. Rudra's reply — write here and send back
+## 9. Rudra's reply
 
-> **Date:**
-> **Answered by:**
+> **Date:** 2026-11-24
+> **Answered by:** Rudra side (agent). Every answer carries `file:line` from
+> Rudra's tree at `main` d5c7e61 plus the unmerged branch where noted.
+> **Status of this reply: ANSWERS ARE FACT, THE MENU IN §10 IS NOT A COMMITMENT.**
+> Rudra's owner has not greenlit any build yet. §10 is priced so Vaayu can say
+> which items it wants before anyone writes code.
 
-**Q1 — ceiling source:**
+**Q1 — ceiling source:** **A constant. `max_seq_len` appears nowhere in Rudra's
+source** (verified by grep across `src/`). The window is
+`[model.<role>] context_tokens`, a TOML key in the project's
+`.rudra/config.toml` (layer 3 of five), read at `llm/factory.py:116-128`.
 
-**Q2 — compaction trigger:**
+The sharp part: **Rudra already fetches the exact JSON that carries your
+number.** `llm/batching.py:27-49` does `GET /v1/models` at startup and reads
+only `data[0].batching.recommended_client_concurrency`. `max_seq_len` is a
+sibling key in that same response, and is discarded. Gated on
+`entry.reads_batching_hint`, which is `True` for the `vaayu` provider
+(`llm/providers.py:189-191`).
 
-**Q3 — summary output cap:**
+Two consequences you could not see:
+- The 42-request run almost certainly had `context_tokens = 16384` written by
+  hand in the test project's config. Our own A/B projects today did exactly that.
+- **`rudra init` ships `context_tokens` COMMENTED OUT** (`context/budget.py:158`).
+  When it is absent, `factory.py:116`'s comment is explicit: deepagents keeps a
+  **fixed 170 k trigger**. So a user who never sets the key would sail past
+  `max_seq_len` and take your HTTP 400 — compaction would never fire at all.
+  Reading the advertised ceiling fixes a latent 400-bug, not just the -22 %.
 
-**Q4 — append-to-chain instead of new prompt:**
+**Q2 — compaction trigger:** **A fraction of the window: 0.85.**
+`llm/factory.py:116-128` copies `context_tokens` into
+`model.profile["max_input_tokens"]`, and the comment there records that
+deepagents' `compute_summarization_defaults` switches from its fixed 170 k
+trigger to `("fraction", 0.85)` **only when that key is an int**.
 
-**Q5 — `max_tokens`:**
+`0.85 x 16384 = 13,926`. That is your §V1 discriminator ("near 13.9 k") derived
+from Rudra's source, and it is why the chains peaked at 14,340 / 12,818 /
+10,172. Your inference was correct to the token.
 
-**Q6 — mutable blocks:**
+What is kept after a summarization is a separate knob: deepagents defaults
+`keep=("messages", 20)` / `("fraction", 0.10)`
+(`deepagents/middleware/summarization.py:35,270,281`).
 
-**Q7 — non-streaming paths:**
+**Q3 — summary output cap:** **Nothing caps it today. There is no `max_tokens`
+on that call at all**, which is why you measured 555 / 595 / 595. Proof —
+`langchain/agents/middleware/summarization.py:816-819`:
+
+```python
+response = self.model.invoke(
+    self.summary_prompt.format(messages=formatted_messages).rstrip(),
+    config={"metadata": {"lc_source": "summarization"}},
+)
+```
+
+(async twin at `:842`.) The length is whatever the model decides to stop at.
+Capping it is mechanically easy on Rudra's side — hand that middleware a model
+bound with an output cap rather than the bare role model — see §10 R2.
+
+**Q4 — append-to-chain instead of new prompt:** **Your diagnosis is exactly
+right, and the same three lines above are the cause.** The call passes a **bare
+string**, not the message chain. So the prompt's head is the summary
+instruction template, never the conversation's system prompt — hence
+`prefix_match = 7`.
+
+**One mechanism you could not see from outside, and it makes item 3 worth more
+than the 197 s you priced.** That call reuses the *same model instance*, so it
+carries the **same `session_id`** Rudra set at `llm/factory.py` (`extra_body`,
+gated on `accepts_session_id`, `llm/providers.py:192`). Your prefix cache is
+keyed on `session_id`. So the summarize request **overwrites that session's
+cached prefix with a completely different head** — which is why, as you
+observed, *"immediately followed by a much shorter chain that also matches only
+7 tokens."* The following real request is not merely a new shape; it is paying
+for a cache the summarize call evicted.
+
+So item 3 saves the 197 s **plus the next request's full re-prefill.** On the
+measured run that second part is unpriced but of the same order.
+
+Whether Rudra can append instead: not by configuration — it needs Rudra to own
+the summarization step rather than inherit it (§10 R2/R3). Noted honestly: this
+is upstream behaviour in `langchain`/`deepagents`, not a Rudra line we can edit.
+
+**Q5 — `max_tokens`:** **Rudra sends none today, and the plumbing already
+exists unused.** `ModelConfig.max_output_tokens` is declared
+(`config/schema.py:84`) and defaults to `None` (`:328`), and every provider
+entry already declares the wire name — `max_output_kwarg="max_tokens"` for
+`vaayu` (`llm/providers.py:194`). So this is wiring a default, not new
+machinery.
+
+Values Rudra would pick per request class, if it sends them (not a commitment —
+these are the numbers we would propose, and we would rather you sanity-check
+them against admission before we hardcode anything):
+
+| request class | proposed `max_tokens` | why |
+|---|---|---|
+| planner (clarify / architect / breakdown) | 1,500 | longest real outputs; plan prose |
+| coder | 2,000 | writes file bodies into tool args |
+| tester | 1,500 | test bodies |
+| reviewer | 800 | advisory prose, gates nothing |
+| compaction summary | 250 | your item 2 |
+| `probe_role` (`models test`) | 16 | replies the single word `ok` |
+
+**Q6 — mutable blocks: still in the head. NOT already fixed.** This is the one
+place your document is optimistic. `subagents/build.py:148-178` assembles the
+**system prompt** in this order:
+
+1. `spec.system_prompt` — static per role
+2. `facts_block(...)` — **mutable**, grows as the run records facts
+3. `## PROJECT FILES` tree — **mutable**, and the comment at `:158-161` states
+   it is *"deliberately NOT cached across invocations"* because these agents
+   write the files they are shown, so a stale listing is a correctness bug
+4. recalled memories — **mutable**
+5. the MCP catalog
+
+Items 2-5 are all in the head, and all four are blocks **Rudra itself
+controls**, which is what makes §10 R5 tractable.
+
+Why your live run looked clean (3,249/4,631 then 4,627/4,839): within one agent
+invocation the system prompt is fixed, so turn-to-turn inside an invocation
+hits. The miss lands at every **new** invocation — a fresh coder/tester dispatch
+— because facts and the tree have changed since the last one. Your partial-miss
+ladder (196 / 426 / 428 / 973 / 2,284 / 2,363) is the static `spec.system_prompt`
+matching and then block 2 or 3 breaking it, which is exactly your reading.
+
+**Q7 — non-streaming paths: yes, and there are more than the one you found.**
+The run loop itself streams — `permissions/approval.py:329` wraps
+`agent.astream(..., stream_mode=mode, subgraphs=True)`. Outside it:
+
+1. `llm/probe.py:144` and `:166` — `model.invoke` and
+   `model.bind_tools([echo]).invoke`. These are `rudra models test` / `rudra
+   doctor`, i.e. diagnostics, not part of a run. A tool-schema'd probe is a
+   plausible fit for your 352-prompt/140-output/87.9 s request.
+2. The AGENTS.md architecture summariser, `loop/engine.py:1652+` — documented in
+   Rudra's own CLAUDE.md as one of two calls made outside any graph. Runs at the
+   **end of every run**.
+3. **The compaction summary call itself** —
+   `langchain/agents/middleware/summarization.py:816` (`.invoke`) and `:842`
+   (`.ainvoke`), quoted under Q3. `langchain_openai` only streams an `.invoke`
+   when `streaming=True` is set on the model, and **Rudra does not set it**.
+
+**Please check item 3 against your own logs:** did the three compaction requests
+(11,750/555, 10,123/595, 7,465/595) carry `stream: false`? If they did, those
+are **368-385 s of total wire silence each** — not the 88 s of your item 6 — and
+they are a far better candidate for the "Vaayu keeps dying" reports of
+2026-11-18 than anything found so far. We cannot see your request flags; you
+cannot see that these were summarization calls. This is the one question only
+the two halves together can answer.
 
 **Q8 — what Rudra needs from Vaayu:**
 
+1. **Not a token-count endpoint.** Priced in your own law a round-trip is
+   `12.8 + 3.6 = 16.4 s` of fixed cost before a single position, so Rudra cannot
+   afford to ask before each compaction decision. Keep the estimate local.
+2. **Keep `max_seq_len` on `/v1/models` and `/health`** — done, and it is the
+   one thing Rudra will read. No new surface needed for item 1.
+3. **The ask that would actually change Rudra's behaviour: put `prefix_match`
+   and `new_positions` in the response `usage` block.** Rudra already receives
+   streamed usage (`stream_usage=True`, `llm/providers.py:202`). With those two
+   numbers Rudra could log its own cache behaviour per call into
+   `.rudra/run/logs/` and **detect head-invalidation from its own evidence**,
+   without anyone reading Vaayu's logs. Rudra's §8a rule is that a diagnostic
+   number which only exists on another machine does not exist; today the
+   prefix-cache story is exactly that number. This is the difference between
+   Rudra guessing and Rudra measuring.
+4. **Optional, lower value:** advertise a recommended `max_tokens` ceiling, or
+   the admission cost of an uncapped request, so Rudra can pick Q5's values
+   against your admission arithmetic instead of our guesswork.
+
 **Anything Rudra found that this document gets wrong:**
 
+1. **Item 5 is not already fixed** — see Q6. `subagents/build.py:148-178`.
+2. **The "130-200 s/token" figure is ours and it was wrong; thank you for
+   killing it.** It came from Rudra's own ledger (`TODO.md` OPEN-183, sourced
+   from `2026-11-22-vaayu-rudra-slow-decode-handoff.md`), where one incident's
+   number got written down as a general rate. Rudra's own measurement today
+   agrees with you: on a completed run, planner 2,917 output tokens in 2,190 s
+   and coder 1,016 in 812 s — ~0.75-0.80 s/token *including* per-request fixed
+   cost, i.e. consistent with your 0.504 s/token decode plus 16.4 s/request.
+   The ledger entry has been corrected.
+3. **"Nothing about this run says Vaayu is unstable under load" — we have
+   counter-evidence from the same day, and we think your own §V4 explains it.**
+   Running a laya A/B across five Rudra runs on 2026-11-24 we saw: two runs
+   killed by `502 ProviderUnavailable` **mid-stream** during planning; one run
+   that hung ~90 min on a tester `StreamChunkTimeout` at 721 s followed by two
+   planner `APITimeoutError`s at the full 600 s; and `GET /v1/models` flipping
+   200 ↔ 502 within minutes.
+
+   We are **not** claiming your stress run is wrong — 42/42 clean is 42/42
+   clean. Our best reconciliation is **your own §V4**: if an idle server ignores
+   SIGINT and SIGTERM and `systemctl stop` waits its 120 s timeout then
+   hard-kills, every restart during today's `sdpa -> flash` rollout would drop
+   in-flight streams and serve 502s to whoever was mid-request. That matches the
+   shape of what we saw (mid-stream drops, not refused connections) and it means
+   **V4 is worth more to Rudra than its "small" billing suggests** — it is
+   plausibly the cause of a day's worth of apparent instability, and of
+   OPEN-184's `RemoteProtocolError` class on Rudra's side.
+
+   Checkable: compare your restart timestamps on 2026-11-24 against 502s served.
+4. **Minor:** Rudra does not display an "s/token" figure anywhere; `usage.json`
+   records `seconds` and `calls` per role, and `s/call`. The bad number was
+   hand-computed into a ledger entry, not emitted by Rudra.
+
 **Rudra's own plan, in the order it will do it:**
+
+**There is no committed plan yet — by the owner's explicit instruction.** What
+exists is the priced menu in §10, written in your cost law so you can rank it
+from the engine side before Rudra spends a line of code. The owner greenlights,
+then Rudra builds, then Rudra live-verifies on Vaayu (Rudra's standing rule is
+that nothing is done on unit tests alone).
+
+What Rudra will say about ordering, as a recommendation only: **R1 first** (it
+is the precondition for your entire -22 % and it is the smallest change), then
+**R6 + R2** (both are wiring that already exists), then the measurement item
+**R8/#3** if you build it, because everything after that wants evidence rather
+than argument. **R3 and R5 are the big ones and should not be started until
+there is a number proving the small ones landed.**
+
+---
+
+## 10. Menu: what Rudra could do, priced in Vaayu's cost law — NOT COMMITMENTS
+
+Every price below uses §2's laws (`16.4 s` fixed per request, `6.70 ms` per new
+position, `0.504 s` per generated token) against the measured 4,690 s run, so
+Vaayu can rank these without asking Rudra anything. **Nothing here is promised.**
+
+| id | change | priced saving on that run | Rudra-side cost | risk |
+|---|---|---|---|---|
+| **R1** | Read `max_seq_len` from `/v1/models` and derive the trigger from it | **~1,057 s (-22 %)** — your item 1, the whole conditional | Small. `batching.py:27-49` already fetches the JSON | Low, but see note |
+| **R2** | Cap the summary's output at ~250 tokens | **~507 s** — your item 2 | Small. Bind an output cap onto the model handed to the summarization middleware | Low. A 250-token summary may lose detail; `keep` already preserves the recent tail verbatim |
+| **R3** | **Replace the Vaayu-generated summary with a locally assembled state block** | **~885 s of decode, plus item 3's 197 s, plus the next request's re-prefill — the whole compaction block** | **Large.** Rudra must own the summarization step | Real. The honest one |
+| **R4** | Let **laya** (local decision model) make the compaction decisions | Removes whole round-trips: `16.4 s + 0.504 x output` each | Medium; mostly built, unmerged | Per-decision win only — see below |
+| **R5** | Move the four mutable blocks out of the system-prompt head into the final message | **239 s measured; up to ~763 s** (your 42 % / 113,911 re-prefilled positions) | Medium. One function, `build.py:148-178` | Real: moves instructions away from the content they govern |
+| **R6** | Send `max_tokens` on every request (Q5's table) | Protects your expert tier; bounds the 4-hour tail | Trivial. Plumbing exists unused | Low. A cap that is too low truncates real work |
+| **R7** | Close the non-streaming paths, incl. the summary call | Up to **3 x ~375 s of wire silence** if Q7/#3 is confirmed | Small-medium | Low |
+
+### Why R3 is the item Vaayu could not have asked for
+
+Your item 2 asks Rudra to make the summary *shorter*. Rudra may be able to stop
+asking for one **at all** — because the information a summary reconstructs is
+already written down locally, by machinery that exists and costs zero Vaayu
+tokens:
+
+| what a summary says | where Rudra already has it, free |
+|---|---|
+| what was decided, and why | `.rudra/facts.json` — `{key: {value, why, source}}`, written by the agent's own `record_fact` |
+| what work exists and its state | `.rudra/run/ledger.json` — tasks, status, attempts, `files_touched`, notes, halts |
+| what happened in earlier tasks | `.rudra/AGENTS.md` Session Log — one entry per completed task, `files_touched` from git |
+| the project's shape | `AGENTS.md` Architecture Notes |
+| anything semantically relevant | **MemPalace** recall block — local embeddings (ChromaDB/MiniLM), **no LLM call** |
+
+So the post-compaction context can be *assembled* from local state instead of
+*generated* by MiniMax at 0.504 s/token. In your currency: **1,745 output
+tokens x 0.504 = 885 s that simply stops being spent**, and because there is no
+separate summarize request, item 3's 197 s and the session-prefix poisoning
+described under Q4 both disappear with it.
+
+**The honest risks**, so this is not oversold:
+- Rudra's automatic summarization is **inherited from deepagents and fires
+  without passing through any Rudra middleware** (recorded in Rudra's own
+  `context/usage.py:622`). Owning it means replacing that middleware — the
+  largest change on this menu.
+- A hand-assembled block is structured state, not narrative. It will lose
+  conversational nuance a model summary keeps. Mitigation: deepagents already
+  keeps the recent tail verbatim (`keep=("messages", 20)` / `0.10`), so the
+  block replaces only the *old* turns.
+- It is unmeasured. The 885 s is arithmetic from your law, not a Rudra
+  measurement.
+
+### What laya is, and what it actually bought (R4)
+
+Vaayu has not been told about this. **laya is a small local decision model**
+(MLX sidecar, Apple Silicon; `laya_mlx` 0.8.1) that answers typed questions —
+"clarify or not", "which MCP tool", "which skills", "how to recover a blocked
+task" — **on Rudra's machine, with no Vaayu round-trip.** It lives on an
+unmerged branch (51 commits, `laya-decision-integration`) and is gated: below a
+confidence threshold it abstains and the question goes to Vaayu as it does
+today.
+
+Measured on Vaayu **today**, same binary, laya toggled, one real build task:
+
+| | tool calls on the MCP-retrieval dispatch | Vaayu round-trips for discovery |
+|---|---|---|
+| laya ON | 3 — `call_mcp_tool` **direct** | **0** |
+| laya OFF | 5 — `list_mcp_tools` + `describe_mcp_tool` + `call` | **2** |
+
+laya pre-picked the right tool at confidence 0.419 and the coder skipped
+discovery: **2 Vaayu round-trips removed, ~75 s on that dispatch.** Priced in
+your law each avoided round-trip is `16.4 s + 6.70 ms x new_positions +
+0.504 s x output_tokens`.
+
+**The honest caveat, because it matters for how much Vaayu should bet on this:**
+at whole-run level that win did **not** show up. Totals were 34 turns / 4,372 s
+with laya on against 27 turns / 2,776 s with it off — because planner
+nondeterminism (21 vs 15 calls) and one gate retry where laya abstained swamped
+a 2-turn saving at n=1. **laya's effect is real per decision and currently
+invisible per run.** Treat it as a mechanism for removing round-trips, not as a
+proven speedup.
+
+### A note on R1 that Vaayu should know before asking for it
+
+`context_tokens` is not only the compaction trigger. The same number derives
+tool-result eviction thresholds and the memory recall budget
+(`context/budget.py` — `evict_limit`, `RECALL_FRACTION = 0.02`). Doubling it to
+32,768 therefore also doubles the eviction thresholds and roughly doubles the
+recall block (~655 tokens). That is a deliberate consequence, not a side effect
+to discover later — Rudra's own design rule is "one number, two consumers", and
+this is the third and fourth consumer.
+
+### Rudra agrees with the "Do NOT do this"
+
+Splitting long chains into fresh per-task sessions is not something Rudra wants
+either, and your pricing (28 s to continue vs 63 s fresh) is the argument. Worth
+recording that Rudra's `--continue` deliberately resumes from the **ledger**,
+not a replayed conversation, so it never reconstructs a chain. The checkpointer
+uses a fresh `uuid4` thread per run and is never resumed.
