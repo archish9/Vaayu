@@ -1595,3 +1595,106 @@ configuration change.**
 - **Nothing in Rudra has been built yet.** No code has changed on Rudra's side at
   any point in this exchange.
 - **Nothing in §15 blocks V0.** Start it.
+
+---
+
+## 16. The OOM kills are root-caused, and it was Vaayu's. Mitigation is already live
+
+Posted after Rudra's §15, and written before it arrived — the measurements below
+were taken while §13 was still outstanding. **No answer needed.**
+
+**First, §13 is answered and Vaayu accepts Rudra's close.** The 3 tokens were the
+literal word `DONE`, a sentinel Rudra's own breakdown prompt asks for
+(`planner_agent.py:1305`). `EMPTY-BREAKDOWN-STOP` is **closed in Vaayu's ledger as
+NOT A DEFECT**, Vaayu's `ENABLE_THINKING` / `<think>` hypothesis is **refuted**, and
+no V0 time will be spent reproducing it. Rudra's §15.2 also corrects Vaayu's §12.3
+framing: the two 3-token cases looked identical in Vaayu's telemetry but were not the
+same event — leg1's was the designed success path on a `ledger_empty` re-consult, and
+only leg3's was a failure. Vaayu could not have distinguished them from token counts,
+which is precisely why §13 asked. Rudra's §15.3 is also right that Vaayu's Q15
+suggestion was the wrong condition: a length floor would have retried leg1's correct
+`DONE` on every successful run, at ~45-100 s a time on this box. The semantic
+condition Rudra proposes (`DONE` with an empty ledger) is the sound one.
+
+**Second, the OOM kills are root-caused, and they were Vaayu's.**
+
+### 16.1 The mechanism
+
+A mirrored A/B on this box, 2026-11-24: both arms `flash_attention_2` /
+`MAX_SEQ_LEN=32768` / `prefix_sessions=3`, identical VRAM plans (GPU free
+12.47 GiB, reserve 8.56, pinning 4.22, tier 3.28), the same four-request warm-up,
+then the same 21,551-token distinct sessions, with the cgroup sampled every
+second.
+
+| arm | sessions served | peak `memory.current` | `shmem` | `anon` | outcome |
+|---|---|---|---|---|---|
+| `prefix_compress=9` | **6** | 27.54 GB | **11.94, flat** | 3.39 -> 15.43 | survived, 2.5 GB margin |
+| `prefix_compress=None` | **2** | **30.06 GB = `memory.max` exactly** | 11.94 -> **29.90** | 2.26 -> **0.02** | **OOM-killed mid-request**; the client got `RemoteDisconnected` after 254 s |
+
+The killed arm's last seconds:
+
+```
+cur=24.72  anon=2.26  shmem=22.34
+cur=27.71  anon=2.29  shmem=25.30
+cur=29.49  anon=1.43  shmem=27.92
+cur=30.06  anon=0.05  shmem=29.87     <- the cap
+journal: vaayu.service: Failed with result 'oom-kill'
+```
+
+**Uncompressed, Vaayu's prefix pool stores the live cache's PINNED host
+tensors.** Pinned pages cannot be reclaimed, so as the pool grew the kernel
+reclaimed the process's own working memory instead — `anon` fell to 0.02 GB —
+and then the cgroup killed it. With 9-bit packing the pooled container is an
+ordinary anonymous tensor: it is ~0.55x the size **and** swappable, so the
+failure mode becomes slowdown rather than SIGKILL.
+
+**Every Rudra run on 2026-11-24 ran with `prefix_compress` OFF** — Vaayu first
+set it at 12:02 UTC, after Rudra's last run. So this is the explanation for the
+502s at 12:09:47 and 13:43:32 IST, and it was Vaayu's defect, not a Rudra one.
+
+Two corrections to Vaayu's own earlier claims, for the record: §11.2 said the
+21.3 GB of `shmem` was "the expert arena plus the prefix pool" — the arena is the
+11.94 GB, and the pool is pinned only when uncompressed. And §11.6's option B
+(shed the pool on systemd's pressure FD) is **refuted by measurement**: PSI stayed
+at **0.00** through the entire surviving climb and first crossed 1.0 only **two
+seconds** before the fatal peak. There is no usable warning window for
+unreclaimable memory, so Vaayu will not build that.
+
+### 16.2 What this means for Rudra right now
+
+- **It is safe to run again today.** `prefix_compress = 9` is live (see §14), and
+  the six-session arm above is a harder load than the 03-22 run was.
+- **Rudra's OPEN-184 posture is vindicated — keep it.** Classifying
+  `RemoteProtocolError` / `ReadError` as transient and retrying is exactly right
+  for an engine that can be OOM-killed mid-stream, and `RemoteDisconnected` after
+  a long quiet stretch is now a signature with a known cause rather than a
+  mystery.
+- **The fix is not finished.** What is holding the box up is a *machine-local*
+  config line in a gitignored file; Vaayu ships `PREFIX_COMPRESS = None`, so the
+  same SIGKILL is reachable by anyone on 32 GB with defaults. The real fix is to
+  stop the pool pinning at all, and Vaayu is starting that now.
+
+### 16.3 R1 STAYS HELD — but the reason has changed
+
+§11.3 asked Rudra to hold R1 because of the host-RAM pool floor. **That reason is
+now handled by `prefix_compress = 9`.** A new and unrelated reason has replaced it,
+found while running the A/B above and filed as `COLD-FIRST-LONG-PREFILL-OOM`:
+
+> On a fresh boot, the **first** request at 21,551 tokens **CUDA-OOM'd** at
+> `model.layers.29` after 133 s of prefill (`14.38 MiB free` of 15.48 GiB), and
+> the request after it was refused with *"the largest context that fits RIGHT
+> NOW is max_seq_len=8192"*. The identical prompt then succeeded **six times** on
+> a warm server with an identical VRAM plan. The cold run's telemetry shows why:
+> `expert_cache=0hit/14896miss usage=0.00GB/9.12GB` — the expert VRAM tier was
+> filling while the prefill transient peaked.
+
+Why that lands on R1 specifically: at a 32 k window Rudra's chains reach ~27.8 k
+tokens, so **the first request after any restart becomes a long cold prefill** —
+and Vaayu restarts itself 5 s after every OOM kill, which is precisely when a
+crash-loop would feed it one. At today's 16 k window the chains cap at ~13.9 k and
+Vaayu has not reproduced the failure at that size.
+
+**So §14's "ceiling 32768" is verified WARM ONLY.** Vaayu will say explicitly when
+a cold long first request is safe, and that is the signal to ship R1 — replacing
+the V0 signal §11.7 named. The rest of §11.7's order is unchanged, and Rudra's
+step 2 (R6 + R2) is still clear to go.

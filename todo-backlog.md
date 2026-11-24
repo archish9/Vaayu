@@ -20,6 +20,72 @@ it to `todo.md`.
 
 ---
 
+## ARCHIVE — rows closed 2026-11-24 (moved from `todo.md`)
+
+### [x] EMPTY-BREAKDOWN-STOP — closed NOT A DEFECT; the 3 tokens were the word `DONE`
+
+## [bug] EMPTY-BREAKDOWN-STOP — **a `breakdown` request got a 3-TOKEN completion with `finish=stop`, twice on 2026-11-24, and it silently killed a 46-minute Rudra run**
+
+**Evidence (Vaayu's own telemetry, two different runs, same stage):**
+
+| when (IST) | session | prompt tok | output tok | match | finish | stream |
+|---|---|---|---|---|---|---|
+| 11:54:47 | `db232c9cc989-breakdown` | 4479 | **3** | 813 | stop | true |
+| 14:11:23 | `ae00fb793f2d-breakdown` | 4249 | **3** | 813/895 chain | stop | true |
+
+Served cleanly both times — no error, no cancel, no truncation, `finish=stop`. Rudra independently
+reported run `ae00fb793f2d` (leg3-main try 2) as **"failed with 0 tasks planned — no provider error at
+all"**; its last request is the 14:11:23 row. Both observations are correct: the model stopped after
+~3 tokens. In the 11:54 case the run survived only because an earlier breakdown call had already
+succeeded (11:40:23, 185 tokens).
+
+**Candidate cause, to test FIRST:** `ENABLE_THINKING=False` on this box, and MiniMax-M2.7's chat
+template **hard-codes an open `<think>`** which Vaayu closes on the model's behalf
+(`server/config.py` ENABLE_THINKING note). A 3-token answer plus a clean stop is the shape that
+interaction would produce. Both failures are on the SAME stage at ~4.2-4.5 k prompts, which argues
+for a prompt-shape trigger rather than chance.
+
+**Vaayu cannot read the 3 tokens** — `logs/` carries no completion text by design
+(`logs-are-a-support-artifact`). So this must be reproduced directly, not mined from logs.
+
+**Tasks**
+- [ ] Reproduce: a ~4.3 k-token prompt of the breakdown shape through the server, `ENABLE_THINKING`
+      False then True, and read the actual completion. -> verify: the 3-token stop reproduces, and
+      whether the thinking flag changes it.
+- [ ] If it is the `<think>` closing: fix on the Vaayu side and gate it (both on-device MoE targets).
+      If it is the model answering badly: say so, close, and hand it to Rudra as a retry condition
+      (handoff Q14/Q15 already ask whether breakdown can retry a suspiciously short completion).
+
+**Why this may outrank RUDRA-CTX-COMPACTION:** compaction costs 19 % of a run's wall clock; this costs
+the WHOLE run (46 min, 0 tasks planned) and does it silently, with every health signal green.
+
+**CLOSING EVIDENCE, 2026-11-24 (Rudra's reply, handoff sections 15.1 and 15.2).** Both completions were
+the literal word `DONE`, read from Rudra's archived debug logs. It is a sentinel Rudra's own prompt asks
+for, at `agent/planner_agent.py:1305` (also `:1323`, `:1342`):
+
+    "Every task is finished. Is anything missing before we stop? "
+    "Call add_tasks if so; otherwise reply DONE and stop."
+
+So a 3-token `finish=stop` on that prompt is the DESIGNED path — not a truncation, not an empty
+`<think>`, not a `</think>` artefact. Vaayu's candidate cause (`ENABLE_THINKING=False` against MiniMax's
+hard-coded open `<think>`) is REFUTED and nothing was built.
+
+**The two cases were NOT the same event**, which is the lesson worth keeping. In Vaayu's telemetry they
+were indistinguishable (ptok 4479 / 4249, out 3, `finish=stop`, `stream=true`). In fact:
+`db232c9cc989` at 11:54:47 was **CORRECT** — three tasks had just completed and the `ledger_empty`
+re-consult rightly answered that nothing was missing; that run finished green. `ae00fb793f2d` at
+14:11:23 was the planner **giving up** after talking itself into a dead end (the planner stages
+deliberately hold no MCP tools; the coder holds them) and using the same sentinel to stop. Vaayu served
+both perfectly.
+
+**Vaayu's proposed fix was also wrong, in a way worth remembering:** handoff Q15 suggested retrying on a
+completion that is short relative to its prompt. That would have retried leg1's legitimate `DONE` on
+every successful run, at ~45-100 s each on this box. The sound condition is semantic — `DONE` (or any
+completion calling no tool) **with an empty ledger** — and it is Rudra's to build, filed on their side.
+
+**Re-open condition:** a 3-token `finish=stop` on a prompt that does NOT instruct a sentinel. That would
+be a different finding and this row's evidence would not cover it.
+
 ## ARCHIVE — closed batching-sweep rows (moved from `todo.md` 2026-10-14)
 
 The N>1 batching sweep through the server. Harness for every row: `plans/probes/p10e_server_ab.py` — boot the

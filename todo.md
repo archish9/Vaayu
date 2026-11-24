@@ -79,42 +79,77 @@ running. Boot/kill a background server with the Bash tool; `pkill -9 -f "python 
 
 # OPEN
 
-## [bug] EMPTY-BREAKDOWN-STOP — **a `breakdown` request got a 3-TOKEN completion with `finish=stop`, twice on 2026-11-24, and it silently killed a 46-minute Rudra run**
+## [bug] COLD-FIRST-LONG-PREFILL-OOM — **the FIRST request after boot, at 21,551 tokens, CUDA-OOM'd at `MAX_SEQ_LEN=32768`; the same prompt succeeds once the server is warm**
 
-**Evidence (Vaayu's own telemetry, two different runs, same stage):**
+Found 2026-11-24 as a confound while running HOST-RAM-CEILING's A/B, and it is a separate defect.
 
-| when (IST) | session | prompt tok | output tok | match | finish | stream |
-|---|---|---|---|---|---|---|
-| 11:54:47 | `db232c9cc989-breakdown` | 4479 | **3** | 813 | stop | true |
-| 14:11:23 | `ae00fb793f2d-breakdown` | 4249 | **3** | 813/895 chain | stop | true |
+**What happened.** Fresh boot (`run-2026-11-24T12-52-41Z`, flash, 32768, plan validated `S_max=32768`,
+reserve 8.56 GiB, tier 3.28 GB). First request ever: 21,551 tokens, 43 chunks. It ran 133 s of prefill
+then died at layer 29:
 
-Served cleanly both times — no error, no cancel, no truncation, `finish=stop`. Rudra independently
-reported run `ae00fb793f2d` (leg3-main try 2) as **"failed with 0 tasks planned — no provider error at
-all"**; its last request is the 14:11:23 row. Both observations are correct: the model stopped after
-~3 tokens. In the 11:54 case the run survived only because an earlier breakdown call had already
-succeeded (11:40:23, 185 tokens).
+```
+RuntimeError: CUDA OOM on model.layers.29. Not retried: the layer had already written this
+sequence's cache, so a second run would corrupt it; the KV cache is not truncated to make room
+torch.OutOfMemoryError: Tried to allocate 20.00 MiB. GPU 0 has 15.48 GiB total, 14.38 MiB free
+  (loader_strategy.py:402 build_exl3_qmatrix -> t.to(device) for an expert's tensors)
+```
 
-**Candidate cause, to test FIRST:** `ENABLE_THINKING=False` on this box, and MiniMax-M2.7's chat
-template **hard-codes an open `<think>`** which Vaayu closes on the model's behalf
-(`server/config.py` ENABLE_THINKING note). A 3-token answer plus a clean stop is the shape that
-interaction would produce. Both failures are on the SAME stage at ~4.2-4.5 k prompts, which argues
-for a prompt-shape trigger rather than chance.
+The NEXT request was then refused by admission with `VramPlanError: ... The largest context that fits
+RIGHT NOW is max_seq_len=8192` — i.e. the failed request left the allocator holding the reserve.
 
-**Vaayu cannot read the 3 tokens** — `logs/` carries no completion text by design
-(`logs-are-a-support-artifact`). So this must be reproduced directly, not mined from logs.
+**Why it is boot-order, not size.** The identical 21,551-token prompt succeeded six times in a row on
+a server that had first served four 3.3 k-token requests, with an identical VRAM plan. The cold run's
+own telemetry shows the difference: `expert_cache=0hit/14896miss/0evict usage=0.00GB/9.12GB` — the
+host arena was empty and the expert VRAM tier was filling WHILE the prefill transient peaked.
+
+**Why it matters more than it looks.** This is exactly the shape of an agent's first request after a
+restart — and Vaayu restarts itself 5 s after every OOM kill (HOST-RAM-CEILING), so a crash-loop can
+convert into a second, different failure that the client sees as a 500.
 
 **Tasks**
-- [ ] Reproduce: a ~4.3 k-token prompt of the breakdown shape through the server, `ENABLE_THINKING`
-      False then True, and read the actual completion. -> verify: the 3-token stop reproduces, and
-      whether the thinking flag changes it.
-- [ ] If it is the `<think>` closing: fix on the Vaayu side and gate it (both on-device MoE targets).
-      If it is the model answering badly: say so, close, and hand it to Rudra as a retry condition
-      (handoff Q14/Q15 already ask whether breakdown can retry a suspiciously short completion).
+- [ ] Reproduce deliberately: boot, send ONE request at ~20-22 k tokens as the first request, both
+      kernels. -> verify: it OOMs cold and passes warm, with the plan line identical.
+- [ ] Then decide where the charge belongs: the expert VRAM tier should not be able to fill into the
+      prefill reserve of the request that is running (compare `elastic_tier.py`'s rules, which are OFF
+      on MiniMax because decode graphs own the pool), or admission must charge the cold-tier case.
+- [ ] Until then: do NOT claim `MAX_SEQ_LEN=32768` is safe for a cold long first request. The handoff
+      (section 14) tells Rudra the ceiling is 32768; that number is only verified warm.
 
-**Why this may outrank RUDRA-CTX-COMPACTION:** compaction costs 19 % of a run's wall clock; this costs
-the WHOLE run (46 min, 0 tasks planned) and does it silently, with every health signal green.
+## [x] EMPTY-BREAKDOWN-STOP — **CLOSED 2026-11-24 AS NOT A DEFECT, same day it was filed. The 3 tokens were the literal word `DONE`** — a sentinel Rudra's own breakdown prompt asks for (`planner_agent.py:1305`: *"otherwise reply DONE and stop"*). Vaayu's `ENABLE_THINKING` / hard-coded-open-`<think>` hypothesis is REFUTED and nothing was built. Two lessons worth keeping: (a) **the two cases were NOT the same event** — identical in Vaayu's telemetry (ptok ~4.3k, out 3, `finish=stop`) but leg1's was the designed success path on a `ledger_empty` re-consult and only leg3's was a planner dead-end, so **token counts cannot distinguish a correct short answer from a failed one** and asking the client for the completion text was the only way; (b) the retry condition Vaayu proposed (a length floor) **would have been actively harmful** — it would retry every legitimate `DONE` at ~45-100 s a time. Full text: `todo-backlog.md`. Follow-up (`DONE` + empty ledger) is Rudra's and is filed on their side.
 
-## [bug] HOST-RAM-CEILING — **Vaayu was cgroup-OOM-killed TWICE on 2026-11-24, mid-run, and the two pinned host caches are sized to land ~1.5 GB short of the SIGKILL cap.** This is V0: nothing else builds first
+## [bug] HOST-RAM-CEILING — **ROOT-CAUSED 2026-11-24 by a mirrored A/B: UNCOMPRESSED pooled prefix entries are PINNED (shmem), so the pool is unreclaimable and walks the cgroup into a SIGKILL. `PREFIX_COMPRESS=9` moves it to ANON and survives.** Fix shape is now a code decision, not an investigation
+
+**THE A/B (both arms: flash, `MAX_SEQ_LEN=32768`, `prefix_sessions=3`, GPU free 12.47 GiB at load,
+reserve 8.56 / pinning 4.22 / tier 3.28 — identical plans; same 4-request warm-up, then the same
+21,551-token distinct sessions; cgroup sampled at 1 Hz):**
+
+| arm | sessions served | peak `memory.current` | `shmem` | `anon` | PSI some avg10 | outcome |
+|---|---|---|---|---|---|---|
+| `PREFIX_COMPRESS=9` | **6** | 27.54 GB | **11.94 FLAT** | 3.39 -> 15.43 | **0.72** | survived, 2.5 GB margin, 1.42 GB swapped |
+| `PREFIX_COMPRESS=None` | **2** | **30.06 GB = `memory.max` exactly** | 11.94 -> **29.90** | 2.26 -> **0.02** | 0.00 until ~5 s before death, max 2.31 | **OOM-KILLED mid-request** (`Failed with result 'oom-kill'`); the client got `RemoteDisconnected` after 254 s |
+
+**The mechanism, read straight off the trajectory.** Uncompressed, the pool parks the live cache's
+PINNED host tensors, so `shmem` climbs 22.34 -> 23.22 -> 25.30 -> 26.95 -> 27.92 -> 28.60 -> 29.13 ->
+29.87 GB while **`anon` collapses 2.31 -> 1.96 -> 1.43 -> 0.89 -> 0.05 -> 0.02** — the kernel reclaims
+the process's OWN working memory because pinned pages cannot be reclaimed — then `memory.current` pins
+at the cap and the cgroup kills it. Compressed, the packed container is an ordinary anon tensor:
+`shmem` never moves, the pool is swappable, and the failure mode becomes slowdown instead of death.
+
+**This is the root cause of the two OOM kills Rudra hit on 2026-11-24** (06:39:43 and 08:13:35 UTC,
+matched to their 502s within 3-4 s): every Rudra run that day ran with `PREFIX_COMPRESS` OFF, since
+it was first set at 12:02 UTC.
+
+**CORRECTION to this row's earlier text:** it said "88 % of the cgroup is pinned — the expert arena
+PLUS the prefix pool". Half wrong. The arena is the 11.94 GB of `shmem`; the pool is pinned ONLY when
+uncompressed. Under 9-bit packing the pool is anon, and the measured entry is 2.94 GB per 21,551
+tokens = 136 KB/token = **0.55x** raw (the code's remedy text says ~0.61x, so slightly better).
+
+**OPTION B IS REFUTED, twice.** systemd's `MEMORY_PRESSURE_WATCH` cannot drive a shed: PSI stayed
+**0.00** through the entire compressed climb 15.4 -> 24.2 GB, and in the killed arm it first exceeded
+1.0 **two seconds** before the peak and never passed 2.31. There is no usable warning window for
+unreclaimable memory. Do not build a pressure-triggered cache shed.
+
+
 
 **Evidence (journal, this box).** `Nov 24 12:09:43 IST` and `13:43:35 IST`: `Main process exited,
 code=killed, status=9/KILL` + `Failed with result 'oom-kill'`, `28.0G memory peak, 2.5G swap peak`
@@ -160,16 +195,23 @@ flash@32768 9.12+13.09=**22.21** (expert arena GB + prefix pool GB). `max_seq_le
 while Rudra's own window stays 16 k** — Vaayu's ceiling does not lengthen chains, Rudra's trigger does.
 
 **Tasks**
-- [ ] **Step 0 is a REPRO, not a fix** (systematic-debugging Phase 1): boot, drive concurrent sessions to
-      full-length chains, log `memory.current` / `anon` / `shmem` against the cap every second until it
-      kills or plateaus. -> verify: the pool is shown to reach its budget (or something else overshoots),
-      AND whether PSI rises at all before death — that premise decides task 2's option B.
-- [ ] Then ONE of: (A) budget the pool against the CAP minus arena minus a derived reserve — static,
-      provable, costs pool capacity; (B) open systemd's pressure FD and shed the pool — dynamic, but
-      pinned memory may never raise PSI in time; (C) make pooled entries reclaimable so the failure mode
-      is slowdown, not death. **Recommended: step 0, then A, then re-ask whether B is needed.**
+- [x] **Step 0 DONE 2026-11-24** — the A/B above. Driver and 1 Hz cgroup samples in the session
+      scratchpad (`v0_repro.py`, `v0_mem.csv`, `v0_mem_uncomp2.csv`). No engine code was touched.
+- [x] **Option B refuted** by the PSI columns (see above). Option C turns out to be what
+      `PREFIX_COMPRESS=9` already does, by accident rather than by design.
+- [ ] **DECIDE THE FIX SHAPE — this is the open question now.** `PREFIX_COMPRESS=9` is today holding
+      the box up from a MACHINE-LOCAL config line (`config_local.py`, gitignored), which is exactly
+      CLAUDE.md section 8's "banked, not shipped": any other user on 32 GB of RAM hits the same SIGKILL with
+      Vaayu's defaults, because `config.py` ships `PREFIX_COMPRESS = None`. Candidate shapes:
+      (i) make the pool's container anon REGARDLESS of compression — the real defect is that pooling
+      pins, and packing only hides it; (ii) derive a default `prefix_compress` when the pool budget
+      exceeds what the cgroup cap can hold pinned; (iii) budget the pool against the CAP minus the
+      arena minus a derived reserve (the old option A), which is still right as a second belt.
+      **(i) is the honest fix and does not cost the 0.7 s/hit or any output bits; (ii) is the cheap
+      one.** Not model-specific: derive it (section 5).
 - [ ] The hang travels with this row — see [bug] SIGNAL-STOP-IGNORED, which is the SAME bug seen from
-      the shutdown end.
+      the shutdown end. NOTE the killed arm also shows why a stuck request looks like a hang: with
+      `anon` reclaimed to 0.02 GB the process thrashes before it dies.
 
 **Stop rules.** `PREFIX_SESSIONS 3 -> 2` is REFUTED as a stopgap: zero saving (table above) and it moves
 the pool toward the measured over-capacity cliff where reuse collapses to ZERO rather than degrading —
@@ -189,7 +231,10 @@ silences CANNOT trip it and the heartbeat cadence defect stays unprioritised. `c
 zero-parse on `langchain_openai` 1.4.2 (`chat_models/base.py:4168,4222`). R2 now, R3 is the direction
 with no date. Vaayu's §12 settled the non-streaming request as the **AGENTS.md summariser** (bare
 session id, completion at 11:58:42 IST = Rudra's own `close()` time, 140 tokens, `tools: 0`) and found
-[bug] EMPTY-BREAKDOWN-STOP.
+[bug] EMPTY-BREAKDOWN-STOP. **§15 (posted after the A/B) tells Rudra the OOM is root-caused and was
+Vaayu's, that the mitigation is live, and that R1 stays held for a NEW reason — COLD-FIRST-LONG-PREFILL-OOM
+rather than host RAM. The release signal for R1 changed: it is now "a cold long first request is safe",
+not "V0 landed".**
 **Earlier state, for the record:** Vaayu's §11 carries three
 corrections (the two OOM kills, the one orphaned request per run, and "42/42 no crash" as survivorship
 bias), the refutation of Rudra's `stream: false` theory for the compaction calls (all three streamed:
