@@ -79,6 +79,41 @@ running. Boot/kill a background server with the Bash tool; `pkill -9 -f "python 
 
 # OPEN
 
+## [bug] EMPTY-BREAKDOWN-STOP — **a `breakdown` request got a 3-TOKEN completion with `finish=stop`, twice on 2026-11-24, and it silently killed a 46-minute Rudra run**
+
+**Evidence (Vaayu's own telemetry, two different runs, same stage):**
+
+| when (IST) | session | prompt tok | output tok | match | finish | stream |
+|---|---|---|---|---|---|---|
+| 11:54:47 | `db232c9cc989-breakdown` | 4479 | **3** | 813 | stop | true |
+| 14:11:23 | `ae00fb793f2d-breakdown` | 4249 | **3** | 813/895 chain | stop | true |
+
+Served cleanly both times — no error, no cancel, no truncation, `finish=stop`. Rudra independently
+reported run `ae00fb793f2d` (leg3-main try 2) as **"failed with 0 tasks planned — no provider error at
+all"**; its last request is the 14:11:23 row. Both observations are correct: the model stopped after
+~3 tokens. In the 11:54 case the run survived only because an earlier breakdown call had already
+succeeded (11:40:23, 185 tokens).
+
+**Candidate cause, to test FIRST:** `ENABLE_THINKING=False` on this box, and MiniMax-M2.7's chat
+template **hard-codes an open `<think>`** which Vaayu closes on the model's behalf
+(`server/config.py` ENABLE_THINKING note). A 3-token answer plus a clean stop is the shape that
+interaction would produce. Both failures are on the SAME stage at ~4.2-4.5 k prompts, which argues
+for a prompt-shape trigger rather than chance.
+
+**Vaayu cannot read the 3 tokens** — `logs/` carries no completion text by design
+(`logs-are-a-support-artifact`). So this must be reproduced directly, not mined from logs.
+
+**Tasks**
+- [ ] Reproduce: a ~4.3 k-token prompt of the breakdown shape through the server, `ENABLE_THINKING`
+      False then True, and read the actual completion. -> verify: the 3-token stop reproduces, and
+      whether the thinking flag changes it.
+- [ ] If it is the `<think>` closing: fix on the Vaayu side and gate it (both on-device MoE targets).
+      If it is the model answering badly: say so, close, and hand it to Rudra as a retry condition
+      (handoff Q14/Q15 already ask whether breakdown can retry a suspiciously short completion).
+
+**Why this may outrank RUDRA-CTX-COMPACTION:** compaction costs 19 % of a run's wall clock; this costs
+the WHOLE run (46 min, 0 tasks planned) and does it silently, with every health signal green.
+
 ## [bug] HOST-RAM-CEILING — **Vaayu was cgroup-OOM-killed TWICE on 2026-11-24, mid-run, and the two pinned host caches are sized to land ~1.5 GB short of the SIGKILL cap.** This is V0: nothing else builds first
 
 **Evidence (journal, this box).** `Nov 24 12:09:43 IST` and `13:43:35 IST`: `Main process exited,
@@ -146,7 +181,16 @@ unavailable: 28 GiB of 31 GB total already leaves ~1 GB for the desktop.
 **Handoff to Rudra:** `HANDOFF-RUDRA-CONTEXT-2026-11-24.md` (repo root, at the user's explicit request —
 self-contained: both cost laws, the 1125 s decomposition, the 7 ranked Rudra asks with prices, Vaayu's own
 build list V1-V5, the NOT-building table, 8 questions and a reply section Rudra fills in and sends back).
-**Rudra REPLIED (§9/§10) and Vaayu answered (§11, written 2026-11-24).** Vaayu's §11 carries three
+**Rudra replied TWICE (§9/§10, §11.9) and Vaayu answered twice (§11, §12). BUILD GATE LIFTED for V0.**
+Rudra's §11.9: R1 is **held** pending V0 (owner-approved); its 502s match Vaayu's OOM kills to within
+3-4 s and `ff20cbb4bfa5` is Rudra's own session id for Vaayu's named orphan — the OOM diagnosis is
+confirmed from both sides. Rudra's stream-chunk timeout is 600 s / 300 s default, so Vaayu's 17.66 s
+silences CANNOT trip it and the heartbeat cadence defect stays unprioritised. `cached_tokens` confirmed
+zero-parse on `langchain_openai` 1.4.2 (`chat_models/base.py:4168,4222`). R2 now, R3 is the direction
+with no date. Vaayu's §12 settled the non-streaming request as the **AGENTS.md summariser** (bare
+session id, completion at 11:58:42 IST = Rudra's own `close()` time, 140 tokens, `tools: 0`) and found
+[bug] EMPTY-BREAKDOWN-STOP.
+**Earlier state, for the record:** Vaayu's §11 carries three
 corrections (the two OOM kills, the one orphaned request per run, and "42/42 no crash" as survivorship
 bias), the refutation of Rudra's `stream: false` theory for the compaction calls (all three streamed:
 324/328/326 chunks — but max silence 16.96 / 17.66 s against a 10 s keepalive), the `cached_tokens`

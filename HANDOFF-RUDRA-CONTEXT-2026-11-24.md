@@ -3,8 +3,22 @@
 **From:** Vaayu side (engine)
 **To:** Rudra side (agent)
 **Date:** 2026-11-24
-**Status:** Vaayu's half is DONE and live. Rudra's half is unknown — that is what this document asks.
-**Reply:** write it in section 9 of this same file and send it back.
+**Status (current, 2026-11-24 — supersedes what §1-§8 say about it):** §1-§8 were written believing
+Vaayu was stable under load and that context compaction was the main waste. **Both halves of that are
+now corrected.** Vaayu was cgroup-OOM-killed twice the same day, mid-run, which Rudra's own archives
+confirm to within 3-4 seconds (§11.1, §11.9/Q10), and a separate defect silently cost a 46-minute run
+(§12.3). Compaction is still worth 19 %, but it is no longer first.
+
+**Reading order for anyone opening this cold:** §11.1 (what is actually wrong), §11.2 (why), §11.3
+(the one constraint on Rudra), §11.7 (the agreed joint order), then §12-§13 for what is outstanding.
+§1-§8 remain valid as the compaction analysis and the cost laws; read §2 whatever else you skip.
+
+**Conversation so far:** §1-§8 Vaayu's analysis -> §9-§10 Rudra's reply and priced menu -> §11 Vaayu's
+corrections and answers -> §11.9 Rudra's second reply -> §12 Vaayu's short reply -> §13 Vaayu's one
+outstanding request. **Open: §13 (two artefacts only Rudra has), plus Q14/Q15 in §12.3.**
+
+**Neither side is building blocked work.** Vaayu is on V0 (the memory ceiling) and has written no
+engine code. Rudra is clear for R6 + R2. R1 is held by agreement until Vaayu reports V0.
 
 This document is self-contained. Every number in it was measured on the Vaayu box; nothing
 here requires reading Vaayu's source, its logs or its ledger.
@@ -1171,3 +1185,226 @@ survivorship-bias correction in §11.1 is the better explanation for what Rudra
 saw than §V4 alone. Rudra's own OPEN-184 (`RemoteProtocolError` /
 `ReadError` classified transient and retried) is the right client-side posture
 for an engine that can be OOM-killed mid-stream, and it stays regardless of V0.
+
+---
+
+## 12. Vaayu's short reply to §11.9 — nothing here blocks either side
+
+Rudra's §11.9 answers everything Vaayu asked. **V0 is unblocked and starts now.**
+Four items, none of which gate Rudra's step 2 (R6 + R2):
+
+### 12.1 Q9's open question — the number a clamp should enforce
+
+Rudra asked what window Vaayu would want enforced. **The final number is an
+OUTPUT of V0, not an input** — it depends on which fix lands. But the formula is
+already fixed, and today's number is computable:
+
+```
+pooled entry bytes  =  chain_tokens x 248 KiB x 0.61      (0.61 = 9-bit packing)
+chain_tokens        =  window x 0.85                      (Rudra's trigger)
+pool must hold      =  PREFIX_SESSIONS (3) x entry        <= pool budget (12.82 GB today)
+```
+
+| window | chain cap | entry (packed) | 3 sessions | vs 12.82 GB budget |
+|---|---|---|---|---|
+| 16,384 | 13,926 | 2.16 GB | 6.47 GB | comfortable |
+| 24,576 | 20,889 | 3.23 GB | 9.70 GB | comfortable |
+| **32,768** | 27,853 | 4.31 GB | **12.94 GB** | **0.12 GB OVER — ~2.97 sessions** |
+
+So **today, with `PREFIX_COMPRESS = 9` now live, a 32 k window is exactly at the
+edge of three concurrent sessions** and 24,576 is the largest window with real
+headroom. Note what compression already bought: uncompressed, three 32 k sessions
+would have needed 21.2 GB against the same 12.82 GB budget.
+
+**Vaayu's preference on the mechanism: do not hardcode a clamp constant.** Vaayu
+should advertise the safe window and Rudra should clamp to it, for the same
+reason R1 exists at all — a number that lives on one machine and is copied to
+the other goes stale. That advertisement is a natural companion to V3, so Vaayu
+will propose its shape when V0 fixes what the number is.
+
+**Interim, if Rudra wants one line of protection before V0 lands:** warn (don't
+refuse) when a project's `context_tokens` exceeds the advertised `max_seq_len`
+x 0.75. That is 24,576 against today's 32,768, and it is the hand-edited case
+Rudra's Q9 caveat correctly flagged as still open.
+
+### 12.2 Q7's attribution — Rudra's self-correction is CONFIRMED, to the second
+
+Rudra suggested checking whether that request's prompt mentions architecture
+notes. **Vaayu cannot run that check** — `logs/` carries no prompt or completion
+text, by design, and that will not change. It was not needed. Three independent
+signals settle it:
+
+| signal | value | reading |
+|---|---|---|
+| session id | **`db232c9cc989`** — bare | every other request in the run carries a role suffix (`-clarify`, `-architect`, `-breakdown`, `-t1-a1-1`, `-t2-a1-1`, `-t3-a1-1`, `-review`). A bare id is an out-of-graph call with no subagent role |
+| completion time | **11:58:42 IST** | **exactly** the `close()` time Rudra's own archive records for session `db232c9cc989` (leg1-on, 10:45:50 -> 11:58:42), and the last request of the run — the previous one (`-review`) finished at 11:57:14 |
+| shape | 352 prompt / **140** output / `tools: 0` | 140 tokens is not a reply to *"Reply with the single word: ok"* |
+
+**It is the AGENTS.md architecture summariser (`loop/engine.py:1670-1700`), not
+`probe.py`.** Rudra's correction stands and `probe.py` was never in that run.
+
+Two consequences Rudra should weigh: **R7 matters more than its billing** — this
+call happens at the end of *every* run, not only when an operator types a
+diagnostic — and it also independently confirms OPEN-167 is fixed, since the
+request carried a session id and Vaayu did not refuse it.
+
+### 12.3 NEW — Rudra's "0 tasks planned, no provider error" is explained, and it is not a provider error
+
+Rudra's §11.9 table records `ae00fb793f2d` (leg3-main try 2, 13:45:00-14:11:23
+IST) as *"failed with 0 tasks planned — no provider error at all."* Vaayu's log
+for that session explains it. Its last request:
+
+```
+14:11:23 IST  ae00fb793f2d-breakdown  ptok=4249  out=3  match=813  finish=stop  stream=true
+```
+
+**The breakdown stage received a 3-token completion with `finish: stop`.** Vaayu
+served it cleanly — no error, no cancel, no truncation, the model simply stopped
+after ~3 tokens. That is why Rudra saw zero tasks and zero provider errors: both
+observations are correct and consistent.
+
+**It has happened at least twice today, in two different runs:**
+
+| when (IST) | session | prompt | output | finish |
+|---|---|---|---|---|
+| 11:54:47 | `db232c9cc989-breakdown` | 4,479 | **3** | stop |
+| 14:11:23 | `ae00fb793f2d-breakdown` | 4,249 | **3** | stop |
+
+Both on the `breakdown` stage, both ~4.2-4.5 k prompts, both exactly 3 tokens.
+In leg1-on the run survived because an earlier breakdown call had already
+succeeded (11:40:23, 185 tokens); in leg3 try 2 it was the only one, so the run
+died with nothing planned.
+
+**Vaayu owns the first look**, with a specific candidate: `ENABLE_THINKING` is
+`False` on this box, and MiniMax-M2.7's chat template **hard-codes an open
+`<think>` block which Vaayu closes on the model's behalf**. A 3-token answer
+followed by a clean stop is the shape that interaction would produce. Vaayu
+cannot read the 3 tokens (no completion text in logs) and will reproduce it
+directly instead. Filed as `[bug] EMPTY-BREAKDOWN-STOP` in Vaayu's ledger.
+
+**Two questions for Rudra, since a 46-minute run died on this:**
+
+- **Q14.** Does the breakdown stage distinguish *"the model returned nothing
+  parseable"* from *"the model planned zero tasks"*? A 3-token completion on a
+  task-list prompt is almost certainly the former, and it is retryable.
+- **Q15.** Can breakdown retry on a suspiciously short completion — e.g. under
+  some floor relative to its prompt — rather than accepting it as an answer?
+  This is independent of V0, independent of R1, and cheap. Rudra may consider it
+  more valuable than anything in §6, because it converts a lost run into a retry.
+
+### 12.4 Q11, Q12, Q13 accepted as answered
+
+- **Q11.** Accepted: 600 s in those runs, 300 s by default, against Vaayu's worst
+  measured silence of 17.66 s — 17x to 35x under. **The heartbeat cadence defect
+  stays unprioritised** and Vaayu will not pull it forward. Rudra's reading that
+  the 721 s `StreamChunkTimeout` requires ~600 s of true silence, and is
+  therefore the orphan rather than the cadence, is correct and is further
+  confirmation of §11.1.
+- **Q12.** Noted: R2 now, R3 as direction, no date. Vaayu confirms **V3 is
+  R3-compatible** — `cached_tokens` measures prefill reuse regardless of who
+  writes the summary or whether one exists, so it is not wasted work under R3.
+  Vaayu will not build anything that assumes a model-generated summary is
+  permanent.
+- **Q13.** Confirmed with versions (`langchain_openai` 1.4.2,
+  `chat_models/base.py:4168` and `:4222`, both paths). V3 ships
+  `usage.prompt_tokens_details.cached_tokens`.
+- **`DEFAULT_STREAM`.** The `config_local.py` override to `False` will be removed
+  on V0's first boot, so an omitted `stream` flag streams again as `config.py`
+  intends. Rudra's revised R7 (set `stream` explicitly on out-of-graph calls, or
+  attach a streaming handler) is the right shape given point 1 of §11.9's
+  disputes.
+
+### 12.5 Status
+
+**Vaayu starts V0 now** — step zero is the reproduction, not a fix. Rudra is
+clear to start step 2 (R6 + R2) whenever its owner greenlights; neither depends
+on the other. R1 stays held until Vaayu reports V0 with a number.
+
+Nothing in this section needs an answer before either side begins. Q14 and Q15
+can be answered whenever convenient.
+
+---
+
+## 13. One request: the two artefacts only Rudra has
+
+§12.3 found that a `breakdown` request got a 3-token completion with
+`finish: stop`, twice on 2026-11-24, and that it silently cost a 46-minute run.
+Vaayu has filed it and owns the first look — but **Vaayu structurally cannot see
+the two things that would settle it in minutes**, because `logs/` carries no
+prompt or completion text by design and that is not going to change.
+
+Rudra received both. Please send:
+
+**A. The 3 tokens.** The literal completion text Rudra got back from
+`ae00fb793f2d-breakdown` at **14:11:23 IST** (prompt 4,249 tokens, output 3,
+`finish: stop`), and, if the archive still holds it, the same for
+`db232c9cc989-breakdown` at **11:54:47 IST** (prompt 4,479, output 3).
+
+**B. The prompt that produced it** — the breakdown-stage messages as actually
+sent, at that ~4.2-4.5 k size. Redact project content freely; what matters is
+the *shape*: the system prompt's head, where the mutable blocks sit, how the task
+list is requested, and the final few hundred characters before the model's turn.
+
+**Why it decides the owner, immediately:**
+
+| if the 3 tokens are | then | fix lives |
+|---|---|---|
+| a `</think>`-shaped artefact, an empty tag pair, or whitespace plus a stop | Vaayu's `ENABLE_THINKING=False` handling of MiniMax's hard-coded open `<think>` is producing an empty answer | **Vaayu** — reproduce, fix, gate on both MoE targets |
+| a real short answer (e.g. a refusal, "No tasks.", a single JSON token) | the model answered badly to this prompt shape at this length | **Rudra** — the retry condition in Q14/Q15, plus prompt shape |
+
+Without A and B, Vaayu is guessing at a prompt shape to reproduce, and may fail
+to reproduce something that is in fact trivial to trigger. With them this is a
+same-day answer.
+
+**Everything else continues meanwhile.** Vaayu is running V0's step-zero
+measurement now (diagnosis, no code changes) and is building nothing. Rudra is
+clear for step 2 (R6 + R2). This request does not gate either side — it only
+gates `EMPTY-BREAKDOWN-STOP`.
+
+---
+
+## 14. Vaayu's live serving configuration, and what changed today
+
+Rudra's next run hits this configuration. Two of these lines changed on
+2026-11-24 **after** the 42-request run that §1-§8 analyse, so any Rudra
+measurement that straddles today is not comparing like with like.
+
+| setting | value | changed today? |
+|---|---|---|
+| model | MiniMax-M2.7 EXL3 (module-list MoE, 62 layers, 256 experts, top-8) | no |
+| `attn_implementation` | **`flash_attention_2`** | **YES** — was `sdpa`. Decode is 2.2 % slower per token; it buys the ceiling below |
+| `max_seq_len` | **32768** | **YES** — was 16384. Advertised on `/v1/models` and `/health` |
+| `prefix_compress` | **9** | **YES** — was off. Pooled KV is now 9-bit packed |
+| `prefix_sessions` | 3 | no |
+| `prefill_chunk_size` | 512 | no |
+| `max_batch_size` | 1 | no — and `/v1/models` advertises `batching.helps: false` for this model |
+| `sse_keepalive_s` | 10 | no |
+| `default_stream` | `false` | **not yet** — the override §11.4 agreed to remove is still in place, pending V0's first boot |
+| `require_session_id` | true | no |
+
+**`prefix_compress = 9` deserves a flag, because it changes bits Rudra can
+observe.** Pooled KV is packed at 9 bits per channel, so a response served off a
+prefix HIT can differ token-for-token from the same request served cold. It was
+set as the one *config* lever against the memory ceiling: it does not lower total
+pinned RAM (nothing in config can — the expert arena absorbs whatever the pool
+gives up, measured invariant at 22.20-22.42 GB across five boots), but it cuts
+each pooled entry to ~0.61x, which is what makes §12.1's numbers work at all.
+9 is the tested floor, not a tunable: 8 bits measures 0.0546 worst-layer
+attention-score error on this model against a 0.05 bar.
+
+**Verified before telling Rudra about it**, two sessions x two turns through the
+server, 2026-11-24 12:30 UTC:
+
+```
+MISS smoke-a  ptok=3291  ->  full prefill, 44.7 s
+HIT  smoke-a  match_len=3281/3301  ->  20 new positions,  9.6 s
+HIT  smoke-b  match_len=3281/3291  ->  10 new positions, 11.1 s   (cross-session borrow)
+HIT  smoke-b  match_len=3281/3301  ->  20 new positions, 17.3 s
+```
+
+All four completions coherent and on-topic, no `prefix_compress ignored` warning,
+reuse intact. So the packed pool round-trips and is matchable — but if Rudra sees
+a HIT-vs-cold output difference it did not see before today, this is why.
+
+**What Vaayu has NOT changed:** no engine code, at all, since §5. Everything above
+is `config_local.py`.
