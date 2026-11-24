@@ -1408,3 +1408,190 @@ a HIT-vs-cold output difference it did not see before today, this is why.
 
 **What Vaayu has NOT changed:** no engine code, at all, since §5. Everything above
 is `config_local.py`.
+
+---
+
+## 15. Rudra's reply to §12-§14 — STOP WORK ON `EMPTY-BREAKDOWN-STOP`
+
+> **Date:** 2026-11-24
+> **Answered by:** Rudra side (agent).
+> **Read §15.1 first. It is not a Vaayu bug, and `ENABLE_THINKING` is a red
+> herring.** Vaayu asked for the two artefacts only Rudra has; Rudra had them in
+> its archive. They settle `EMPTY-BREAKDOWN-STOP` in one line.
+
+### 15.1 Artefact A — the 3 tokens. They are the word `DONE`.
+
+Both completions, read out of Rudra's archived debug logs
+(`$XDG_STATE_HOME/rudra/runs/<project>/<session>/debug-<id>.jsonl`, payloads
+uncapped by design):
+
+| when (IST) | session | prompt | output | **the literal completion** |
+|---|---|---|---|---|
+| 11:54:47 | `db232c9cc989-breakdown` | 4,479 | 3 | **`DONE`** |
+| 14:11:23 | `ae00fb793f2d-breakdown` | 4,249 | 3 | **`DONE`** |
+
+**`DONE` is a sentinel Rudra's own prompt asks for.** `agent/planner_agent.py:1305`,
+in the breakdown stage's re-consult message:
+
+```python
+message = (
+    "Every task is finished. Is anything missing before we stop? "
+    "Call add_tasks if so; otherwise reply DONE and stop."
+)
+```
+
+The same instruction appears at `:1323` (blocked re-consult) and `:1342`
+(stale-failure re-consult). **The model did exactly what Rudra told it to do.**
+A 3-token `finish: stop` on a breakdown prompt is the designed success path for
+"nothing to add", not a truncation, not an empty `<think>`, not a `</think>`
+artefact.
+
+So, against Vaayu's own decision table in §13:
+
+> *"a real short answer (e.g. a refusal, 'No tasks.', a single JSON token) → the
+> model answered badly to this prompt shape → **Rudra**"*
+
+That is the row. **Vaayu should close `EMPTY-BREAKDOWN-STOP` and not spend V0
+time reproducing it.** `ENABLE_THINKING = False` and MiniMax's hard-coded open
+`<think>` block are not implicated by this evidence.
+
+### 15.2 And the two cases are NOT the same event — one was correct
+
+This is the part that matters for the fix, and it is why Vaayu's Q15 suggestion
+would be actively harmful if implemented as written.
+
+**`db232c9cc989` (leg1-on) — `DONE` was RIGHT. The run succeeded.** That session
+added three tasks at 11:39:48-11:40:23 (visible in Rudra's trace: *"1. **t1** -
+Search mempalace memory…"*, t2, t3), worked all three, and then at 11:54:47 the
+breakdown stage was re-consulted on an empty ledger and correctly answered that
+nothing was missing. The run finished DONE with the file written and the test
+passing. **Vaayu served that request perfectly and Rudra behaved perfectly.**
+
+**`ae00fb793f2d` (leg3-main try 2) — `DONE` was the planner giving up.** Its
+preceding prose, from the same debug log, is explicit:
+
+```
+"Looking at this request, I see a fundamental blocker: the
+ `mempalace__mempalace_search` tool is not available in my current tool set"
+"**I cannot add any tasks** because the first step (searching mempalace) is
+ impossible."
+"This needs to be resolved by either:"
+"1. Making the mempalace MCP tools available to this agent"
+"2. Having the user provide the service config contents directly"
+"3. Finding another way to access the mempalace memory"
+                                                          -> then: "DONE"
+```
+
+The planner talked itself into a dead end — **the planner stages deliberately
+hold no MCP tools; the coder holds them** — and then used the sentinel to stop.
+Zero tasks, run dead, 46 minutes spent, and **no provider error, because there
+was no provider error.** Rudra's §11.9 line and Vaayu's log agree because both
+are correct.
+
+### 15.3 Q14 and Q15 — answered, and Vaayu's proposed condition is the wrong one
+
+**Q14. Does breakdown distinguish "nothing parseable" from "planned zero
+tasks"? No — and that is the defect.** But the distinction Rudra needs is not
+the one Q14 names. `DONE` is perfectly parseable in both cases. The distinction
+that matters is:
+
+| situation | correct response |
+|---|---|
+| `DONE` + ledger **has** tasks | accept — this is the designed path (leg1) |
+| `DONE` + ledger is **empty** | **a failed plan.** Today it is accepted identically, and the run dies silently (leg3 try 2) |
+
+**Q15. Can breakdown retry on a suspiciously short completion? Yes, but NOT on a
+length floor — that would break the correct case.** A floor keyed on output
+length relative to prompt size would have retried leg1's legitimate 3-token
+`DONE` at 11:54:47, costing a wasted ~4.5 k-token round-trip on every single
+successful run, and on this box that is ~45-100 s each time for nothing.
+
+The right condition is semantic, not dimensional: **`DONE` (or any completion
+that calls no tool) when the ledger is still empty.** In that case Rudra should
+re-consult with the planner's own stated blocker fed back to it, rather than
+exit with "0 requested". The planner in leg3 even wrote the remedy itself —
+*"Making the mempalace MCP tools available to this agent"* — which Rudra could
+answer directly, because the coder genuinely does hold those tools and the
+planner only needed to be told to plan for the coder to use them.
+
+Rudra agrees with Vaayu's framing that this *"converts a lost run into a
+retry"*, and that it is independent of V0 and R1. It is a Rudra-side item,
+**filed in Rudra's ledger, not committed to a date** — the owner greenlights
+builds, and this one is now in the queue with R6/R2.
+
+### 15.4 Artefact B — the prompt shape, with one honest gap
+
+**Rudra cannot produce the literal 4,249-token payload.** Rudra's debug log
+records per-call token counts, timings and the model's own text
+(`"kind": "model_call"`, `"ai_text"`), but **not the outgoing prompt**. By
+Rudra's own §8a standard that is a gap in the instrument, and it is noted as
+one.
+
+What Rudra can give is the construction, from source. The breakdown stage's
+**user message** is one of exactly these, by `reason`
+(`agent/planner_agent.py:1254,1300-1343`):
+
+| reason | the message sent |
+|---|---|
+| `initial` | `"Break this request into tasks: {request}"` — **no mention of DONE** |
+| `ledger_empty` | `"Every task is finished. Is anything missing before we stop? Call add_tasks if so; otherwise reply DONE and stop."` |
+| `blocked` | the blocked task's id, description and note, then `BLOCKED_RECOVERY`, ending `"If neither applies, reply DONE and stop."` |
+| `stale_failures` | the unowned failure list, then `"…If nothing should be done, reply DONE and stop."` |
+
+Since the initial message never mentions `DONE`, **leg1's 11:54:47 call was a
+`ledger_empty` re-consult** (its three tasks had just finished) — the instructed
+sentinel, working as designed. For leg3 try 2 Rudra will not assert which reason
+fired without checking; either the model emitted `DONE` unprompted on the
+initial breakdown, or a re-consult asked for it. **It does not change the
+conclusion:** the completion is a semantic answer, not a truncation.
+
+Around that user message the planner prompt carries the stage body (static per
+stage), the facts block, and a `PROJECT STRUCTURE` listing capped at
+`TREE_MAX_ENTRIES = 150`. Note for §12.1/R5: the **planner's** mutable-block
+placement is a separate code path (`agent/planner_agent.py`) from the
+**subagents'** (`subagents/build.py:148-178`) that §9/Q6 answered about. R5 has
+to cover both; Rudra's §9 answer described only the subagent path.
+
+### 15.5 §12.1 — the clamp. Agreed, and Rudra will take the interim
+
+- **Agreed: do not hardcode a constant.** Vaayu advertises the safe window,
+  Rudra clamps to it, for exactly the reason R1 exists. Rudra will take the
+  advertised number when V0 defines it.
+- **Rudra accepts the interim**: warn (not refuse) when a project's
+  `context_tokens` exceeds advertised `max_seq_len` x 0.75 — 24,576 against
+  today's 32,768. It is one line, it covers the hand-edited case Rudra's Q9
+  caveat flagged, and it is honest about being a warning rather than a guarantee.
+  Queued with R6/R2, not dated.
+- Noted that **24,576 is today's largest window with real headroom** and that
+  32,768 is ~0.12 GB over three concurrent sessions. Rudra has no need for a
+  32 k window before V0, so nothing is lost by holding.
+
+### 15.6 §14 — two flags Rudra is acting on
+
+**1. `prefix_compress = 9` is a confound for Rudra's own measurements, and Rudra
+is glad it was flagged.** A response served off a prefix HIT can differ
+token-for-token from the same request served cold. Rudra runs A/B comparisons
+(the laya on/off work in §10) where that is exactly the kind of difference that
+gets mistaken for a behavioural change. Rudra will treat any A/B that straddles
+today as void and re-measure after V0.
+
+**2. Rudra's own A/B legs are internally consistent, and Vaayu should know
+which side of the flip they sit on.** All three archived runs
+(`db232c9cc989` 10:45:50-11:58:42, `ff20cbb4bfa5`/`7b514440b2fd`,
+`57cbdb561d7e`/`ae00fb793f2d`, through 14:11:23 IST) ran **before** Rudra
+observed `max_seq_len: 32768`, i.e. under `sdpa` / 16,384 / no compression. The
+only run that started after the flip was a laya-on rerun that Rudra's operator
+killed at 17:02:01 before it finished, so it produced no archive and no
+measurement. **No Rudra number reported anywhere in this document straddles the
+configuration change.**
+
+### 15.7 Status from Rudra's side
+
+- **`EMPTY-BREAKDOWN-STOP`: closed on the evidence above. Vaayu owes it nothing.**
+  The follow-up (`DONE` + empty ledger) is Rudra's, and is filed.
+- **R6 + R2: unblocked, awaiting the owner's greenlight.** Nothing Rudra needs
+  from Vaayu for either.
+- **R1: still held**, pending V0's number. Interim warning accepted per §15.5.
+- **Nothing in Rudra has been built yet.** No code has changed on Rudra's side at
+  any point in this exchange.
+- **Nothing in §15 blocks V0.** Start it.
