@@ -325,15 +325,44 @@ def test_store_failure_does_not_fail_the_request(capsys):
     from vaayu.prefix_cache import PrefixCacheStore
     from vaayu.vaayu_base import VaayuBaseModel
 
+    pc = PrefixCacheStore(budget_bytes=10 ** 9)
+    pc.store("other", [9, 9, 9], _bf16_cache(seq=6))
+    kept = pc._current_bytes
+    assert kept > 0, "premise: the pool holds another session's entry"
+
     c = _bf16_cache(seq=4)
     _oom_on_park(c)
-    pc = PrefixCacheStore(budget_bytes=10 ** 9)
     fake = types.SimpleNamespace(_kv_writer=None, config=None)
     VaayuBaseModel._persist_and_store(fake, pc, "sess", c, [1, 2, 3, 4, 5])
     assert pc.peek_match("sess", [1, 2, 3, 4]) == 0
-    assert pc._current_bytes == 0
+    # The blast radius stops at the failed session: a neighbour sharing the
+    # pool keeps its entry, and the byte count still accounts for exactly it.
+    assert pc.peek_match("other", [9, 9, 9]) == 3
+    assert pc._current_bytes == kept
     out = capsys.readouterr().out
     assert "WARNING" in out and "sess" in out and "OutOfMemoryError" in out
+
+
+def test_a_persist_failure_still_propagates():
+    """The handler wraps the POOL STORE only. A kv_persist failure means the
+    on-disk record silently missed this turn's tokens -- a different failure
+    with a different meaning, undetectable until a restore serves the previous
+    turn's bytes. Widening the `try` to cover `enqueue_append` would swallow
+    it, so this pins the scope."""
+    import types
+    import pytest
+    from vaayu.prefix_cache import PrefixCacheStore
+    from vaayu.vaayu_base import VaayuBaseModel
+
+    class _Writer:
+        def enqueue_append(self, sid, cache, cfg, toks, length):
+            raise RuntimeError("the kv writer died")
+
+    c = _bf16_cache(seq=4)
+    pc = PrefixCacheStore(budget_bytes=10 ** 9)
+    fake = types.SimpleNamespace(_kv_writer=_Writer(), config=None)
+    with pytest.raises(RuntimeError, match="the kv writer died"):
+        VaayuBaseModel._persist_and_store(fake, pc, "sess", c, [1, 2, 3, 4, 5])
 
 
 def test_store_failure_retains_no_reference_to_the_cache():

@@ -2035,6 +2035,11 @@ class FP8DynamicCache(DynamicCache):
                 moved = getattr(layer, name).to(device, non_blocking=not to_cpu)
                 setattr(layer, name, moved)
 
+    # One-time latch for the fallback's WARNING below. On the CLASS, not an
+    # instance: a 62-layer park must not print 62 lines, and the condition is a
+    # property of the buffer layout rather than of one cache.
+    _park_fallback_warned = False
+
     @staticmethod
     def _compact_to_cpu(src, used: int, out=None):
         """`src[..., :used, :]` in ordinary CPU memory, allocating NOTHING on
@@ -2052,8 +2057,10 @@ class FP8DynamicCache(DynamicCache):
         A `[*lead, S_cap, D]` KV buffer is contiguous, so `[..., :used, :]` is a
         set of contiguous `[used, D]` prefixes -- one per leading index, strided
         apart by `S_cap * D`. Copying them block by block touches no device
-        memory and moves exactly `used` positions across PCIe, fewer than the
-        capacity-sized read it replaces. Bit-identical to the old reference by
+        memory at all. The PCIe bytes are UNCHANGED: the old `.contiguous()`
+        was a device-to-device copy, so that path too sent only `used`
+        positions over the bus. What this removes is one device ALLOCATION and
+        one device-side copy. Bit-identical to the old reference by
         construction: the same bytes, in the same order.
 
         Every copy is BLOCKING. The destination is pageable (never pinned --
@@ -2062,18 +2069,43 @@ class FP8DynamicCache(DynamicCache):
         before any byte has arrived.
 
         `out` lets a caller fill a slice of a larger CPU tensor (windowed_kv's
-        ring tail); it must already have the compacted shape. Every shape is
-        read off `src` -- no layer, head or dim count appears here (§5).
+        ring tail). It is checked, not trusted: `copy_` BROADCASTS, so a
+        wrong-shaped destination would silently replicate one position across
+        the rest instead of failing. Every shape is read off `src`/`out` -- no
+        layer, head or dim count appears here (§5).
         """
         used = int(used)
+        if src.dim() < 2:
+            raise ValueError(
+                f"_compact_to_cpu needs a [*lead, S, D] buffer; got "
+                f"{src.dim()} dim(s), shape {tuple(src.shape)}")
+        if not 0 <= used <= src.shape[-2]:
+            raise ValueError(
+                f"used={used} is off this buffer's sequence axis "
+                f"[0, {src.shape[-2]}] (shape {tuple(src.shape)})")
+        want = (*src.shape[:-2], used, src.shape[-1])
         if out is None:
-            out = torch.empty((*src.shape[:-2], used, src.shape[-1]),
-                              dtype=src.dtype, device="cpu")
+            out = torch.empty(want, dtype=src.dtype, device="cpu")
+        elif tuple(out.shape) != want:
+            raise ValueError(
+                f"out has shape {tuple(out.shape)}, expected {want}")
         if not src.is_contiguous():
             # The per-block argument holds only for a contiguous source: a
             # transposed or otherwise strided buffer has no contiguous
             # [used, D] prefixes to copy. Take the old path, which DOES
-            # allocate on the device, rather than copy the wrong bytes.
+            # allocate on the device, rather than copy the wrong bytes --
+            # announced, because an OOM from here would otherwise be
+            # indistinguishable from the pre-fix defect (§5: warn, never
+            # degrade silently).
+            if not FP8DynamicCache._park_fallback_warned:
+                FP8DynamicCache._park_fallback_warned = True
+                print(f"[Vaayu-Prefix] WARNING: parking a non-contiguous KV "
+                      f"buffer (shape {tuple(src.shape)}, strides "
+                      f"{tuple(src.stride())}) -- it has no contiguous "
+                      f"per-position blocks to copy, so the park is staging on "
+                      f"the GPU again and allocating device memory that no "
+                      f"VRAM budget charges. Printed once per process. "
+                      f"(a real limit, announced -- not a swallowed error)")
             out.copy_(src[..., :used, :])
         elif used == src.shape[-2]:
             out.copy_(src)                  # contiguous end to end: one DMA

@@ -123,3 +123,34 @@ def test_park_bytes_identical_to_contiguous_reference(geo):
     for name in c._BUFFER_LISTS:
         for i, t in enumerate(getattr(c, name)):
             assert torch.equal(t, want[name][i]), (name, i)
+
+
+def test_the_device_staging_fallback_warns_once(monkeypatch, capsys):
+    """The fallback restores the exact device allocation this fix removes, so
+    an OOM from it must not look like pre-fix behaviour (CLAUDE.md §5: warn,
+    never degrade silently) -- but a 62-layer park must not print 62 lines."""
+    monkeypatch.setattr(FP8DynamicCache, "_park_fallback_warned", False)
+    src = torch.randn(1, 2, 6, 4).bfloat16().transpose(1, 2)
+    assert not src.is_contiguous()
+    for _ in range(3):
+        FP8DynamicCache._compact_to_cpu(src, 1)
+    out = capsys.readouterr().out
+    assert out.count("[Vaayu-Prefix] WARNING:") == 1
+    assert "non-contiguous" in out
+
+
+def test_the_helper_refuses_inputs_it_cannot_park_correctly():
+    """A shared primitive across two modules now. `copy_` BROADCASTS, so a
+    wrong-shaped `out` would silently replicate one position across the rest
+    instead of failing, and a 1-D source would fabricate a plausible 2-D
+    result where the old slice raised."""
+    src = torch.randn(1, 2, 6, 4).bfloat16()
+    with pytest.raises(ValueError, match="dim"):
+        FP8DynamicCache._compact_to_cpu(src[0, 0, :, 0], 1)
+    with pytest.raises(ValueError, match="used"):
+        FP8DynamicCache._compact_to_cpu(src, src.shape[-2] + 1)
+    with pytest.raises(ValueError, match="used"):
+        FP8DynamicCache._compact_to_cpu(src, -1)
+    bad = torch.empty((*src.shape[:-2], 3, src.shape[-1]), dtype=src.dtype)
+    with pytest.raises(ValueError, match="out has shape"):
+        FP8DynamicCache._compact_to_cpu(src, 1, out=bad)
