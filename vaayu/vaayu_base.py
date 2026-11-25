@@ -3646,7 +3646,8 @@ class VaayuBaseModel(GenerationMixin):
                 else:
                     print(f"[Vaayu-MoE] WARNING: Expert VRAM cache disabled — free VRAM "
                           f"{_free_vram/1e9:.2f}GB leaves {_vram_budget/1e9:.2f}GB after the "
-                          f"{self._vram_plan.reserve_bytes/1e9:.2f}GB reserve, under one "
+                          f"{self._vram_plan.reserve_bytes/1e9:.2f}GB reserve and the "
+                          f"{self._expert_tier_margin_bytes/1e9:.2f}GB tier margin, under one "
                           f"{self._moe_geometry['expert_bytes']/1e6:.1f}MB expert. Every expert "
                           f"streams per token; expect very slow decode (a real hardware limit, "
                           f"not a bug).")
