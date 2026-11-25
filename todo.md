@@ -211,10 +211,15 @@ flash@32768 9.12+13.09=**22.21** (expert arena GB + prefix pool GB). `max_seq_le
 `sessions x max_seq_len` is visible downstream"). **So no config change can fix this; only code can.**
 
 **Two defects behind it:**
-- `vaayu_base.py:3667` — `prefix_budget = effective_available_bytes() - 3.5 GiB`, i.e. all remaining
-  RAM minus a flat constant. The same codebase already learned this for the I/O-mode decision
-  (`safetensor_model_persister.py:303` subtracts the arena explicitly, with the 2026-10-04 regression
-  in its comment). The prefix budget never got that treatment.
+- `vaayu_base.py:3667` — `prefix_budget = effective_available_bytes() - 3.5 GiB`, i.e. the cgroup-aware
+  basis minus a flat constant. **CORRECTED 2026-11-25:** this bullet used to say the budget "never got"
+  `safetensor_model_persister.py:303`'s treatment of subtracting the expert arena explicitly. **It must not
+  get it** — that site runs at load START, before the arena is pinned, while this one runs at load END,
+  after (`vaayu_base.py:383`, `:759`), so the arena is already charged in `memory.current` and already out
+  of `effective_available_bytes()`. Subtracting it twice double-counts ~12 GB: the §2.3 pinned-arena trap
+  the shipped 2026-11-22 cgroup-budgeter design prices at ~9 GB. The genuine hole is the flat 3.5 GiB
+  reserve against ~1.5 GB of real margin, and the keep-one-entry floor below, which ignores the budget
+  outright. D1's Task 5 is re-scoped accordingly (warn when budget < one full-length entry).
 - **No feedback anywhere.** All four `effective_available_bytes()` call sites run at LOAD time
   (`vaayu_base.py:2996,3065,3196,3667`, `safetensor_model_persister.py:303`); nothing re-reads memory
   during a run. systemd hands the process `MEMORY_PRESSURE_WATCH` + `MEMORY_PRESSURE_WRITE` (PSI) and
