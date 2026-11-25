@@ -347,6 +347,29 @@ while Rudra's own window stays 16 k** — Vaayu's ceiling does not lengthen chai
       compacted entry. ~2 GB apart, same bytes. Candidates: malloc trim / `release_freed_host_pages()`, or
       the 1 Hz sampler missing the true peak. Matters because Task 5's load-time warning sizes an entry, so
       a 2 GB error in entry size is a 2 GB error in the threshold.
+- [ ] **Better behaviour than the shipped fix, found in Task 8's review — swallow the store failure AND
+      attempt the cropped re-park.** Fix B (`70b11b0`) returns normally instead of raising, which is right
+      for the user, but it also stops the speculative path's existing recovery: at `vaayu_base.py:7329`
+      `_persist_and_store` sits inside a `try/except BaseException: restore_on_abort(*_checked_out); raise`,
+      and pre-fix a store failure DID fire `restore_on_abort`, cropping to `prefix_len` and re-storing a
+      SMALLER entry that might have fit (`prefix_cache.py:396-397`). Ruling 2026-11-25: Fix B stands — the
+      user keeps a 133 s answer and pays one cold prefill next turn — but the handler could do both if the
+      caller hands it the checked-out tuple. Reachable on **every dense load** (`use_prompt_lookup="auto"`
+      resolves True for dense, so `choose_speculative_target` never returns `generate` there).
+      **CORRECTION to `be2aa25`'s commit message:** its claim that the raise "skipped `restore_on_abort` so
+      the popped entry was lost" is true only of the `generate()` path (`:6826-6834`); on the speculative
+      path it did NOT skip it.
+- [ ] **Task 8 re-open condition (from its review):** `PrefixCacheStore.drop()` is unreachable today —
+      `store()` raises only inside `to_cpu()`/`compress_cache()`, both before the lock and before any
+      insertion — so it can only no-op. It is deliberate defence. **Re-open if any failure point moves
+      inside `store()`'s locked block**, and note it drops whatever entry sits under the id, not only a
+      partial one.
+- [ ] **Before merging D1: fix the FALSE perf claim in `vaayu_base.py:2054-2056`'s docstring.** It says the
+      block copy "moves exactly `used` positions across PCIe, fewer than the capacity-sized read it
+      replaces". The replaced code already moved exactly `used` positions; its `.contiguous()` was a
+      DEVICE-to-device copy, so **PCIe bytes are unchanged**. The real win is one fewer device allocation
+      and one fewer device-side copy. Same wording is in `be2aa25`'s message and was in the task brief
+      (corrected there 2026-11-25). Flagged because §0 exists to un-rot exactly this kind of claim.
 - [ ] The hang travels with this row — see [bug] SIGNAL-STOP-IGNORED, which is the SAME bug seen from
       the shutdown end. NOTE the killed arm also shows why a stuck request looks like a hang: with
       `anon` reclaimed to 0.02 GB the process thrashes before it dies.
