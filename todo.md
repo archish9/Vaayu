@@ -8,7 +8,57 @@ SETTLED list of refuted perf ideas lives there too — read it from git before p
 
 ## What we are working on (read this first)
 
-The live thread is the **N>1 batching sweep through the server** and acting on what it found. N>1 batching = the
+**THE LIVE THREAD (2026-11-25): the Rudra handoff build-out — EIGHT features, ONE PER FRESH SESSION, IN THIS
+ORDER.** Source: `HANDOFF-RUDRA-CONTEXT-2026-11-24.md` (repo root, git-tracked, self-contained — both cost laws,
+the 1125 s compaction decomposition, Rudra's two replies, and §16's root cause of the OOM kills). Each feature
+has a **self-contained design doc** written 2026-11-25 so it can be built COLD, in a fresh session, without
+reading this thread. **Pick the lowest-numbered doc that is not closed.** `docs/` is gitignored (§7), so every
+row below also carries its own numbers — the doc is the detail, never the only copy of the conclusion.
+
+**FACT AUDIT, 2026-11-25.** Every Rudra-side `file:line` in those docs was verified against Rudra's tree
+(`/home/a/code/ai-ml/agent/RudraAnvil`, `main` **`cba6fff`**; the handoff quoted `d5c7e61`). Result:
+`docs/2026-11-25-handoff-feature-docs-FACT-AUDIT.md`. Headlines that matter to the plan — **`max_seq_len`
+appears ZERO times in Rudra's `src/`, and `"max_output_tokens": None` still ships, and there is no
+Rudra-owned summarization middleware: R1, R6 and R2 are ALL still unshipped, so nothing on Rudra's side
+has changed since the measured run.** The 0.85 compaction fraction is confirmed at upstream source
+(`deepagents/middleware/summarization.py:34`), so the D7 discriminator (13,926 vs 27,853) is read off
+source on both sides. `subagents/build.py` and `loop/engine.py` line numbers in the handoff have
+**drifted**; `llm/providers.py`, `llm/probe.py` and `agent/planner_agent.py` have not.
+
+| # | feature | doc, in `docs/superpowers/specs/` | row below | gate |
+|---|---|---|---|---|
+| **D1** | HOST-RAM-CEILING — unpin the parked prefix pool, ship a safe default (+ drop the `DEFAULT_STREAM=False` override) | `2026-11-25-D1-host-ram-ceiling-design.md` | `[bug] HOST-RAM-CEILING` | none — **START HERE** |
+| **D2** | COLD-FIRST-LONG-PREFILL-OOM — a cold boot's first long request CUDA-OOMs | `2026-11-25-D2-cold-first-long-prefill-oom-design.md` | `[bug] COLD-FIRST-LONG-PREFILL-OOM` | **THIS IS RUDRA'S R1 RELEASE SIGNAL** (§16.3) |
+| **D3** | SIGNAL-STOP-IGNORED — the orphaned request and the signals it swallows | `2026-11-25-D3-signal-stop-and-orphan-hang-design.md` | `[bug] SIGNAL-STOP-IGNORED` | run AFTER D1 (memory confound) |
+| **D4** | `usage.prompt_tokens_details.cached_tokens` on both response paths | `2026-11-25-D4-cached-tokens-usage-design.md` | `[ ] CACHED-TOKENS` | none |
+| **D5** | advertise the derived SAFE window, so Rudra clamps to a number that cannot go stale | `2026-11-25-D5-safe-window-advert-design.md` | `[ ] SAFE-WINDOW-ADVERT` | **needs D1 + D2's numbers** |
+| **D6** | `ttft_s: null` on non-streaming rows drops them out of every prefill fit | `2026-11-25-D6-ttft-nonstreaming-design.md` | `[bug] RUDRA-RUN-TELEMETRY` 1st bullet | must precede D7 |
+| **D7** | verify the raised ceiling on a real Rudra run — **MEASURE ONLY, no engine code** | `2026-11-25-D7-verify-ceiling-design.md` | `[~] RUDRA-CTX-COMPACTION` 3rd task | **BLOCKED until Rudra ships R1** |
+| **D8** | elastic expert tier on MiniMax — INVESTIGATION, real chance of refutation | `2026-11-25-D8-elastic-tier-minimax-design.md` | `[ ] ELASTIC-TIER-MINIMAX` | none; gates nothing |
+
+**Joint order agreed with Rudra** (handoff §11.7, amended by §16.3). **Vaayu:** D1 → D2 (which releases R1) →
+D4 → D5 → D7 → D8, with D3 and D6 slotted where they fit. **Rudra:** **R6** (`max_tokens` on every request) and
+**R2** (cap the compaction summary at ~250 tokens) are clear to go now and depend on nothing of Vaayu's; **R1**
+(derive the compaction trigger from the advertised window instead of a hand-written `context_tokens`) is **HELD
+by agreement** until Vaayu reports that a cold long first request is safe; **R5** then **R3** come last, with
+evidence from D4. **One change per measured run**, or neither side can attribute the result.
+
+**Three things in that handoff are CLOSED — do NOT rebuild them.** (a) `EMPTY-BREAKDOWN-STOP`: the 3-token
+completion was the literal word `DONE`, a sentinel Rudra's own breakdown prompt asks for — NOT A DEFECT, and
+Vaayu's `ENABLE_THINKING`/`<think>` hypothesis is REFUTED (§15.1, §16). (b) **Option B**, a PSI
+`MEMORY_PRESSURE_WATCH`-triggered cache shed: REFUTED by measurement — PSI stayed **0.00** through the entire
+climb and first exceeded 1.0 **two seconds** before the fatal peak, so there is no usable warning window for
+unreclaimable memory. (c) the handoff's **V5** (prefix budget at the new ceiling): subsumed by D1, same defect
+from the other end. The **heartbeat-cadence** defect stays **unprioritised** — Rudra's inter-chunk timeout is
+600 s in those runs (300 s default) against Vaayu's worst measured wire silence of **17.66 s**, 17–35× under, so
+it cannot be costing them runs.
+
+---
+
+**PREVIOUS THREAD, whose key output is still the standing rule.**
+
+Before 2026-11-25 the live thread was the **N>1 batching sweep through the server** and acting on what it found
+(now CLOSED; its rule below still stands and is cited by the rows). N>1 batching = the
 server fusing several *concurrent* client requests into one batch (`MAX_BATCH_SIZE>=2`, sdpa only). The client
 (Rudra — a local-first autonomous coding agent, provider-agnostic, talks OpenAI-wire to Vaayu; its brief is
 `docs/rudra-batching-findings-2026-10-14.md`) controls whether it fans out concurrent calls at all.
@@ -81,6 +131,8 @@ running. Boot/kill a background server with the Bash tool; `pkill -9 -f "python 
 
 ## [bug] COLD-FIRST-LONG-PREFILL-OOM — **the FIRST request after boot, at 21,551 tokens, CUDA-OOM'd at `MAX_SEQ_LEN=32768`; the same prompt succeeds once the server is warm**
 
+**BUILD DOC (self-contained, build it cold):** `docs/superpowers/specs/2026-11-25-D2-cold-first-long-prefill-oom-design.md` — **D2 of 8.** **This row is Rudra's R1 release signal** (handoff §16.3): R1 ships when Vaayu reports a cold long first request is safe, NOT when HOST-RAM-CEILING lands.
+
 Found 2026-11-24 as a confound while running HOST-RAM-CEILING's A/B, and it is a separate defect.
 
 **What happened.** Fresh boot (`run-2026-11-24T12-52-41Z`, flash, 32768, plan validated `S_max=32768`,
@@ -118,6 +170,8 @@ convert into a second, different failure that the client sees as a 500.
 ## [x] EMPTY-BREAKDOWN-STOP — **CLOSED 2026-11-24 AS NOT A DEFECT, same day it was filed. The 3 tokens were the literal word `DONE`** — a sentinel Rudra's own breakdown prompt asks for (`planner_agent.py:1305`: *"otherwise reply DONE and stop"*). Vaayu's `ENABLE_THINKING` / hard-coded-open-`<think>` hypothesis is REFUTED and nothing was built. Two lessons worth keeping: (a) **the two cases were NOT the same event** — identical in Vaayu's telemetry (ptok ~4.3k, out 3, `finish=stop`) but leg1's was the designed success path on a `ledger_empty` re-consult and only leg3's was a planner dead-end, so **token counts cannot distinguish a correct short answer from a failed one** and asking the client for the completion text was the only way; (b) the retry condition Vaayu proposed (a length floor) **would have been actively harmful** — it would retry every legitimate `DONE` at ~45-100 s a time. Full text: `todo-backlog.md`. Follow-up (`DONE` + empty ledger) is Rudra's and is filed on their side.
 
 ## [bug] HOST-RAM-CEILING — **ROOT-CAUSED 2026-11-24 by a mirrored A/B: UNCOMPRESSED pooled prefix entries are PINNED (shmem), so the pool is unreclaimable and walks the cgroup into a SIGKILL. `PREFIX_COMPRESS=9` moves it to ANON and survives.** Fix shape is now a code decision, not an investigation
+
+**BUILD DOC (self-contained, build it cold):** `docs/superpowers/specs/2026-11-25-D1-host-ram-ceiling-design.md` — **D1 of 8, START HERE.** Fix shape **DECIDED 2026-11-25**: option (i), unpin the park (`vaayu_base.py:2043` + `:2029`, the only two `pin_memory()` sites in the path), then MEASURE the prefix-HIT restore cost; the bounded pinned staging ring is a contingency with a >5 % trigger, not pre-built work. Option (iii) (budget the pool against the cap) rides along as a lower-priority second belt. Honest correction to this row's own text: (i) costs no OUTPUT BITS, but it does trade pinned H2D for pageable H2D on every HIT restore (~3.3 GiB at a 13,926-token chain) — unmeasured, hence measure-then-decide.
 
 **THE A/B (both arms: flash, `MAX_SEQ_LEN=32768`, `prefix_sessions=3`, GPU free 12.47 GiB at load,
 reserve 8.56 / pinning 4.22 / tier 3.28 — identical plans; same 4-request warm-up, then the same
@@ -219,6 +273,8 @@ at 7.4 k a turn-2 match fell 7422/7517 -> 44/7517, TTFT 25.0 -> 51.3 s (row 31).
 unavailable: 28 GiB of 31 GB total already leaves ~1 GB for the desktop.
 
 ## [~] RUDRA-CTX-COMPACTION — a 78-min Rudra stress run on MiniMax-M2.7 spends **19 % of its wall clock on context compaction forced by `MAX_SEQ_LEN=16384`**. The ceiling can DOUBLE: flash's `S_max` is 32768 (measured on device 2026-11-24) at sdpa-16384's budget profile
+
+**BUILD DOC for this row's remaining task (self-contained):** `docs/superpowers/specs/2026-11-25-D7-verify-ceiling-design.md` — **D7 of 8, MEASURE ONLY, no engine code.** **BLOCKED until Rudra ships R1**, which is gated on D2. Running it earlier measures the OLD trigger and reads as 'the ceiling raise bought nothing' — a wrong conclusion from a correct measurement.
 
 **Handoff to Rudra:** `HANDOFF-RUDRA-CONTEXT-2026-11-24.md` (repo root, at the user's explicit request —
 self-contained: both cost laws, the 1125 s decomposition, the 7 ranked Rudra asks with prices, Vaayu's own
@@ -360,6 +416,8 @@ the opposite direction). This row is about CONTEXT, not about the tier.
 
 ## [bug] SIGNAL-STOP-IGNORED — a server survived both SIGINT and SIGTERM; found 2026-11-24 while cycling boots for RUDRA-CTX-COMPACTION. **PREMISE CORRECTED: it was NOT idle**
 
+**BUILD DOC (self-contained, build it cold):** `docs/superpowers/specs/2026-11-25-D3-signal-stop-and-orphan-hang-design.md` — **D3 of 8.** Run it AFTER D1: in the killed arm `anon` was reclaimed to 0.02 GB, so memory thrash is half the symptom. `py-spy` and every ptrace profiler are FORBIDDEN here — use `faulthandler.dump_traceback_later` or an in-process watchdog.
+
 **CORRECTION 2026-11-24, same day.** This row was filed as "an IDLE server ignored signals". It was not
 idle: `run-2026-11-24T08-13-45Z` logged 27 POSTs against 26 completed rows, and its orphan request went
 quiet at 09:03:46 — so the process had been 77 minutes inside a request that had stopped producing
@@ -387,6 +445,8 @@ or a SIGQUIT-free in-process watchdog thread to name the native call that is spi
 
 ## [bug] RUDRA-RUN-TELEMETRY — two small holes found while reading `run-2026-11-24T03-22-54Z`; neither affects serving
 
+**BUILD DOC for the first bullet (self-contained):** `docs/superpowers/specs/2026-11-25-D6-ttft-nonstreaming-design.md` — **D6 of 8; must precede D7, which consumes it.** NOT a one-liner: only the streaming path has a first-token event (`engine.py:855-859`); the non-streaming path builds its row after generation completes (`engine.py:700-725`), so there is no observation point to read. The second bullet is RUDRA's and is SETTLED — the non-streaming call was the AGENTS.md summariser (`loop/engine.py:1670-1700`), confirmed to the second in §12.2, not `probe.py`. Vaayu's own half of it (removing the `DEFAULT_STREAM=False` override) is a D1 task.
+
 - [ ] A non-streaming request (`stream: false`, `wire: null`) logs **`ttft_s: null`** — the one such row in
       the run (session `db232c9cc989`, ptok 352, 140 tokens, wall 87.9 s, `finish stop`, no error) carries no
       TTFT at all, so it drops out of every prefill fit. Streaming rows are fine.
@@ -395,6 +455,129 @@ or a SIGQUIT-free in-process watchdog thread to name the native call that is spi
       says that was to be fixed Rudra-side; it is not fixed on every path. Vaayu side: nothing to do but
       record it — a `stream:false` request is wire-silent for its whole wall time by construction
       (87.9 s here), and heartbeats cannot help it. Hand back to Rudra.
+
+## [ ] CACHED-TOKENS — put `usage.prompt_tokens_details.cached_tokens` on the wire, so Rudra can measure its own prefix reuse from its own logs
+
+**BUILD DOC (self-contained, build it cold):** `docs/superpowers/specs/2026-11-25-D4-cached-tokens-usage-design.md` — **D4 of 8.** Filed 2026-11-25 from `HANDOFF-RUDRA-CONTEXT-2026-11-24.md` §8/Q8-3 (Rudra's ask) → §11.4 (Vaayu's acceptance and the key choice) → §11.6 (promoted above the elastic tier) → §11.9/Q13 (Rudra verified it) → §12.4.
+
+**Why.** **42 % of every prompt position Rudra sent was a re-prefill** — 113,911 of 269,083 in the 78-min run.
+Vaayu can see that; Rudra cannot, and Rudra's standing rule is that a diagnostic number living only on the other
+machine does not exist. Both sides spent two rounds arguing about prefix misses from one side's logs.
+
+**DECIDED: the STANDARD OpenAI key, not a custom pair.** `usage.prompt_tokens_details.cached_tokens`.
+`langchain_openai` **1.4.2** already maps it to `usage_metadata.input_token_details.cache_read` on BOTH paths
+(`chat_models/base.py:4168` non-streaming, `:4222` streaming, documented `:3442`) — Rudra verified it in their
+installed tree: **zero parsing on their side**. `new_positions = prompt_tokens − cached_tokens`, so no second
+field. **R3-compatible**: it measures prefill reuse regardless of who writes the compaction summary or whether
+one exists, so it is not wasted if Rudra stops asking Vaayu for summaries.
+
+**THE DESIGN RISK, in one line.** The value Vaayu already computes (`engine.py:458`,
+`self._prefix_matched() - matched_before`) comes from **process-wide counters** — correct per-request only
+because the server serves one request at a time (`slot()` under `self._lock`, `MAX_BATCH_SIZE=1`). Under N>1 it
+is a **batch-wide** number. Ship the field AND state that limit in a code comment, `vaayu/server/README.md` and
+this row — a plausible-looking wrong number at N>1 is exactly `WIRE-BATCHED-ZERO`'s false-healthy-zeros mistake.
+
+**Sites:** `GenerationResult` at `engine.py:98-105`; its three producers `engine.py:729`, `:940`, `:1212-1213`;
+`class Usage` at `server/schemas.py:180`; the two response builders `server/app.py:967` (non-streaming) and
+`:1392` (streaming, **guarded by `req.stream_options.include_usage` at `:1390`** — Rudra sets `stream_usage=True`
+so they get it; a client that does not ask gets no usage block, which is OpenAI-correct, do not "fix" it).
+
+**Verify on DENSE too**, not just MiniMax: the dense path goes through speculative decoding
+(`use_prompt_lookup=auto → True`), so `generate()` is never entered and prefix MISS/HIT was never printed there
+(`prefix-cache-dense-reach`; both found bugs fixed `1454ac6`). A dense HIT reporting 0 is that reach bug class.
+
+**§8:** no knob (standard wire field, always on). Must be plumbed through both builders — grep both.
+**Stop rules:** reporting only, output ids must not move (`tests/test_prefix_hit_bitwise_gate.py` is the bar); do
+NOT build a token-count endpoint (both sides declined it — a round trip is 16.4 s of fixed cost before a single
+position, so Rudra keeps the estimate local); do NOT add a custom `prefix_match`/`new_positions` pair.
+**Fixtures from the measured run:** the three compaction requests had `prefix_match_tokens = 7` against prompts
+of 11,750 / 10,123 / 7,465; the clean live run had 3,249/4,631 then 4,627/4,839 then 4,835/4,993.
+
+## [ ] SAFE-WINDOW-ADVERT — advertise the DERIVED safe window, so Rudra clamps to a number that cannot go stale
+
+**BUILD DOC (self-contained, build it cold):** `docs/superpowers/specs/2026-11-25-D5-safe-window-advert-design.md`
+— **D5 of 8. NEEDS D1 AND D2's NUMBERS; do not ship before both.** Filed 2026-11-25 from
+`HANDOFF-RUDRA-CONTEXT-2026-11-24.md` §11.9/Q9 (Rudra asks what number to enforce) → §12.1 (Vaayu's formula and
+preference) → §15.5 (Rudra agrees and takes the interim).
+
+**Why.** Vaayu advertises `max_seq_len` on `/health` (`server/app.py:670`) and `/v1/models` (`:723`). That is the
+**hard ceiling, not the safe one**, for two measured reasons: at 32,768 one full-length prefix entry is
+32,768 × 248 KiB = **7.75 GiB**, so the ~12.9 GB pool holds about **1.7** of them against ~3.2 at 16,384, and
+with `PREFIX_SESSIONS=3` the pool goes over capacity and evicts; and **§14's "ceiling 32768" is verified WARM
+ONLY** (D2). Rudra's R1 derives its trigger as `window × 0.85` from whatever Vaayu advertises, so advertising a
+number Rudra cannot safely fill makes runs LESS stable and both sides would misread the deaths as a flash-flip
+regression.
+
+**DECIDED intent (agreed with Rudra, §15.5): do NOT hardcode a clamp constant** — Vaayu advertises, Rudra clamps,
+*"for the same reason R1 exists at all: a number that lives on one machine and is copied to the other goes
+stale."* **OPEN:** the field name/shape (**propose it to Rudra in HANDOFF §17 before shipping** — Vaayu said it
+would), the number itself (an output of D1/D2), and whether it is computed at load or per GET.
+
+**The formula is fixed (§12.1); only the number moves:**
+`entry = chain_tokens × 248 KiB × 0.61` (9-bit packing; **measured 0.55× on this model**),
+`chain_tokens = window × 0.85`, and `PREFIX_SESSIONS (3) × entry <= pool budget (12.82 GB today)`.
+16,384 → chain 13,926, entry 2.16 GB, 3 sessions **6.47 GB** (comfortable). **24,576 → 20,889 / 3.23 / 9.70 GB —
+the largest window with real headroom.** 32,768 → 27,853 / 4.31 / **12.94 GB = 0.12 GB OVER**, i.e. ~2.97
+sessions. Uncompressed, three 32 k sessions would need **21.2 GB** against the same budget.
+
+**The cliff is not graceful**, which is why advice beats discovery: at 7.4 k a turn-2 match fell **7422/7517 →
+44/7517** and TTFT went **25.0 → 51.3 s** — reuse collapses to zero rather than degrading.
+**Interim Rudra already accepted:** warn (not refuse) when a project's `context_tokens` exceeds advertised
+`max_seq_len × 0.75` = **24,576** today. Rudra's hold on R1 covers its DEFAULT only — a user who hand-edits
+`context_tokens = 32768` gets 27,853-token chains today with no code change on either side.
+**Rudra-side blast radius, so it is not discovered later:** their `context_tokens` also drives tool-result
+eviction thresholds and the memory recall budget (`context/budget.py`, `RECALL_FRACTION = 0.02`) — one number,
+four consumers.
+
+**§8:** probably no knob (derived, like `max_seq_len`'s own advertisement) — state it, don't assume it; both
+`app.py:670` and `:723` must carry it. Rudra already fetches `/v1/models` at startup and reads only
+`batching.recommended_client_concurrency`, **discarding `max_seq_len`, a sibling key in the same response** — so
+a new sibling costs them one line. **Stop rules:** no hardcoded constant; do NOT start refusing between the safe
+window and `max_seq_len` (advice, not policy); no `max_tokens` recommendation here (deferred, depends on
+ELASTIC-TIER-MINIMAX); `PREFIX_SESSIONS 3 → 2` is REFUTED as a way to buy window (zero saving against the cap,
+and it moves the pool toward that cliff).
+
+## [ ] ELASTIC-TIER-MINIMAX — can `elastic_tier.py` run on MiniMax at all? INVESTIGATION, real chance of refutation
+
+**BUILD DOC (self-contained, build it cold):** `docs/superpowers/specs/2026-11-25-D8-elastic-tier-minimax-design.md`
+— **D8 of 8, LAST, gates nothing.** Filed 2026-11-25 from `HANDOFF-RUDRA-CONTEXT-2026-11-24.md` §V2, §11.6,
+§11.7 step 6. The handoff's own framing, keep it: *"an investigation with a real chance of being refuted, not a
+promise."* **A refutation written up with numbers is a COMPLETE result for this row.**
+
+**The refusal, verbatim, on MiniMax today** — `vaayu/elastic_tier.py:104`: *"elastic expert tier OFF: decode
+graphs are installed, and their memory pool is not something this tier may return to the driver. 5.27 GiB of the
+reserve stays unlent."* Sibling guards: `:109` (speculator), `:114` (pre-allocated KV). Before them, `:99-102`
+requires `lendable = reserve − base_floor >= expert_bytes` and `_lend_pays(...)`.
+
+**JUDGE THIS ON ADMISSION STABILITY, NOT DECODE tok/s.** Growing the MiniMax expert VRAM tier is **SETTLED
+2026-10-16** — H2D is only **31.5 %** of a token and the ceiling is **~12 %** — and `ATTN-AB` reconfirmed it from
+the opposite direction: flash's **2.4× bigger** tier moved `gb_tok` by **0.08 %**. What is NOT settled is
+admission: Rudra sends no `max_tokens`, so admission reserves the worst case, and on the 16 k run that
+**ratcheted the tier 3.21 → 2.81 GB over 42 requests (cached layers 45 → 39 of 62)**. Live line:
+`admission: evicted 0.05 GiB of the expert VRAM tier to admit 32768 tokens (predicted peak 8.56 GiB) and capped
+its budget 3.17 -> 3.12 GB`. If this lands, Rudra's R6 becomes a nicety instead of a requirement, and Vaayu can
+answer the one thing it DEFERRED (§11.4/Q8-4: advertise a recommended `max_tokens` ceiling — Rudra wants their
+planner 1,500 / coder 2,000 / tester 1,500 / reviewer 800 / compaction 250 / probe 16 sanity-checked against
+admission).
+
+**Where it DOES run, for scale — and NOT re-verifiable on device:** gpt-oss-20b, S35-E (merged `5bd31c3`
+2026-10-11) decode **56.7 → 39.6 / 58.2 → 44.4 / 71.0 → 55.0 ms/token at 2 k / 8 k / 16 k**, 8-turn session
+**−24 %**, ids identical, cost **+1.6–3.9 s TTFT** on a request that empties the tier. **gpt-oss has NO
+checkpoint on this box** (2026-11-17 audit), so that figure is history and the whole-layer forward is uncovered.
+
+**ORDER THE WORK CHEAPEST-REFUTATION-FIRST.** (1) Evaluate the OTHER two guards against MiniMax's live plan — if
+`kv_preallocated` would also fire, the row is **refuted with no allocator work at all**. (2) Price the prize with
+a **bit-identical ORACLE arm** (wrap `plan_vram`'s `pinning_budget` BEFORE load so the tier gets the 5.27 GiB) and
+measure admission ratchet + ≥8-turn session wall clock. (3) **Only if the oracle pays**, touch the decode-graph /
+allocator blocker. **STOP RULE: if the oracle shows no benefit worth the +TTFT, refute and stop — the real
+implementation cannot beat its own oracle.**
+**Allocator facts that decide feasibility:** `expandable_segments` returns VRAM only in fully-free 20 MiB units,
+so a partial evict returns **13–78 %** — read driver-free AFTER `empty_cache()`, never infer it
+(`cuda-allocator-partial-free`); a **failed graph capture poisons the allocator and `empty_cache()` becomes a
+no-op** (S12, `cuda-graph-capture-traps`); and S42's trap was sizing the tier off the free-VRAM snapshot taken at
+expert-cache-creation time rather than at pin time — **~2.9 GB off**.
+**Also:** CUPTI **OOMs on MiniMax** under the 28 GiB cap — run CUPTI-off and trust `journalctl`
+(`minimax-h2d-census-cupti-oom`); a CUPTI window poisons later arms in-process (replay 4.6×, `TEARDOWN_CUPTI=1`).
 
 ## [bug] HARD-HANG 2026-11-08 — box hung mid Rudra run E; ROOT CAUSE = KERNEL blk-mq bug (CVE-2026-64017), NOT Vaayu. Fixed kernel already on disk, GRUB pinned to the broken one
 
