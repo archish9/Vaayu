@@ -198,6 +198,44 @@ def compute_moe_geometry(expert_offset_index, num_layers, moe_top_k, moe_num_exp
     }
 
 
+def largest_injection_group_bytes(expert_offset_index) -> int:
+    """Bytes ONE `build_exl3_qmatrix` call moves H2D for the largest single
+    expert submodule: the max, over every layer, expert and submodule path, of
+    the summed `byte_length` of that submodule's tensors.
+
+    Grouped exactly as `moe_patch._inject_expert_weights` does it: the index
+    stores FULL checkpoint keys (`...experts.<n>.w1.trellis`), so the expert
+    prefix is stripped with `_EXPERT_PREFIX_RE` and the rest is split at its
+    last dot (`w1` is the group, `trellis` the tensor).
+
+    The max, never a sample: this is a ceiling a VRAM margin is sized on, and
+    one outsized expert in any layer would OOM an underestimate. Unlike
+    `compute_moe_geometry` it therefore scans EVERY layer.
+
+    Returns 0 for None, an empty index, or one whose keys carry no
+    `.experts.<n>.` prefix (the fused-3D whole-layer forward keys differently);
+    a load must not die because an index is shaped unexpectedly.
+    """
+    from .moe_patch import _EXPERT_PREFIX_RE
+
+    layers = getattr(expert_offset_index, "index", None)
+    if not layers:
+        return 0
+    largest = 0
+    for layer_tensors in layers.values():
+        for expert_tensors in layer_tensors.values():
+            groups: dict[str, int] = {}
+            for param_key, tensor in expert_tensors.items():
+                m = _EXPERT_PREFIX_RE.match(param_key)
+                if m is None:
+                    continue
+                submod_path = param_key[m.end():].rpartition(".")[0]
+                groups[submod_path] = groups.get(submod_path, 0) + tensor.byte_length
+            if groups:
+                largest = max(largest, max(groups.values()))
+    return largest
+
+
 def compute_spec_working_set(geometry: dict, verify_positions: int) -> int:
     """Expert working set of ONE speculative verify pass, in bytes (Fix #9).
 

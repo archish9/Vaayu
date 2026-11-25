@@ -1,6 +1,6 @@
 """Model-agnostic MoE geometry — derived from the offset index, never hardcoded."""
 import pytest
-from vaayu.vaayu_base import compute_moe_geometry
+from vaayu.vaayu_base import compute_moe_geometry, largest_injection_group_bytes
 
 
 class _FakeMeta:
@@ -80,3 +80,72 @@ def test_geometry_nonuniform_takes_max_and_warns(
     max_expert_bytes = num_experts * base_bytes
     assert g["expert_bytes"] == max_expert_bytes  # max, not first
     assert "non-uniform expert sizes" in capsys.readouterr().out
+
+
+class _GroupIndex:
+    """Mimics ExpertOffsetIndex.index with the FULL checkpoint keys it stores
+    (`...experts.<n>.<submodule>.<tensor>`), taking an explicit layer map."""
+    def __init__(self, index):
+        self.index = index
+
+
+def _expert(prefix, group_bytes, extra_per_group=0):
+    """One expert: per projection, a `.trellis` plus a small `.suh` (same group)."""
+    out = {}
+    for name, nbytes in zip(("w1", "w3", "w2"), group_bytes):
+        out[f"{prefix}.{name}.trellis"] = _FakeMeta(nbytes - extra_per_group)
+        out[f"{prefix}.{name}.suh"] = _FakeMeta(extra_per_group)
+    return out
+
+
+def _index_with(num_layers, num_experts, group_bytes):
+    return _GroupIndex({
+        f"model.layers.{L}": {
+            e: _expert(f"model.layers.{L}.block_sparse_moe.experts.{e}",
+                       group_bytes, extra_per_group=1_000)
+            for e in range(num_experts)
+        }
+        for L in range(num_layers)
+    })
+
+
+def _index_with_one_outlier(normal, outlier, num_layers=48, outlier_layer=40):
+    index = {}
+    for L in range(num_layers):
+        size = outlier if L == outlier_layer else normal
+        index[f"model.layers.{L}"] = {
+            e: _expert(f"model.layers.{L}.mlp.experts.{e}", [normal, normal, size if e == 3 else normal])
+            for e in range(4)
+        }
+    return _GroupIndex(index)
+
+
+def test_injection_group_none_and_empty_index_are_zero():
+    assert largest_injection_group_bytes(None) == 0
+    assert largest_injection_group_bytes(_GroupIndex({})) == 0
+    assert largest_injection_group_bytes(_GroupIndex({"model.layers.0": {0: {}}})) == 0
+
+
+def test_injection_group_unprefixed_keys_are_not_expert_tensors():
+    """Fused-3D keys carry no `.experts.<n>.` and are a supported zero."""
+    idx = _GroupIndex({"model.layers.0": {0: {
+        "model.layers.0.mlp.experts.gate_up_proj_blocks": _FakeMeta(5_000)}}})
+    assert largest_injection_group_bytes(idx) == 0
+
+
+@pytest.mark.parametrize("num_layers,num_experts,group_bytes", [
+    (62, 256, [3_000_000, 3_000_000, 2_400_000]),   # MiniMax-like, 3 projections
+    (48, 512,  [600_000,   600_000,   490_000]),    # Qwen3-Next-like
+])
+def test_injection_group_largest_submodule_not_the_expert_total(
+        num_layers, num_experts, group_bytes):
+    idx = _index_with(num_layers, num_experts, group_bytes)
+    assert largest_injection_group_bytes(idx) == max(group_bytes)
+    assert largest_injection_group_bytes(idx) < sum(group_bytes)
+
+
+def test_injection_group_single_outsized_expert_sets_the_size():
+    """One fat expert in layer 40 must not be averaged away, nor missed by
+    sampling only the first layer the way compute_moe_geometry does."""
+    idx = _index_with_one_outlier(normal=3_000_000, outlier=9_000_000)
+    assert largest_injection_group_bytes(idx) == 9_000_000
