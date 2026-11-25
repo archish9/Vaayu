@@ -156,11 +156,19 @@ rows with `prompt_tokens > 18000` and `finish != "error"`), all at `MAX_SEQ_LEN=
 | `run-2026-11-24T12-02-16Z` | 9 | 6 | **6** |
 | `run-2026-11-25T07-17-14Z` | 9 | 10 | **10** |
 | `run-2026-11-24T12-52-41Z` (this row's own run) | None | 3 | 1 |
+| `run-2026-11-24T12-59-09Z` | None | 1 | 1 |
 | `run-2026-11-25T07-45-35Z` | None | 10 | 1 |
+| `run-2026-11-25T08-05-42Z` | None | 3 | **0** |
 | `run-2026-11-25T08-20-57Z` | None | 3 | 1 |
 
-**Packed 16/16, uncompressed 3/16** — and this row's own run is 1 of 3, which is what every uncompressed
-arm does whether or not it was warmed. Boot order is not ruled out as a contributing factor, but it is not
+**RECOUNTED 2026-11-25, and the first count was wrong in BOTH directions.** This block first said
+"Packed 16/16, uncompressed 3/16". The packed side is right (16 of 16 across 2 runs). The uncompressed side
+was not: it omitted `12-59-09Z` and `08-05-42Z`, and a per-run "served 1 of 3" ratio counts
+post-cascade rows and `VramPlanError` admission refusals — which never ran a forward pass — as if they were
+independent trials of the mechanism. **Uncompressed is 4 of 20 long requests across 5 runs**, and the
+honest, sharper form of the finding is this: **no uncompressed run has EVER served a second long request.**
+Packed has served 6 and 10 in a row. Verified twice, independently, by parsing every `env.json` on disk
+against its `requests.jsonl` (prompts over 18,000 tokens, `finish != "error"`). Boot order is not ruled out as a contributing factor, but it is not
 what the evidence on disk separates: `prefix_compress` is. What survives unchanged from the original
 argument is the cold run's telemetry, `expert_cache=0hit/14896miss/0evict usage=0.00GB/9.12GB` — the host
 arena was empty and the expert VRAM tier was filling WHILE the prefill transient peaked.
@@ -177,8 +185,9 @@ convert into a second, different failure that the client sees as a 500.
 **Tasks**
 - [ ] **FIRST, run the two cells nobody has run** (they decide whether this row is about boot order at
       all): the warm six-session shape at `PREFIX_COMPRESS=None`, and the cold single-request shape at
-      `PREFIX_COMPRESS=9`. -> verify: the 16/16-vs-3/16 split above either survives or collapses. Until
-      both exist, do NOT describe the defect as boot-order.
+      `PREFIX_COMPRESS=9`. -> verify: the split above (packed 16/16 across 2 runs; uncompressed 4/20
+      across 5, never a second long request in any of them) either survives or collapses. Until both
+      exist, do NOT describe the defect as boot-order.
 - [ ] Reproduce deliberately: boot, send ONE request at ~20-22 k tokens as the first request, both
       kernels. -> verify: it OOMs cold and passes warm, with the plan line identical. NOTE: "passes warm"
       is now in doubt — it has only ever been observed at `PREFIX_COMPRESS=9`.
