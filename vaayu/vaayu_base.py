@@ -6889,7 +6889,32 @@ class VaayuBaseModel(GenerationMixin):
             # value here indexes one position past what the cache actually holds.
             self._kv_writer.enqueue_append(
                 resolved_sid, kv, self.config, token_ids, kv.get_seq_length())
-        pc.store(resolved_sid, token_ids, kv)
+        # The store only, never the enqueue above: a persist failure is a
+        # different failure with a different meaning. All three callers reach
+        # it through here, which is why the handler lives here.
+        try:
+            pc.store(resolved_sid, token_ids, kv)
+        except Exception as e:      # noqa: BLE001 -- announced, never re-raised
+            # The reply was generated and streamed to the user ~130 s ago (D1,
+            # logs/run-2026-11-25T07-45-35Z: the park's own device allocation
+            # OOM'd here, at ttft_s 133.16, and turned a finished answer into a
+            # 500). This is called OUTSIDE generate()'s `except BaseException`,
+            # so re-raising also skipped restore_on_abort and dropped the popped
+            # entry. Cache housekeeping is not the user's problem.
+            #
+            # The exception is kept NOWHERE -- not on self, not in the pool, not
+            # in a log record. A retained exception holds its traceback, which
+            # holds this frame, which holds `kv`: the engine's own
+            # `row["error"] = ex` (server/engine.py) would then pin the whole
+            # device KV for as long as that row lives.
+            print(f"[Vaayu-Prefix] WARNING: could not store session "
+                  f"{resolved_sid!r} in the prefix pool ({type(e).__name__}: "
+                  f"{e}); the answer already sent is unaffected, and the next "
+                  f"turn on this session prefills in full. "
+                  f"(a real limit, announced -- not a swallowed error)")
+            # Half-converted: store() may have raised mid-conversion, so no
+            # partial entry may stay in the pool.
+            pc.drop(resolved_sid)
 
     def _adopt_prefix_hit(self, kv, match_len: int, prompt_len: int,
                           session_id) -> int:
