@@ -2108,7 +2108,11 @@ class FP8DynamicCache(DynamicCache):
                       f"(a real limit, announced -- not a swallowed error)")
             out.copy_(src[..., :used, :])
         elif used == src.shape[-2]:
-            out.copy_(src)                  # contiguous end to end: one DMA
+            # Contiguous end to end: one DMA. Still device-clean when `out` is a
+            # non-contiguous view (windowed_kv's ring tail), but then copy_ has
+            # to stage a CONTIGUOUS HOST temp of `out.numel()` elements -- a
+            # host transient, on a branch named for the host-RAM ceiling.
+            out.copy_(src)
         else:
             for idx in itertools.product(*(range(n) for n in src.shape[:-2])):
                 out[idx].copy_(src[idx][:used])

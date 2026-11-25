@@ -57,6 +57,13 @@ def test_resident_bytes_positive_and_shrinks_after_compact():
 # (kv heads, head_dim, layers) of the two EXL3 checkpoints on this box, per
 # CLAUDE.md §5's two-geometry rule. They contrast on every axis a park sees:
 # 8 x 128 over 62 layers against 2 x 256 over 40.
+# MiniMax-like and Qwen3.6-35B-like rather than §5's named MiniMax/Qwen3-Next
+# pair on purpose: a KV-park helper varies over kv-heads, head_dim and layer
+# count -- the three axes above, which decide the block count and block size of
+# every copy -- and over nothing else. Expert count, top_k and expert byte size
+# never reach this code, so Qwen3-Next's contrast with MiniMax is on axes this
+# helper cannot see, while Qwen3.6-35B contrasts on all three of the ones it
+# can (and is on disk, so the gate run exercises exactly this pair).
 GEOMETRIES = {
     "minimax-like": dict(heads=8, dim=128, layers=62),
     "qwen36-35b-like": dict(heads=2, dim=256, layers=40),
