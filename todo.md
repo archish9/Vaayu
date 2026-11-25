@@ -232,7 +232,57 @@ arm served ten full prefills back to back at the same size as the arm that died.
       **time-to-FAILURE**, not time-to-first-token — it sits within 0.4-0.7 s of `wall_s` with
       `tokens: 0`. And `prefix_hit: true` on these rows is matching only **39-41 of 21,550 tokens** (the
       system prompt), so nothing here is a reuse measurement.
-- [ ] **NEXT, and it is a CONTROL, not a nicety: the packed arm at `main`.** Same cell, same boot shape,
+- [x] **CONTROL + INSTRUMENTED PAIR DONE 2026-11-25 — the `prefix_compress` discriminator is REAL and
+      survives `be2aa25`: packed 6/6, uncompressed 1/6, matched pair at `93fc758`.** Same commit, same
+      box, back to back, byte-identical prompts (the driver derives the body from `sess{i}x`, which
+      excludes the arm tag), identical plan lines, load-time free VRAM 12.51 GB in both. Arm P
+      `logs/run-2026-11-25T11-30-54Z`, Arm U `logs/run-2026-11-25T11-50-18Z`, write-up
+      `docs/superpowers/specs/2026-11-25-D2-artifacts/control-RESULTS.md`, device samplers
+      `d2-p-device.csv` (995 samples) / `d2-u2-device.csv` (921), 0 read errors. Arm U reproduces H1 to
+      the digit (20.00 MiB wanted, 21.75-23.75 MiB free, layers .0/.1, 14.71-14.73 GiB allocated,
+      125-139 MiB reserved-but-unallocated) -> **n=2 for the uncompressed shape; the packed 6/6 is n=1.**
+- [x] **THE 20 MiB INJECTION IS THE VICTIM, NOT THE CAUSE — half the hypothesis is killed.** SUPPORTED:
+      nothing budgets the per-injection H2D staging (no plan term covers it; reserve 8.56 GiB of which KV
+      7.75, pinning 4.26, expert ceiling 6.40 -> tier 3.32). **KILLED: "the tier fills to its ceiling
+      during session 1."** The tier saturates during **warm-0**, the first 1500-token request, in BOTH
+      arms (`vram=0hit/368miss/0evict` on its first decode token, `439hit/297miss/292evict` on its
+      second; `evict == miss` in 142/160 P and 71/90 U summaries after that), and tier size is plan-fixed
+      and logged identically in both. In Arm P those same unbudgeted injections run 339-350x per token
+      for six long sessions and ALL succeed. **So the deficit is ~20 MiB of slack at the peak, not a
+      tier that grew.**
+- [x] **WHAT ACTUALLY DIFFERS: a sub-second transient at the prefill -> decode boundary, ~1.4 GiB bigger
+      uncompressed.** Steady prefill footprint is the SAME in both arms (median 13.35-13.45 GB used).
+      `peak_vram_gb_process` **14.1292 on all six Arm P sessions vs 15.8042-15.8130 in Arm U**. Device-free
+      MiB (1 Hz): after load 11932 both; after session 1 **P 2742 / U 6754**; after session 2 P 3054 /
+      U 7272; run minimum **P 1456 / U 20**. Arm U releases ~5 GB BETWEEN long requests (idle 8.2-8.8 GB)
+      and re-acquires it; Arm P holds 12.4-13.5 GB idle. **The arm with the HIGHER idle footprint has the
+      LOWER peak** — the release/re-acquire churn is the cost. Arm U's session 1 (the one that SERVED)
+      ran ten consecutive seconds at **20-54 MiB free**; `d1-u2-4`'s sampler minimum was 1306 MiB and it
+      still OOM'd, so the fatal spike is BELOW 1 Hz. At the first decode token of every long Arm U
+      session the tier reports `0hit/368miss/0evict` — a signature that appears exactly ONCE in all of
+      Arm P (cold warm-0) — i.e. **the uncompressed arm pays a 368-miss tier refill on every long
+      request**, which is also a perf cost, not only a crash risk.
+- [x] **Code read 2026-11-25, narrowing the churn (NOT yet proved to be the mechanism):** the two store
+      branches differ in what they do to the LIVE cache — `store()` uncompressed calls `cache.to_cpu()`,
+      which moves the live cache's tensors to host, while `compress_cache()` builds a separate packed
+      host container. The batch-path reclaim that evicts the tier (`vaayu_base.py:7503`
+      `evict_until_free`) is N>1 only and is NOT reachable at the server's N=1, so whatever empties the
+      tier between Arm U's requests is something else. **External `nvidia-smi` cannot separate torch
+      `reserved` from `allocated`** (shutdown reserved went the other way: P 12.85 -> 7.66 GiB, U
+      14.85 -> 7.25), so settling this needs torch's own counters per request, i.e. a throwaway probe.
+- [x] **Two confounds, recorded not buried.** (1) rustdesk held exactly **148 MiB** of GPU in all 1916
+      samples of both arms and never moved — constant, so not the explanation, but **6.7x the 22 MiB
+      shortfall**; do NOT kill it (it may be the user's own session). (2) The HOST-RAM columns are NOT
+      like-for-like and must not be read as "packed costs more RAM": P peaked 24.366 GiB with 3.78 GiB
+      swap touched and PSI 0.72, U 20.546 GiB with swap 0 and PSI 0.00 — but P completed six long
+      requests and six prefix stores where U completed one. Neither came near the 28.0 GiB cap; neither
+      was killed. Arm P also hit `[Vaayu-Prefix] WARNING: prefix pool over capacity` at session 4 and
+      **still served sessions 4-6**, so pool pressure is not the killer either.
+- [x] **`server.log` CANNOT time-place anything inside a request** — a request's whole log block is
+      buffered and flushed with one timestamp at request end (every `d1-u2-0` line reads
+      `11:54:50.144Z`). An external sampler was the only time-resolved source. Carry this into any future
+      probe on this row.
+- [ ] **SUPERSEDED by the pair above: the packed arm at `main`.** Same cell, same boot shape,
       `PREFIX_COMPRESS=9`. Nobody has run packed at or after `be2aa25` either. If packed ALSO dies at
       20 MiB now, the `prefix_compress` correlation is dead and this row is pure VRAM accounting; if it
       serves 6/6, there is a real store-path -> device-VRAM mechanism that must be understood BEFORE a fix
