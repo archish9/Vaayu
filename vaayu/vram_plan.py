@@ -900,6 +900,35 @@ def expert_vram_budget_for(plan: VramPlan, free_vram_now: int) -> int:
     return max(0, int(free_vram_now) - plan.reserve_bytes)
 
 
+def tier_margin_bytes(*, injection_bytes: int, hardware_floor: int,
+                      allocator_unit: int) -> int:
+    """Bytes the expert VRAM tier must NOT be given: `max(hardware_floor,
+    ceil_to_unit(injection_bytes + allocator_unit))`.
+
+    Why the tier may not have the last byte: `expert_vram_budget_for` hands it
+    everything above the reserve, so a later per-expert H2D allocation that no
+    budget counted has no room. Same failure as `_STAGE3_ADMISSION_MARGIN_BYTES`
+    (`vaayu_base.py:711-724`): a plan that maximizes to its limit leaves nothing
+    at admission.
+
+    The measured failing allocation was 20.00 MiB requested against 21.75 MiB
+    FREE, more free than requested. PyTorch's caching allocator had to expand a
+    segment by a whole contiguous unit, so the allocator unit, not the expert's
+    own size, dominates the margin on this model. The margin is therefore one
+    injection group plus one spare unit, rounded up to whole units.
+
+    `injection_bytes` is DERIVED by the caller from the checkpoint's expert
+    offset index (CLAUDE.md §5), never a literal. 0 (dense) yields the floor, and
+    `allocator_unit <= 0` disables the derived term. Pure: no torch, no I/O.
+    """
+    floor = int(hardware_floor)
+    unit = int(allocator_unit)
+    if unit <= 0:
+        return floor
+    need = max(0, int(injection_bytes)) + unit
+    return max(floor, -(-need // unit) * unit)
+
+
 def residency_first_allows_pin(*, used: int, size: int, budget: int,
                                free_vram: int, reserve: int,
                                working_set_bytes: int, margin: int) -> bool:

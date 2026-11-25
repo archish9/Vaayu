@@ -1455,3 +1455,37 @@ def test_a_ceiling_is_never_offered_above_the_load_time_one():
         msg = _too_big_message(requested=4096, s_max=2048, free_vram=free, shape=sh,
                                min_resident=EXPERT_BYTES, headroom=budget)
         assert "max_seq_len=2048" in msg
+
+
+# ---- D2: the margin the expert VRAM tier may not take --------------------
+from vaayu.vram_plan import tier_margin_bytes
+
+_UNIT = 20 * MB          # the allocator's expansion granularity, this box
+_FLOOR = int(0.20 * GB)  # _RESIDENCY_FIRST_PIN_MARGIN_BYTES
+
+
+def test_margin_is_never_below_the_hardware_floor():
+    # MiniMax-like: one injection group is ~8.4 MiB, far under the floor.
+    assert tier_margin_bytes(injection_bytes=int(8.4 * MB),
+                             hardware_floor=_FLOOR, allocator_unit=_UNIT) == _FLOOR
+
+
+def test_a_large_injection_group_raises_the_margin_above_the_floor():
+    # DeepSeek-V4-like: a 12.750 MiB expert whose group is most of it, scaled up
+    # to a geometry whose group exceeds the floor outright.
+    big = int(0.30 * GB)
+    m = tier_margin_bytes(injection_bytes=big, hardware_floor=_FLOOR,
+                          allocator_unit=_UNIT)
+    assert m > _FLOOR
+    assert m >= big + _UNIT          # the group PLUS one spare unit
+    assert m % _UNIT == 0            # rounded up to whole allocator units
+
+
+def test_dense_has_no_injection_and_gets_the_floor():
+    assert tier_margin_bytes(injection_bytes=0, hardware_floor=_FLOOR,
+                             allocator_unit=_UNIT) == _FLOOR
+
+
+def test_an_allocator_unit_of_zero_does_not_divide_by_zero():
+    assert tier_margin_bytes(injection_bytes=int(8.4 * MB), hardware_floor=_FLOOR,
+                             allocator_unit=0) == _FLOOR
