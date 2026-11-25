@@ -78,17 +78,23 @@ Status keys: `[ ]` pending · `[~]` in progress · `[!]` blocked · `[bug]` open
 Protocol: `CLAUDE.md` §6 (this ledger), §7 (all plans / RESULTS go in `docs/`, gitignored — so every row carries its
 own numbers), §8 (every change must reach the server; say if it is banked).
 
-**Suite floor (CURRENT, after HARD-HANG's SQE-PLUG work, 2026-11-17): `4267 passed, 92 skipped, 1 failed`**
-(364.50 s, FOREGROUND, `./venv/bin/python -m pytest -q`), reconciled **4360 collected** = the 2026-11-09
-WIRE-TELEMETRY floor's 4335 + 25 new (16 `tests/test_sqe_caps.py`, 1 `test_server_config_module.py`, 8
-`test_docs_speed_knobs.py`). `cargo test` in `vaayu_rust/`: **46 passed, 0 failed, 1 ignored** — needs a current
+**Suite floor (CURRENT, measured 2026-11-25 at `c525e29`, D1 Task 1): `4292 passed, 92 skipped, 0 failed`**
+(426.13 s, FOREGROUND, `./venv/bin/python -m pytest -q`), reconciled **4384 collected** = the 2026-11-17
+SQE-PLUG floor's 4360 + 24 new: 23 in five new files (12 `tests/test_cgroup_aware_budget.py`, 3
+`test_budget_sites_cgroup_aware.py`, 3 `test_direct_io_cgroup_aware.py`, 2 `test_envinfo_cgroup_fields.py`,
+3 `test_prefix_hit_bitwise_gate.py`) + net 1 in `test_server_app.py` (`ccfbfd1` added, `6af2747` dropped one).
+**THE SUITE IS NOW FULLY GREEN — the long-standing "1 failed" is GONE**, see the paragraph below.
+Previous floor line, for the record: `4267 passed, 92 skipped, 1 failed` (364.50 s, 2026-11-17, 4360 collected).
+`cargo test` in `vaayu_rust/`: **46 passed, 0 failed, 1 ignored** — needs a current
 build (`maturin develop --release` in `vaayu_rust/`, with `VIRTUAL_ENV` set).
 **Reconcile by COLLECTED count at each commit, never assume it** (`pytest --collect-only -q`). Earlier floors
 (4242 / 4136 / 4134 / 4094 / 4092) and their per-commit reconciliations are in `git log -p -- todo.md`.
 
-**The 1 failure is not a regression:** `test_max_batch_size_defaults_to_one`, a machine-local artifact — `config.py:195`
-ships `MAX_BATCH_SIZE = 1` and the gitignored `config_local.py:12` shadows it to `3` (proven 2026-11-02; 12/12 green
-with `config_local` absent). Two on-device gates skip unless their env is set: `DENSE_CKPT=`
+**The old "1 failure" is CLOSED, 2026-11-25:** it was `test_max_batch_size_defaults_to_one`, failing because the
+gitignored `config_local.py` shadowed `config.py:195`'s `MAX_BATCH_SIZE = 1` with `3`. **That override was removed
+from `config_local.py` on 2026-11-17** (its own comment says so; verified on disk 2026-11-25, md5
+`bbabfcc08c88ad92314efcd2c23403c4`), so the floor line kept carrying a failure the box no longer had. Measured
+clean today: `0 failed`. Do not expect or excuse a failure here again. Two on-device gates skip unless their env is set: `DENSE_CKPT=`
 (`tests/test_dense_gate.py`, Llama-3.2-1B 6 s + Llama-3.3-70B 2 min) and `FUSED_EXL3_CKPT=`
 (`tests/test_fused_exl3_gate.py`, `darkbit1001--Qwen3.6-35B-A3B-EXL3-6.00bpw-hb6`, 3/3 in ~24 s, ppl 5.98).
 **Re-establish this floor at the top of the next session before changing CODE.**
@@ -226,6 +232,22 @@ while Rudra's own window stays 16 k** — Vaayu's ceiling does not lengthen chai
       scratchpad (`v0_repro.py`, `v0_mem.csv`, `v0_mem_uncomp2.csv`). No engine code was touched.
 - [x] **Option B refuted** by the PSI columns (see above). Option C turns out to be what
       `PREFIX_COMPRESS=9` already does, by accident rather than by design.
+- [x] **Task 1 (suite floor) DONE 2026-11-25:** `4292 passed, 92 skipped, 0 failed`, 426.13 s, 4384 collected
+      — see the floor paragraph at the top of this file. Also corrected in the D1 doc: its §0 floor was the
+      2026-11-09 one (25 tests stale), §3 claimed "no swap configured" against an 8 GiB `/swap.img` that its
+      own A/B table shows swapping 1.42 GB, and §4 said "7 call sites, all at load time" for
+      `effective_available_bytes()` when there are 6, one of them telemetry (`server/envinfo.py:278`) — this
+      row's own "all four" also lists five.
+- [bug] **NEW, found 2026-11-25 while checking D1's Task 2 premise: `_move_recurrent_state`
+      (`vaayu_base.py:2017-2029`) parks recurrent state with an ASYNC D2H.** It passes
+      `non_blocking=True` for both directions, so the park is a CUDA→pageable-host async copy and the
+      following `.pin_memory()` is a CPU→CPU copy that does not synchronize the stream. The KV path beside
+      it is already blocking. Today's pin narrows the window; D1's unpin removes it, so the CPU direction
+      must become `non_blocking=False` **in the same commit** (D1 doc Task 2a). Unreachable on MiniMax (no
+      recurrent layers) — reachable on **Qwen3.6-35B-A3B EXL3** (on disk, gated-delta). The existing
+      round-trip test `test_hybrid_attention_cache.py:505` is CPU-only and cannot catch it; the guard needs
+      CUDA tensors with queued GPU work. Same class as DeepSeek's documented 220M/220M-wrong measurement
+      (`model_code/deepseek_v4/modeling_deepseek_v4.py:952`).
 - [ ] **DECIDE THE FIX SHAPE — this is the open question now.** `PREFIX_COMPRESS=9` is today holding
       the box up from a MACHINE-LOCAL config line (`config_local.py`, gitignored), which is exactly
       CLAUDE.md section 8's "banked, not shipped": any other user on 32 GB of RAM hits the same SIGKILL with
