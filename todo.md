@@ -313,6 +313,61 @@ arm served ten full prefills back to back at the same size as the arm that died.
 - [ ] Until then: do NOT claim `MAX_SEQ_LEN=32768` is safe for a cold long first request. The handoff
       (section 14) tells Rudra the ceiling is 32768; that number is only verified warm.
 
+**THE MARGIN IS BUILT, MEASURED AND PARTLY SUFFICIENT — branch `d2-tier-margin`, 2026-11-25.** Five commits:
+`468a5a0` (pure `tier_margin_bytes`), `9210b2e` (`largest_injection_group_bytes`), `167d804` (+`debec18`)
+(the margin wired into `expert_vram_budget_for` at both load-time call sites, plan line now prints
+`tier margin=`), `c787585` (`warn_tier_lost_to_margin`, fires only when the margin is the CAUSE). Design
+`docs/superpowers/specs/2026-11-25-D2-cold-first-long-prefill-oom-design.md` §5.1; plan
+`docs/superpowers/plans/2026-11-25-D2-tier-margin.md`; results
+`docs/superpowers/specs/2026-11-25-D2-artifacts/margin-RESULTS.md`. §8: **NO KNOB** (correctness, not policy),
+plumbed at both sites, reachable at N=1 on every MoE CUDA load, not banked.
+
+| cell | before | after |
+|---|---|---|
+| warm, 4 warm-ups + 6 x 21.5k, `PREFIX_COMPRESS=None` | **1 of 6** | **6 of 6** (`run-2026-11-25T14-09-05Z`) |
+| same, `PREFIX_COMPRESS=9` | 6 of 6 | **6 of 6** (`run-2026-11-25T14-27-01Z`) |
+| **COLD: ONE 21.5k request as the FIRST request, no warm-ups** | never run | **NOT SERVED** (`run-2026-11-25T14-56-06Z`) |
+
+Verified on the raw oracle (`requests.jsonl`, `prompt_tokens>18000`, `finish != "error"`), not off a driver's
+stdout. Plan line: `expert cache ceiling=6.40 -> 6.20 GiB; tier margin=0.20 GiB`, tier **3.3 GB/~374 experts ->
+3.1 GB/~349**, partial caching 46/62 -> 43/62 layers. **Advertised `max_seq_len` unchanged at 32768**
+(`validated against S_max=32768`), no `VramPlanError`, so the pinned-config boot is intact. Peaks fell by about
+the margin (packed 14.1292 -> 13.9161 GB; uncompressed 15.804/15.813 -> 15.591/15.624). Suite
+`4323 passed, 92 skipped, 0 failed` (4415 collected); all three gates green, ppl 11.90 / 8.87 / 5.98 unmoved.
+**Decode price is NOT resolvable at this n, bound +-1.1 %** (+0.69 % at 1500 tok, -0.52...-1.09 % at 21.5k; arm
+order reversed vs the control, so no sign is claimed).
+
+**IT PASSES ON THE HARDWARE FLOOR, NOT ON THE DERIVATION — and this corrects the spec AND two earlier claims
+in this row.** Measured largest injection group: **2.821 MiB on MiniMax-M2.7, 0.755 MiB on Qwen3.6-35B**, so
+the derived term is ~40 MiB against the 204.80 MiB floor and **never binds on either on-disk MoE model** (it
+binds only above 180.00 MiB). **The 20.00 MiB in every traceback is the CUDA allocator's large-pool SEGMENT,
+not a tensor group** — so this row's earlier "the group is >= 20 MiB" and the §5.1 sentence it came from were
+both wrong, and are corrected in the doc. The derivation stays (CLAUDE.md §5 forbids assuming a model's
+numbers, and it binds on a big-expert checkpoint) but it is **inert today** and must not be cited as the thing
+that works.
+
+- [x] **Margin built + merged on branch, warm cell FIXED** (above).
+- [bug] **THE COLD FIRST LONG REQUEST STILL FAILS, so this row is NOT closed and R1 STAYS HELD.**
+      `run-2026-11-25T14-56-06Z`: one boot, flash, pinned 32768, `PREFIX_COMPRESS=None`, ONE 21,550-token
+      request as the very first request, no warm-ups -> `finish: error`, `tokens: 0`, `ttft_s` 125.6 (which is
+      time-to-FAILURE, not TTFT). **Cold is PROVEN by telemetry, not assumed:**
+      `expert_cache=0hit/14803miss/0evict hit_rate=0% usage=0.00GB/9.12GB`, `cache=0hit/0miss`,
+      `vram=0hit/0miss/0evict`, and `prefix_hit=false` with `prefix_match_tokens=0` — the only such row in the
+      series. It streamed **131.56 GB** for that one prefill (`gb_tok=131.56`, `expert_disk=11.8s`,
+      `compute=113.7s`). So the cold case grows the host arena (0 -> 9.12 GB) AND the VRAM tier (0 -> 3.1 GB)
+      WHILE the prefill transient peaks, which the 0.20 GiB margin does not cover. Driver `d2_cold.py`
+      (`d2_arm.py` with the warm-up and session loops removed; prompt byte-identical to the warm arm's). n=1.
+- [ ] **NEXT, and it is the churn, not a bigger margin.** Do NOT grow the margin to buy this cell: that trades
+      Rudra's decode throughput against a mechanism nobody has named. The named candidate is the
+      release/re-acquire churn still measurable after the fix — ~6.5 GB released between long requests, a
+      cold-tier re-grow (`vram=0hit/344miss/0evict`) on the first decode token of each request, and a 1.71 GB
+      arm-to-arm peak gap. Spec §5.1's fourth option ("stop the churn") is the design to price next.
+- [ ] Residual risks recorded with the fix: slack is now ~0.21 GiB and the fatal transient is **sub-second**
+      (below a 1 Hz sampler), so any later change adding >190 MiB at the prefill -> decode transition re-opens
+      this; host RAM peaks **27.2 GiB of the 28 GiB cap** in both warm arms (PSI 0.98), independent of this
+      fix; **sdpa is UNRUN** (its `S_max` is ~26.1-26.6k, so the pinned `MAX_SEQ_LEN=32768` refuses the load,
+      exit 3 — changing that pin was out of scope).
+
 ## [bug] HOST-RAM-CEILING — **ROOT-CAUSED 2026-11-24 by a mirrored A/B: UNCOMPRESSED pooled prefix entries are PINNED (shmem), so the pool is unreclaimable and walks the cgroup into a SIGKILL. `PREFIX_COMPRESS=9` moves it to ANON and survives.** Fix shape is now a code decision, not an investigation
 
 **BUILD DOC (self-contained, build it cold):** `docs/superpowers/specs/2026-11-25-D1-host-ram-ceiling-design.md` — **D1 of 8, START HERE.** Fix shape **DECIDED 2026-11-25**: option (i), unpin the park (`vaayu_base.py:2043` + `:2029`, the only two `pin_memory()` sites in the path), then MEASURE the prefix-HIT restore cost; the bounded pinned staging ring is a contingency with a >5 % trigger, not pre-built work. Option (iii) (budget the pool against the cap) rides along as a lower-priority second belt. Honest correction to this row's own text: (i) costs no OUTPUT BITS, but it does trade pinned H2D for pageable H2D on every HIT restore (~3.3 GiB at a 13,926-token chain) — unmeasured, hence measure-then-decide.
