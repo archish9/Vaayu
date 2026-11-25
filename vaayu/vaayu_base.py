@@ -761,6 +761,13 @@ _RESIDENCY_FIRST_PIN_MARGIN_BYTES = int(0.20 * 1024 ** 3)
 # is validated against s_max as before.
 _STAGE3_ADMISSION_MARGIN_BYTES = int(0.30 * 1024 ** 3)
 
+# D2: the CUDA caching allocator expands a segment by a whole contiguous unit, so
+# a per-expert H2D allocation can fail with MORE free than it asked for. Measured:
+# 20.00 MiB requested against 21.75 MiB free, five times
+# (logs/run-2026-11-25T11-50-18Z). An allocator/hardware property, not a model
+# number (CLAUDE.md §5); `tier_margin_bytes` adds one such unit to the margin.
+_CUDA_ALLOCATOR_EXPANSION_BYTES = int(20 * 1024 ** 2)
+
 
 def stage3_derive_floor(*, reserve_floor: int, base_floor: int, raised: bool,
                         requested_max_seq_len: int | None, margin: int) -> int:
@@ -3075,11 +3082,23 @@ class VaayuBaseModel(GenerationMixin):
             # (below) actually consumes; the real post-pinning figure is
             # printed at the expert-cache-creation call site further down.
             from .vram_plan import expert_vram_budget_for as _expert_budget_for
-            _expert_budget_planned = _expert_budget_for(self._vram_plan, _free_vram)
+            # D2: the tier does not get the last byte above the reserve. Derived
+            # ONCE per load and reused at the real sizing site below, so the
+            # printed ceiling and the tier actually built cannot disagree. Comes
+            # out of the tier only: plan_vram / max_seq_len are untouched.
+            from .vram_plan import tier_margin_bytes as _tier_margin_bytes
+            self._expert_tier_margin_bytes = _tier_margin_bytes(
+                injection_bytes=largest_injection_group_bytes(self._expert_offset_index),
+                hardware_floor=_RESIDENCY_FIRST_PIN_MARGIN_BYTES,
+                allocator_unit=_CUDA_ALLOCATOR_EXPANSION_BYTES)
+            _expert_budget_planned = _expert_budget_for(
+                self._vram_plan, _free_vram,
+                margin_bytes=self._expert_tier_margin_bytes)
             _gib = 1024.0 ** 3
             print(f"[Vaayu-VRAM] {self._vram_plan.reason}; "
                   f"pinning_budget={self._vram_plan.pinning_budget / _gib:.2f} GiB; "
-                  f"expert cache ceiling={_expert_budget_planned / _gib:.2f} GiB")
+                  f"expert cache ceiling={_expert_budget_planned / _gib:.2f} GiB; "
+                  f"tier margin={self._expert_tier_margin_bytes / _gib:.2f} GiB")
             # CLAUDE.md §5: warn rather than silently degrade when the plan
             # leaves nothing for pinning -- a real hardware limit, not a bug
             # to hide. (The parallel "expert budget under one expert" case is
@@ -3613,7 +3632,9 @@ class VaayuBaseModel(GenerationMixin):
                 # thrash gate sees the tier's real size and the budget below shrinks
                 # by exactly what this pins.
                 _free_vram = self._resident_streamed_nonexpert_layers(_free_vram)
-                _vram_budget = expert_vram_budget_for(self._vram_plan, _free_vram)
+                _vram_budget = expert_vram_budget_for(
+                    self._vram_plan, _free_vram,
+                    margin_bytes=self._expert_tier_margin_bytes)
                 if _vram_budget >= self._moe_geometry["expert_bytes"]:
                     self._expert_vram_cache = ExpertVRAMCache(
                         _vram_budget,

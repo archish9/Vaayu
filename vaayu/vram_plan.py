@@ -890,14 +890,18 @@ def admission_headroom(*, free_vram: int, plan: VramPlan,
     return min(usable, int(plan.reserve_bytes) + max(0, int(expert_giveback_bytes)))
 
 
-def expert_vram_budget_for(plan: VramPlan, free_vram_now: int) -> int:
+def expert_vram_budget_for(plan: VramPlan, free_vram_now: int,
+                           margin_bytes: int = 0) -> int:
     """VRAM the resident expert cache may take, measured AFTER pinning.
 
     Subtracts the SAME reserve pinning did. Replaces
     `compute_vram_expert_budget(free) = free - 3.5 GB`, whose flat constant was
     context-insensitive by its own admission.
+
+    `margin_bytes` is held back from the TIER only (never the reserve or the
+    context): see `tier_margin_bytes`. The default 0 is the old behaviour.
     """
-    return max(0, int(free_vram_now) - plan.reserve_bytes)
+    return max(0, int(free_vram_now) - plan.reserve_bytes - int(margin_bytes))
 
 
 def tier_margin_bytes(*, injection_bytes: int, hardware_floor: int,

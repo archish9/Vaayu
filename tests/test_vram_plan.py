@@ -1489,3 +1489,30 @@ def test_dense_has_no_injection_and_gets_the_floor():
 def test_an_allocator_unit_of_zero_does_not_divide_by_zero():
     assert tier_margin_bytes(injection_bytes=int(8.4 * MB), hardware_floor=_FLOOR,
                              allocator_unit=0) == _FLOOR
+
+
+# --- D2: the margin comes off the tier's budget, and only the tier's ---------
+
+@pytest.mark.parametrize("name", sorted(GEOMETRIES))
+def test_the_margin_comes_off_the_tier_and_nothing_else(name):
+    p = _plan(name)
+    free_after_pinning = USABLE_VRAM - p.pinning_budget
+    margin = int(0.20 * GB)
+    before = expert_vram_budget_for(p, free_after_pinning)
+    after = expert_vram_budget_for(p, free_after_pinning, margin_bytes=margin)
+    assert before - after == margin
+    # the reserve, the context and the pinning budget are untouched
+    assert expert_vram_budget_for(p, free_after_pinning) == before
+    assert p.max_seq_len == _plan(name).max_seq_len
+
+
+def test_the_budget_clamps_at_zero_when_the_margin_exceeds_what_is_left():
+    p = _plan("minimax-m2.7")
+    assert expert_vram_budget_for(p, p.reserve_bytes + MB,
+                                  margin_bytes=int(1.0 * GB)) == 0
+
+
+def test_the_default_is_the_old_behaviour_exactly():
+    p = _plan("llama-70b")
+    assert (expert_vram_budget_for(p, USABLE_VRAM)
+            == max(0, USABLE_VRAM - p.reserve_bytes))
