@@ -1698,3 +1698,68 @@ Vaayu has not reproduced the failure at that size.
 a cold long first request is safe, and that is the signal to ship R1 — replacing
 the V0 signal §11.7 named. The rest of §11.7's order is unchanged, and Rudra's
 step 2 (R6 + R2) is still clear to go.
+
+## 17. D1 (HOST-RAM-CEILING) is FIXED and proved on device — and §16.3's evidence needs a correction. R1 STAYS HELD ON D2.
+
+**2026-11-25.** Two things for Rudra, one good and one a correction to what §16.3 told you.
+
+### 17.1 The host-RAM death is fixed, and measured
+
+The pool no longer parks PINNED host memory (`cbb1bf4`, branch `d1-host-ram-ceiling`). Measured on this
+box with the uncompressed default (`prefix_compress: null` in the run's `env.json`):
+
+| | before (pinned) | after (unpinned) |
+|---|---|---|
+| `shmem` | 11.94 -> **29.90 GB** | **11.94 FLAT** (min == max after load) |
+| `anon` | 2.26 -> **0.02** (kernel reclaimed the process's own memory) | 2.96 -> 9.28, one step at the first park, then flat |
+| peak `memory.current` | **30.06 GB = `memory.max` exactly** | 22.11 GB, 8 GB under the cap |
+| outcome | **SIGKILLed mid-request**, client got `RemoteDisconnected` after 254 s | no kill of any kind, swap 0, PSI some avg10 max 0.00 |
+
+So the mechanism behind the two OOM kills of 2026-11-24 (§16.1) is gone: the parked pool is ordinary
+reclaimable memory, and the failure mode it used to cause — death — is no longer available to it. That
+part of §16 is closed, and it is closed in code rather than by a machine-local config line.
+
+### 17.2 But a long SECOND session still fails, on VRAM — so the default is NOT yet safe for repeated long requests
+
+Being honest about the bar we set ourselves: the acceptance run was **six distinct 21,551-token sessions**,
+and it served **one**. What stops it is not host RAM any more, it is VRAM, and it is **D2**, not this row.
+Two separate unbudgeted device allocations were found, both of which fail once the expert VRAM tier has
+filled during the first long session:
+
+- the prefix park's own compaction temp, 44 MiB — **fixed** (`be2aa25`, `4044eb1`): the park now stages
+  nothing on the device at all;
+- expert injection's `build_exl3_qmatrix -> t.to(device)`, 20 MiB — **open, and it is D2's**.
+
+At that point the plan holds weights 4.26 GiB + expert tier 3.32 GB + a KV ring allocated at the FULL
+`max_seq_len=32768` (7.75 GiB) ≈ 15.1 of 15.48 GiB, with the elastic tier OFF because decode graphs own
+its pool — so roughly 18-42 MiB of slack and no way to shrink the tier to make room.
+
+### 17.3 Correction to §16.3: the "six times warm" evidence is CONFOUNDED
+
+§16.3 and the block above it argue the cold-prefill OOM is about boot order, citing "the identical prompt
+then succeeded **six times** on a warm server with an identical VRAM plan". The VRAM plan was identical;
+**`PREFIX_COMPRESS` was not.** Those six runs had it set to 9 and the cold failure had it at `None`.
+Counting every run on disk (env.json `config.prefix_compress` against requests.jsonl rows over 18,000
+prompt tokens that did not error), all at `max_seq_len=32768` under `flash_attention_2`:
+
+| `prefix_compress` | long sessions | served |
+|---|---|---|
+| 9 | 16 | **16** |
+| None | 16 | **3** |
+
+And on 2026-11-25 the same `build_exl3_qmatrix` 20 MiB failure reproduced on a **WARM** server, after four
+warm-ups and one served 21,551-token session. **So the defect is not specific to a cold boot**, and "it
+passes warm" has only ever been observed with the packed pool. We do not yet know the mechanism behind
+that correlation — two of our hypotheses died on contact with the data this week — and we are not going to
+guess at it in a document you plan against.
+
+### 17.4 What this changes for Rudra: nothing today
+
+- **R1 stays held, on D2, exactly as §16.3 said.** The reason is unchanged in kind and sharper in detail:
+  §14's "ceiling 32768" is still verified WARM ONLY, and now not even that at the shipped
+  `PREFIX_COMPRESS` default. We will still say explicitly when a long request is safe, and that remains
+  the signal to ship R1.
+- **Stay at the 16 k window.** Rudra's chains cap at ~13.9 k there and we have not reproduced any of this
+  at that size.
+- **§11.7's order is otherwise unchanged**, and step 2 (R6 + R2) is still clear to go.
+- Nothing here asks Rudra for work, a config change, or a reply.
