@@ -182,10 +182,30 @@ cold boot** — the second distinct long session fails too.
 restart — and Vaayu restarts itself 5 s after every OOM kill (HOST-RAM-CEILING), so a crash-loop can
 convert into a second, different failure that the client sees as a 500.
 
+**H1 — FOUND 2026-11-25 while auditing the D2 doc, and it may close this row without any fix.** The
+`prefix_compress` discriminator above is measured ENTIRELY on code carrying a defect D1 has since fixed.
+`PrefixCacheStore.store()` branches on compression (`prefix_cache.py:199-206`): `compress_bits is None`
+calls **`cache.to_cpu()`**, while 9 calls `compress_cache(...)` and **never enters `to_cpu()`**. Until
+`be2aa25` (14:19 today) `to_cpu()`'s compaction materialised each layer ON THE DEVICE
+(`vaayu_base.py:2039`) — 44 MiB in nobody's budget, the allocation that raised the 44.00 MiB OOM from
+`prefix_cache.py:200 store()` in `07-45-35Z`. **`be2aa25` + `4044eb1` removed it, and every uncompressed
+run in the table above predates them** (latest `08-20-57Z` at `e49081b`; each run's commit read from
+`env.json`'s `vaayu.commit`). So the packed arm's survival has a mechanism that is no longer in the code,
+and the uncompressed shape has NEVER been measured with a zero-device-byte park. **Also killed a tempting
+alternative: a prefix HIT is not what carried the packed arm** — every long request in BOTH arms logs
+`prefix_hit: true` at TTFT 123.6-133.2 s, i.e. a full 21.5 k prefill (law predicts ~144 s), so the packed
+arm served ten full prefills back to back at the same size as the arm that died.
+
 **Tasks**
+- [ ] **1b (NEW, FIRST — H1's cell).** `main` (`4331482`), `PREFIX_COMPRESS=None`, flash, 32768, the D1
+      acceptance shape: 4 warm-ups then 6 distinct ~21.5 k-token sessions. -> verify: how many long
+      sessions are served at a commit where the park costs ZERO device bytes. **6/6 collapses the
+      `prefix_compress` discriminator and re-scopes this row to (c) + a guard + the §17 release note;
+      1/6 at `build_exl3_qmatrix` makes the (a)/(b) fork live.** Record the plan line, `expert_cache=`,
+      the failing layer index and the driver-free figure either way.
 - [ ] **FIRST, run the two cells nobody has run** (they decide whether this row is about boot order at
-      all): the warm six-session shape at `PREFIX_COMPRESS=None`, and the cold single-request shape at
-      `PREFIX_COMPRESS=9`. -> verify: the split above (packed 16/16 across 2 runs; uncompressed 4/20
+      all): the warm six-session shape at `PREFIX_COMPRESS=None` (= task 1b), and the cold single-request
+      shape at `PREFIX_COMPRESS=9`. -> verify: the split above (packed 16/16 across 2 runs; uncompressed 4/20
       across 5, never a second long request in any of them) either survives or collapses. Until both
       exist, do NOT describe the defect as boot-order.
 - [ ] Reproduce deliberately: boot, send ONE request at ~20-22 k tokens as the first request, both
