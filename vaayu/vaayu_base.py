@@ -6944,9 +6944,13 @@ class VaayuBaseModel(GenerationMixin):
                   f"{e}); the answer already sent is unaffected, and the next "
                   f"turn on this session prefills in full. "
                   f"(a real limit, announced -- not a swallowed error)")
-            # Half-converted: store() may have raised mid-conversion, so no
-            # partial entry may stay in the pool.
-            pc.drop(resolved_sid)
+            # No pc.drop(resolved_sid) here, deliberately: there is nothing
+            # half-converted to forget (store() raises inside
+            # to_cpu()/compress_cache(), both before the lock and before any
+            # insertion) and a drop is destructive -- lookup() leaves the entry
+            # in the pool on a BORROWED hit and on a recurrent one-length
+            # refusal, so dropping by resolved_sid deletes a VALID entry this
+            # store never inserted. Guarded by test_prefix_cache.py.
 
     def _adopt_prefix_hit(self, kv, match_len: int, prompt_len: int,
                           session_id) -> int:

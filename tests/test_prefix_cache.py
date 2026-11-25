@@ -343,6 +343,37 @@ def test_store_failure_does_not_fail_the_request(capsys):
     assert "WARNING" in out and "sess" in out and "OutOfMemoryError" in out
 
 
+def test_store_failure_keeps_the_entry_already_under_that_id(capsys):
+    """A failed store may NOT delete the entry sitting under its own id.
+
+    `lookup()` does not always pop: a BORROWED hit (`key != session_id and m <
+    len(entry.token_ids)`) hands back a copy and leaves the entry in the pool,
+    and a recurrent one-length refusal returns `None, 0` without touching it.
+    The id a store resolves to is the same one that entry sits under -- with no
+    `session_id` the server's default, `_auto_session_id()` hashes the prompt
+    head, which is exactly what matched. So a `drop(resolved_sid)` in the
+    failure handler deletes a VALID entry this store never inserted, and the
+    next turn prefills in full. The neighbour-session assertion above cannot
+    see that: it only proves the blast radius misses OTHER ids."""
+    import types
+    from vaayu.prefix_cache import PrefixCacheStore
+    from vaayu.vaayu_base import VaayuBaseModel
+
+    pc = PrefixCacheStore(budget_bytes=10 ** 9)
+    pc.store("sess", [1, 2, 3, 4, 5, 6], _bf16_cache(seq=6))
+    kept = pc._current_bytes
+    assert pc.peek_match("sess", [1, 2, 3, 4, 5, 6]) == 6, "premise"
+
+    c = _bf16_cache(seq=4)
+    _oom_on_park(c)
+    fake = types.SimpleNamespace(_kv_writer=None, config=None)
+    VaayuBaseModel._persist_and_store(fake, pc, "sess", c, [1, 2, 3, 4, 5])
+    assert "WARNING" in capsys.readouterr().out, "premise: the store failed"
+    assert pc.peek_match("sess", [1, 2, 3, 4, 5, 6]) == 6, (
+        "the failed store deleted the entry already pooled under its id")
+    assert pc._current_bytes == kept
+
+
 def test_a_persist_failure_still_propagates():
     """The handler wraps the POOL STORE only. A kv_persist failure means the
     on-disk record silently missed this turn's tokens -- a different failure
