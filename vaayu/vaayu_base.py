@@ -1,6 +1,7 @@
 import atexit
 import contextlib
 import gc
+import itertools
 import json
 import os
 import re
@@ -2034,6 +2035,53 @@ class FP8DynamicCache(DynamicCache):
                 moved = getattr(layer, name).to(device, non_blocking=not to_cpu)
                 setattr(layer, name, moved)
 
+    @staticmethod
+    def _compact_to_cpu(src, used: int, out=None):
+        """`src[..., :used, :]` in ordinary CPU memory, allocating NOTHING on
+        the device.
+
+        `[..., :used, :].contiguous().to("cpu")` -- what this replaced --
+        materializes the compacted buffer ON THE DEVICE before the D2H, and
+        those staging bytes are in nobody's VRAM budget: the planner hands
+        every spare byte to the expert cache. Measured (D1,
+        `logs/run-2026-11-25T07-45-35Z`): a 44.00 MiB park allocation raised a
+        CUDA OOM against 42.12 MiB free, 130 s AFTER the prefill and AFTER the
+        reply had been streamed. Same class of defect as row 12a, where the
+        drafter's VRAM was in nobody's budget.
+
+        A `[*lead, S_cap, D]` KV buffer is contiguous, so `[..., :used, :]` is a
+        set of contiguous `[used, D]` prefixes -- one per leading index, strided
+        apart by `S_cap * D`. Copying them block by block touches no device
+        memory and moves exactly `used` positions across PCIe, fewer than the
+        capacity-sized read it replaces. Bit-identical to the old reference by
+        construction: the same bytes, in the same order.
+
+        Every copy is BLOCKING. The destination is pageable (never pinned --
+        pinned pages are unreclaimable and walked the cgroup into a SIGKILL,
+        `cbb1bf4`), and a `non_blocking=True` D2H into pageable memory returns
+        before any byte has arrived.
+
+        `out` lets a caller fill a slice of a larger CPU tensor (windowed_kv's
+        ring tail); it must already have the compacted shape. Every shape is
+        read off `src` -- no layer, head or dim count appears here (§5).
+        """
+        used = int(used)
+        if out is None:
+            out = torch.empty((*src.shape[:-2], used, src.shape[-1]),
+                              dtype=src.dtype, device="cpu")
+        if not src.is_contiguous():
+            # The per-block argument holds only for a contiguous source: a
+            # transposed or otherwise strided buffer has no contiguous
+            # [used, D] prefixes to copy. Take the old path, which DOES
+            # allocate on the device, rather than copy the wrong bytes.
+            out.copy_(src[..., :used, :])
+        elif used == src.shape[-2]:
+            out.copy_(src)                  # contiguous end to end: one DMA
+        else:
+            for idx in itertools.product(*(range(n) for n in src.shape[:-2])):
+                out[idx].copy_(src[idx][:used])
+        return out
+
     def to_cpu(self) -> None:
         """Compact each layer to its used length and move all buffers to CPU
         (ordinary reclaimable memory, NOT pinned: pinned pages are
@@ -2043,8 +2091,7 @@ class FP8DynamicCache(DynamicCache):
         for name in self._BUFFER_LISTS:
             lst = getattr(self, name)
             for i in range(len(lst)):
-                used = self._seq_len[i]
-                lst[i] = lst[i][..., :used, :].contiguous().to("cpu")
+                lst[i] = self._compact_to_cpu(lst[i], self._seq_len[i])
         self._move_recurrent_state("cpu")
 
     def to_device(self, device) -> None:

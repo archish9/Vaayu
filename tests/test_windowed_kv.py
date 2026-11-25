@@ -311,6 +311,34 @@ def test_to_cpu_releases_the_freed_spill_pages_once(monkeypatch):
     assert len(calls) == 1
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_pooling_allocates_no_device_memory():
+    """D1: the park must stage nothing on the device.
+
+    `out[..., pos:, :] = ring[..., :held, :]` makes the strided CUDA view
+    contiguous ON THE DEVICE before the D2H, and the park's staging bytes are
+    in nobody's VRAM budget -- the planner hands every spare byte to the expert
+    cache. UNIT-TESTED ONLY: gpt-oss-20b has been absent from this box since
+    the 2026-11-17 audit, so the whole-layer forward it serves has no on-device
+    coverage and no on-device claim is made for it. Covers the parent's
+    compaction of the full-attention layers in the same call.
+    """
+    win, ref = _feed("small-mixed", False, device="cuda")
+    i = min(win.windows)
+    assert win._ring_start[i] > 0, "premise: the plan must have spilled"
+    held = win._seq_len[i] - win._ring_start[i]
+    assert 0 < held < win.key_cache[i].shape[-2], "premise: a ring tail to skip"
+    torch.cuda.synchronize()
+    torch.cuda.reset_peak_memory_stats()
+    base = torch.cuda.memory_allocated()
+    win.to_cpu()
+    # The PEAK, not the post-call reading: a staged temp is freed before to_cpu
+    # returns, so the post-call delta is ~0 (negative, in fact) either way.
+    assert torch.cuda.max_memory_allocated() <= base
+    del win, ref
+    torch.cuda.empty_cache()   # test_decode_graphs measures reserved() deltas
+
+
 def test_the_release_runs_before_the_parent_compacts(monkeypatch):
     win, _ = _feed("small-mixed", False)
     before = [id(t) for t in win.key_cache]

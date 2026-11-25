@@ -319,7 +319,11 @@ class WindowedKVCache(FP8DynamicCache):
                     out[..., pos:pos + blk.shape[-2], :] = blk
                     pos += blk.shape[-2]
                     del blk
-                out[..., pos:, :] = ring[..., :held, :]
+                # NOT `out[..., pos:, :] = ring[..., :held, :]`: a strided CUDA
+                # view assigned into a CPU slice is made contiguous ON THE
+                # DEVICE first, and the park's staging bytes are in nobody's
+                # VRAM budget (see _compact_to_cpu).
+                self._compact_to_cpu(ring, held, out=out[..., pos:, :])
                 lst[i] = out
             self._ring_start[i] = 0
         if freed:
