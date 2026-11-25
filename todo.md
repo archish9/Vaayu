@@ -197,12 +197,58 @@ alternative: a prefix HIT is not what carried the packed arm** — every long re
 arm served ten full prefills back to back at the same size as the arm that died.
 
 **Tasks**
-- [ ] **1b (NEW, FIRST — H1's cell).** `main` (`4331482`), `PREFIX_COMPRESS=None`, flash, 32768, the D1
-      acceptance shape: 4 warm-ups then 6 distinct ~21.5 k-token sessions. -> verify: how many long
-      sessions are served at a commit where the park costs ZERO device bytes. **6/6 collapses the
-      `prefix_compress` discriminator and re-scopes this row to (c) + a guard + the §17 release note;
-      1/6 at `build_exl3_qmatrix` makes the (a)/(b) fork live.** Record the plan line, `expert_cache=`,
-      the failing layer index and the driver-free figure either way.
+- [x] **1b DONE 2026-11-25 — H1 is REFUTED: 1 of 6.** At `main` `c4bb575` (clean), `prefix_compress: null`,
+      flash, 32768, 4 warm-ups + 6 distinct 21,548-token sessions, 28.0 GiB scope. Session 1 served 16
+      tokens (ttft 122.57 s); **sessions 2-6 each completed their 43-chunk prefill and then died**, same
+      signature five times: `build_exl3_qmatrix -> t.to(device)`, **20.00 MiB wanted against 21.75 MiB
+      free, every time**, layers .1/.1/.1/.0/.1. So D1's park fix did NOT cover this row, and the
+      `prefix_compress` correlation above stands un-explained. Evidence:
+      `docs/superpowers/specs/2026-11-25-D2-artifacts/h1-RESULTS.md`, `logs/run-2026-11-25T10-38-35Z`.
+- [x] **THE ROW'S NAME IS NOW DOUBLY WRONG, and this is the run's most useful finding: the OOM is NOT in
+      prefill and NOT cold.** Prefill COMPLETED on all six (125.7-128.1 s, 43 chunks, compute ~117 s);
+      the OOM lands on the **first decode forward**, through
+      `vaayu_base.py:6511 -> decode_graphs.py:519 run -> :419 replay -> moe_patch.py:2061 sparse_forward
+      -> :1976 _load_inject_run -> :1328 _inject_expert_weights -> loader_strategy.py:402`. And the host
+      expert arena was WARM from the first long request (`usage=8.82GB/9.12GB` in every summary), so §4's
+      cold discriminator (`0hit/14896miss usage=0.00GB/9.12GB`, died at layer 29) is ABSENT here — this
+      run reproduces `08-20-57Z`'s WARM shape. **Not fragmentation:** 14.71-14.74 GiB allocated by PyTorch
+      against only 113.92-142.12 MiB reserved-but-unallocated. Keep the row's NAME for pointer stability
+      (it is cited in the handoff and five docs) and read it as a label, not a mechanism.
+- [x] **D1's fix holds on this shape, and host RAM is not the limit here** — 905 samples at 1 Hz:
+      peak `memory.current` **19.99 GiB against the 28.0 GiB cap**, `anon` max 8.64, `shmem` max 11.12,
+      **swap 0, PSI some avg10 max 0.00**. 8 GiB of headroom, no kill of any kind.
+- [x] **Plan line at this boot** (free VRAM 12.51 GB at load, the LOW end of the 12.71-12.72 band
+      `config_local.py` records): protected pin demand 3.26 GiB; `max_seq_len=32768` validated against
+      `S_max=32768`; reserve 8.56 GiB of which KV 7.75; pinning budget 4.26 GiB; expert cache ceiling
+      6.40 GiB; 3 fully-pinned + 62 non-expert-pinned, 3.60 GB; **expert VRAM cache 3.3 GB (~374 experts),
+      restricted to the first 46/62 MoE layers** (budget 3.3 GB < 4.4 GB working set); prefix cache 12.36
+      GB budget; **elastic tier OFF (decode graphs), 5.06 GiB of the reserve stays unlent**; decode-graph
+      pool 0.00 GB charged to the tier.
+- [x] **MEASUREMENT TRAP, worth more than the run — the driver's own stdout reported SIX SUCCESSES.**
+      `d1_arm.py`/`d2_arm.py`'s first-content test is `'"content"' in line`, which **matches an SSE
+      heartbeat chunk** (`wire`: `chunks_sent 14, heartbeats_sent 12`), so every failing session printed
+      `chunks: 16, first_content_s ~10.04`. Trusting the driver would have reported the exact opposite
+      answer. **`requests.jsonl` is the oracle.** Related: on a failed row `ttft_s` (125.70-128.12 s) is
+      **time-to-FAILURE**, not time-to-first-token — it sits within 0.4-0.7 s of `wall_s` with
+      `tokens: 0`. And `prefix_hit: true` on these rows is matching only **39-41 of 21,550 tokens** (the
+      system prompt), so nothing here is a reuse measurement.
+- [ ] **NEXT, and it is a CONTROL, not a nicety: the packed arm at `main`.** Same cell, same boot shape,
+      `PREFIX_COMPRESS=9`. Nobody has run packed at or after `be2aa25` either. If packed ALSO dies at
+      20 MiB now, the `prefix_compress` correlation is dead and this row is pure VRAM accounting; if it
+      serves 6/6, there is a real store-path -> device-VRAM mechanism that must be understood BEFORE a fix
+      (candidate: uncompressed `store()` calls `cache.to_cpu()` and so frees + reallocates the device KV
+      ring between requests, while `compress_cache()` leaves the live cache alone — UNTESTED).
+- [ ] **Then instrument (task 3), sharpened by 1b:** sample driver-free VRAM (after `empty_cache()`),
+      torch allocated/reserved, and the tier's `usage=x/y` **per request across sessions 1 -> 2**, in both
+      arms. Session 1 serves in EVERY arm on record; what grows before session 2's first decode is the
+      whole question. Prime suspect, derived from the plan line: the tier fills to its 3.3 GB ceiling
+      during session 1, and nothing budgets the **per-injection H2D staging** (20 MiB) that
+      `build_exl3_qmatrix` needs on a miss — the s42 trap (`s42-residency-first-vram-basis`) one level
+      down. Confirm or kill it with numbers, do not build against it.
+- [ ] **Confound to carry, not bury:** rustdesk (pid 426218) held **148 MiB of GPU memory** for the whole
+      run, named in the OOM text. Constant across this arm and the §4 runs, but it is 148 MiB against a
+      **22 MiB** failure margin, so "unchanged" is not "negligible". Decide whether to kill it for the
+      next arm, and say which way the arm was run.
 - [ ] **FIRST, run the two cells nobody has run** (they decide whether this row is about boot order at
       all): the warm six-session shape at `PREFIX_COMPRESS=None` (= task 1b), and the cold single-request
       shape at `PREFIX_COMPRESS=9`. -> verify: the split above (packed 16/16 across 2 runs; uncompressed 4/20
