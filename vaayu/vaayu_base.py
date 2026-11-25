@@ -2852,6 +2852,7 @@ class VaayuBaseModel(GenerationMixin):
         self._build_moe_geometry()
 
         self._vram_plan = None
+        self._expert_tier_margin_bytes = 0
         if device.startswith("cuda") and torch.cuda.is_available():
             from .vram_plan import (DEFAULT_ALLOC_FACTOR, VramShape,
                                     plan_vram, reserve_floor_bytes,
@@ -3622,7 +3623,7 @@ class VaayuBaseModel(GenerationMixin):
 
             # VRAM-resident expert cache (Fix #7): hot experts skip per-token H2D.
             if torch.cuda.is_available() and str(self.device).startswith("cuda"):
-                from .vram_plan import expert_vram_budget_for
+                from .vram_plan import expert_vram_budget_for, warn_tier_lost_to_margin
                 _free_vram, _ = torch.cuda.mem_get_info()
                 # S42 residency-first: a non-expert transformer layer streams every
                 # token (100 % read) and so dominates, per byte, an expert slot it
@@ -3643,6 +3644,11 @@ class VaayuBaseModel(GenerationMixin):
                     print(f"[Vaayu-MoE] Expert VRAM cache: {_vram_budget / 1e9:.1f} GB "
                           f"(~{int(_vram_budget // max(1, self._moe_geometry['expert_bytes']))} "
                           f"experts resident on GPU)")
+                elif (_margin_msg := warn_tier_lost_to_margin(
+                        budget_bytes=_vram_budget,
+                        expert_bytes=self._moe_geometry["expert_bytes"],
+                        margin_bytes=self._expert_tier_margin_bytes)) is not None:
+                    print(_margin_msg)
                 else:
                     print(f"[Vaayu-MoE] WARNING: Expert VRAM cache disabled — free VRAM "
                           f"{_free_vram/1e9:.2f}GB leaves {_vram_budget/1e9:.2f}GB after the "

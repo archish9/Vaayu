@@ -933,6 +933,28 @@ def tier_margin_bytes(*, injection_bytes: int, hardware_floor: int,
     return max(floor, -(-need // unit) * unit)
 
 
+def warn_tier_lost_to_margin(*, budget_bytes: int, expert_bytes: int,
+                             margin_bytes: int) -> str | None:
+    """WARNING text when the tier margin is what left the expert VRAM tier under
+    one expert, else None (CLAUDE.md §5: a real limit is announced, never a
+    silent degrade).
+
+    Fires only when the margin is the CAUSE: the budget is under one expert, and
+    would not have been without the margin. A load too small for one expert even
+    with the margin returned keeps only the tier-disabled warning at the call
+    site. Every figure is passed in; nothing here is model-specific.
+    """
+    if budget_bytes >= expert_bytes or budget_bytes + margin_bytes < expert_bytes:
+        return None
+    mib = 1024 ** 2
+    return (f"[Vaayu-MoE] WARNING: Expert VRAM cache disabled by the tier margin — "
+            f"the {margin_bytes / 1024 ** 3:.2f} GiB held back from the tier "
+            f"(budget {budget_bytes / mib:.1f} MiB after it, "
+            f"{(budget_bytes + margin_bytes) / mib:.1f} MiB before it) leaves less "
+            f"than one {expert_bytes / mib:.1f} MiB expert. Every expert streams "
+            f"per token; expect very slow decode.")
+
+
 def residency_first_allows_pin(*, used: int, size: int, budget: int,
                                free_vram: int, reserve: int,
                                working_set_bytes: int, margin: int) -> bool:

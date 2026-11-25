@@ -1516,3 +1516,34 @@ def test_the_default_is_the_old_behaviour_exactly():
     p = _plan("llama-70b")
     assert (expert_vram_budget_for(p, USABLE_VRAM)
             == max(0, USABLE_VRAM - p.reserve_bytes))
+
+
+from vaayu.vram_plan import warn_tier_lost_to_margin
+
+
+def test_a_surviving_tier_says_nothing():
+    assert warn_tier_lost_to_margin(budget_bytes=int(3.3 * GB),
+                                    expert_bytes=int(8.8 * MB),
+                                    margin_bytes=int(0.20 * GB)) is None
+
+
+def test_the_margin_that_kills_the_tier_announces_itself():
+    """CLAUDE.md §5: a real limit gets a WARNING, never a silent degrade. If the
+    margin drops the budget below ONE expert, no tier is created -- the load must
+    say so, with the margin's size and the budget it left."""
+    msg = warn_tier_lost_to_margin(budget_bytes=int(4 * MB),
+                                   expert_bytes=int(8.8 * MB),
+                                   margin_bytes=int(0.20 * GB))
+    assert msg is not None
+    assert "WARNING" in msg
+    assert "0.20" in msg          # the margin, in GiB
+    assert "4" in msg and "8.8" in msg   # budget left and one expert's bytes
+
+
+def test_a_load_too_small_without_the_margin_is_not_the_margins_fault():
+    """Even with the margin returned the budget is under one expert, so the
+    older tier-disabled warning owns this case; a second message would only
+    overlap it."""
+    assert warn_tier_lost_to_margin(budget_bytes=0,
+                                    expert_bytes=int(8.8 * MB),
+                                    margin_bytes=int(1 * MB)) is None
