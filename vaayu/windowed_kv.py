@@ -296,8 +296,7 @@ class WindowedKVCache(FP8DynamicCache):
         tensor (host log + ring), byte-identical to FP8DynamicCache's, so every
         prefix-store rule applies unchanged. Blocks are freed as they are
         copied, so the history is never held twice. The parent then compacts
-        the rest (its `pin_memory()` returns an already-pinned tensor as is)."""
-        pin = torch.cuda.is_available()
+        the rest."""
         freed = 0
         for i in self.windows:
             if i >= len(self._seq_len) or i >= len(self.key_cache):
@@ -312,7 +311,7 @@ class WindowedKVCache(FP8DynamicCache):
                 lst = getattr(self, name)
                 ring = lst[i]
                 out = torch.empty((*ring.shape[:-2], self._seq_len[i], ring.shape[-1]),
-                                  dtype=ring.dtype, device="cpu", pin_memory=pin)
+                                  dtype=ring.dtype, device="cpu")
                 pos, blocks = 0, logs.get(name, [])
                 while blocks:
                     blk = blocks.pop(0)
@@ -324,7 +323,7 @@ class WindowedKVCache(FP8DynamicCache):
                 lst[i] = out
             self._ring_start[i] = 0
         if freed:
-            release_freed_host_pages()   # before the parent pins the rest
+            release_freed_host_pages()   # before the parent compacts the rest
         super().to_cpu()
 
     def to_device(self, device) -> None:

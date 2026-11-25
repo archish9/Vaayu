@@ -2014,7 +2014,7 @@ class FP8DynamicCache(DynamicCache):
                 out.append((i, layer))
         return out
 
-    def _move_recurrent_state(self, device, pin: bool = False) -> None:
+    def _move_recurrent_state(self, device) -> None:
         """Move conv/recurrent state to `device`, in place on the layer objects.
 
         The state travels with the entry rather than in a side object: the
@@ -2022,27 +2022,30 @@ class FP8DynamicCache(DynamicCache):
         separate snapshot to keep in sync. Unlike the KV buffers there is
         nothing to compact, because the state is a fixed-size summary whose
         shape does not depend on how many tokens it has seen.
+
+        Blocking when the target is CPU: a CUDA tensor's
+        `.to("cpu", non_blocking=True)` into pageable memory returns before
+        any byte has arrived, so the parked state would be read half-written.
+        The device direction stays async (H2D).
         """
+        to_cpu = torch.device(device).type == "cpu"
         for _i, layer in self._recurrent_state_layers():
             for name in ("conv_states", "recurrent_states"):
-                moved = getattr(layer, name).to(device, non_blocking=True)
-                setattr(layer, name, moved.pin_memory() if pin else moved)
+                moved = getattr(layer, name).to(device, non_blocking=not to_cpu)
+                setattr(layer, name, moved)
 
     def to_cpu(self) -> None:
         """Compact each layer to its used length and move all buffers to CPU
-        (pinned when CUDA is available), for RAM-resident prefix-cache storage
-        between turns. Drops the geometric-growth capacity tail. The recurrent
+        (ordinary reclaimable memory, NOT pinned: pinned pages are
+        unreclaimable and the pool walks the cgroup into a SIGKILL), for
+        RAM-resident prefix-cache storage between turns. Drops the geometric-growth capacity tail. The recurrent
         state travels with the KV."""
-        pin = torch.cuda.is_available()
         for name in self._BUFFER_LISTS:
             lst = getattr(self, name)
             for i in range(len(lst)):
                 used = self._seq_len[i]
-                compact = lst[i][..., :used, :].contiguous().to("cpu")
-                if pin:
-                    compact = compact.pin_memory()
-                lst[i] = compact
-        self._move_recurrent_state("cpu", pin=pin)
+                lst[i] = lst[i][..., :used, :].contiguous().to("cpu")
+        self._move_recurrent_state("cpu")
 
     def to_device(self, device) -> None:
         """Move all buffers to `device` (GPU) for an in-flight request. The
