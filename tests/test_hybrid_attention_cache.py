@@ -514,6 +514,54 @@ def test_to_cpu_then_to_device_round_trips_the_recurrent_state():
         assert torch.equal(after[i].recurrent_states, r)
 
 
+_CUDA = torch.cuda.is_available()
+
+
+@pytest.mark.skipif(not _CUDA, reason="needs CUDA: the hazard is a CUDA->host copy")
+def test_to_cpu_parks_recurrent_state_blocking_not_async():
+    """A CUDA tensor's `.to("cpu", non_blocking=True)` into pageable memory
+    returns before a byte arrives. Queue GPU work ahead of the park so an async
+    copy is caught mid-flight; the parked values must equal the device's."""
+    cache = _hybrid_cache_with_state()
+    for _i, l in cache._recurrent_state_layers():
+        l.conv_states = (torch.rand(1, 4096, 2048, device="cuda") + 1).to(torch.bfloat16)
+        l.recurrent_states = (torch.rand(1, 4096, 2048, device="cuda") + 1).to(torch.bfloat16)
+    # References are taken to the host BEFORE the park: `.cpu()` on a CUDA
+    # tensor synchronizes, and doing it after would drain the stream and hide
+    # the race.
+    before = {i: (l.conv_states.cpu(), l.recurrent_states.cpu())
+              for i, l in cache._recurrent_state_layers()}
+    a = torch.rand(4096, 4096, device="cuda")
+    for _ in range(40):                      # keep the stream busy ahead of the copies
+        a = a @ a
+        a = a / a.norm()
+    cache.to_cpu()
+    for i, l in cache._recurrent_state_layers():
+        c, r = before[i]
+        assert torch.equal(l.conv_states, c), i
+        assert torch.equal(l.recurrent_states, r), i
+
+
+@pytest.mark.skipif(not _CUDA, reason="pinning only exists with CUDA")
+def test_to_cpu_park_is_not_pinned():
+    """Pinned pages are unreclaimable; a pinned pool walks the cgroup into a
+    SIGKILL (D1). The park must be ordinary host memory."""
+    cache = _hybrid_cache_with_state()
+    for name in cache._BUFFER_LISTS:
+        lst = getattr(cache, name)
+        for i in range(len(lst)):
+            lst[i] = lst[i].cuda()
+    for _i, l in cache._recurrent_state_layers():
+        l.conv_states = l.conv_states.cuda()
+        l.recurrent_states = l.recurrent_states.cuda()
+    cache.to_cpu()
+    parked = [t for name in cache._BUFFER_LISTS for t in getattr(cache, name)]
+    parked += [t for _i, l in cache._recurrent_state_layers()
+               for t in (l.conv_states, l.recurrent_states)]
+    assert parked and all(t.device.type == "cpu" for t in parked)
+    assert not any(t.is_pinned() for t in parked)
+
+
 def test_uniform_cache_carries_nothing_extra():
     """Regression guard for the three non-hybrid checkpoints on disk."""
     cache = FP8DynamicCache(quantize=False)

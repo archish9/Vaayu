@@ -1698,3 +1698,94 @@ Vaayu has not reproduced the failure at that size.
 a cold long first request is safe, and that is the signal to ship R1 — replacing
 the V0 signal §11.7 named. The rest of §11.7's order is unchanged, and Rudra's
 step 2 (R6 + R2) is still clear to go.
+
+## 17. Host-RAM death fixed; repeated long requests still blocked on D2 — and §16.3's evidence needs a correction. R1 STAYS HELD ON D2.
+
+**2026-11-25.** Three things for Rudra: one good, one cost of it we have NOT measured yet, and one
+correction to what §16.3 told you.
+
+### 17.1 The host-RAM death is fixed, and measured
+
+The pool no longer parks PINNED host memory (`cbb1bf4`, branch `d1-host-ram-ceiling`). Measured on this
+box with the uncompressed default (`prefix_compress: null` in the run's `env.json`).
+
+**This is NOT a controlled A/B — read the column headers.** The two columns are different runs, on
+different days, at different commits, and they attempted different numbers of sessions:
+
+| | **before:** 2026-11-24 mirrored-A/B arm, PINNED, pre-`cbb1bf4` — served **2** sessions, then died | **after:** `run-2026-11-25T07-45-35Z`, UNPINNED, at `cbb1bf4` — served **1** of 10 sessions |
+|---|---|---|
+| `shmem` | 11.94 -> **29.90 GB** | **11.94 FLAT** (min == max after load) |
+| `anon` | 2.26 -> **0.02** (kernel reclaimed the process's own memory) | 2.96 -> 9.28, one step at the first park, then flat |
+| peak `memory.current` | **30.06 GB = `memory.max` exactly** | 22.11 GB — the peak with exactly **ONE** entry parked, not a steady state. The second store never succeeded, so pool growth past one entry is UNPROVED |
+| outcome | **SIGKILLed mid-request**, client got `RemoteDisconnected` after 254 s | no kill of any kind, swap 0, PSI some avg10 max 0.00 — but it stopped on VRAM after session 1 (§17.2) |
+
+So the mechanism behind the two OOM kills of 2026-11-24 (§16.1) is gone **as a mechanism**: the parked
+pool is ordinary reclaimable memory rather than pinned pages the kernel cannot touch. Being precise about
+what that does and does not establish: what was shown is that the pool is now **reclaimable**. Reclaim
+*under pressure* is **untested** — `swap 0, PSI some avg10 max 0.00` says the cgroup was never under
+memory pressure in that run, so the kernel was never asked to reclaim those pages. We are not claiming
+the failure mode is unreachable; we are claiming its cause is removed and the pages are now the kind the
+kernel can reclaim. That part of §16 is closed in code rather than by a machine-local config line.
+
+**One cost of the unpin is UNMEASURED, and you should know it before you plan around TTFT.** A prefix-HIT
+restore now uploads from PAGEABLE host memory (~5-6 GB/s on this box) where it used to upload from PINNED
+(~20 GB/s). On this row's own ~6.3 GB restore that is an ESTIMATE of roughly **+0.8 s on a ~15-17 s HIT
+turn, about 5 %** — arithmetic, not a measurement, and the spec for this work names "regressing
+prefix-HIT TTFT without saying so" as an anti-goal. D1's Task 4 exists to measure it (ABBA, mirrored). If
+it lands near 5 % it is at or over that task's own trigger, and we will say so here either way.
+
+### 17.2 But a long SECOND session still fails, on VRAM — so the default is NOT yet safe for repeated long requests
+
+Being honest about the bar we set ourselves: the acceptance run was **six distinct 21,551-token sessions**,
+and it served **one**. What stops it is not host RAM any more, it is VRAM, and it is **D2**, not this row.
+Two separate unbudgeted device allocations were found, both of which fail once the expert VRAM tier has
+filled during the first long session:
+
+- the prefix park's own compaction temp, 44 MiB — **fixed** (`be2aa25`, `4044eb1`): the park now stages
+  nothing on the device at all;
+- expert injection's `build_exl3_qmatrix -> t.to(device)`, 20 MiB — **open, and it is D2's**.
+
+At that point the plan holds weights 4.26 GiB + expert tier 3.32 GB + a KV ring allocated at the FULL
+`max_seq_len=32768` (7.75 GiB) ≈ 15.1 of 15.48 GiB, with the elastic tier OFF because decode graphs own
+its pool — so roughly 18-42 MiB of slack and no way to shrink the tier to make room.
+
+### 17.3 Correction to §16.3: the "six times warm" evidence is CONFOUNDED
+
+§16.3 and the block above it argue the cold-prefill OOM is about boot order, citing "the identical prompt
+then succeeded **six times** on a warm server with an identical VRAM plan". The VRAM plan was identical;
+**`PREFIX_COMPRESS` was not.** Those six requests came from a run with it set to 9, and the cold failure
+had it at `None`.
+
+Counting every run on disk (env.json `config.prefix_compress` against requests.jsonl rows over 18,000
+prompt tokens that did not error), all at `max_seq_len=32768` under `flash_attention_2`. **The honest
+denominator is RUNS, not requests** — once a long request fails, that server is wedged, so every later
+long request in the same run is a consequence of the first failure, not an independent trial of it. In
+particular the `VramPlanError` rows were refused at admission in milliseconds and never ran a forward
+pass at all:
+
+| `prefix_compress` | runs with a long request | long requests | served | per-run result |
+|---|---|---|---|---|
+| 9 | 2 | 16 | **16** | `11-24T12-02-16` 6/6 and `11-25T07-17-14` 10/10 — both runs served every long request |
+| None | 5 | 20 | **4** | `11-24T12-52-41` 1/3, `11-24T12-59-09` 1/1, `11-25T07-45-35` 1/10, `11-25T08-05-42` 0/3, `11-25T08-20-57` 1/3 — **no run ever served a SECOND long request** |
+
+(Recounted 2026-11-25 against the runs now on disk; an earlier edition of this table said 16/16 against
+16/3, i.e. it omitted two of the five `None` runs. The direction is unchanged and the per-run reading is
+the one to carry: packed survives repeated long requests, uncompressed has never served more than one in
+a single boot.)
+
+And on 2026-11-25 the same `build_exl3_qmatrix` 20 MiB failure reproduced on a **WARM** server, after four
+warm-ups and one served 21,551-token session. **So the defect is not specific to a cold boot**, and "it
+passes warm" has only ever been observed with the packed pool. We do not yet know the mechanism behind
+that correlation — two of our hypotheses died on contact with the data this week — and we are not going to
+guess at it in a document you plan against.
+
+### 17.4 What this changes for Rudra: nothing today
+
+- **R1 stays held, on D2, exactly as §16.3 said.** The reason is unchanged in kind and sharper in detail:
+  §14's "ceiling 32768" is still verified WARM ONLY, and now not even that at the shipped
+  `PREFIX_COMPRESS` default. We will still say explicitly when a long request is safe, and that remains
+  the signal to ship R1.
+- **Stay at the 16 k window.** Rudra's chains cap at ~13.9 k there and we have not reproduced any of this
+  at that size.
+- **§11.7's order is otherwise unchanged**, and step 2 (R6 + R2) is still clear to go.
+- Nothing here asks Rudra for work, a config change, or a reply.

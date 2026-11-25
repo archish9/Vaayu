@@ -1,6 +1,7 @@
 import atexit
 import contextlib
 import gc
+import itertools
 import json
 import os
 import re
@@ -2014,7 +2015,7 @@ class FP8DynamicCache(DynamicCache):
                 out.append((i, layer))
         return out
 
-    def _move_recurrent_state(self, device, pin: bool = False) -> None:
+    def _move_recurrent_state(self, device) -> None:
         """Move conv/recurrent state to `device`, in place on the layer objects.
 
         The state travels with the entry rather than in a side object: the
@@ -2022,27 +2023,112 @@ class FP8DynamicCache(DynamicCache):
         separate snapshot to keep in sync. Unlike the KV buffers there is
         nothing to compact, because the state is a fixed-size summary whose
         shape does not depend on how many tokens it has seen.
+
+        Blocking when the target is CPU: a CUDA tensor's
+        `.to("cpu", non_blocking=True)` into pageable memory returns before
+        any byte has arrived, so the parked state would be read half-written.
+        The device direction stays async (H2D).
         """
+        to_cpu = torch.device(device).type == "cpu"
         for _i, layer in self._recurrent_state_layers():
             for name in ("conv_states", "recurrent_states"):
-                moved = getattr(layer, name).to(device, non_blocking=True)
-                setattr(layer, name, moved.pin_memory() if pin else moved)
+                moved = getattr(layer, name).to(device, non_blocking=not to_cpu)
+                setattr(layer, name, moved)
+
+    # One-time latch for the fallback's WARNING below. On the CLASS, not an
+    # instance: a 62-layer park must not print 62 lines, and the condition is a
+    # property of the buffer layout rather than of one cache.
+    _park_fallback_warned = False
+
+    @staticmethod
+    def _compact_to_cpu(src, used: int, out=None):
+        """`src[..., :used, :]` in ordinary CPU memory, allocating NOTHING on
+        the device.
+
+        `[..., :used, :].contiguous().to("cpu")` -- what this replaced --
+        materializes the compacted buffer ON THE DEVICE before the D2H, and
+        those staging bytes are in nobody's VRAM budget: the planner hands
+        every spare byte to the expert cache. Measured (D1,
+        `logs/run-2026-11-25T07-45-35Z`): a 44.00 MiB park allocation raised a
+        CUDA OOM against 42.12 MiB free, 130 s AFTER the prefill and AFTER the
+        reply had been streamed. Same class of defect as row 12a, where the
+        drafter's VRAM was in nobody's budget.
+
+        A `[*lead, S_cap, D]` KV buffer is contiguous, so `[..., :used, :]` is a
+        set of contiguous `[used, D]` prefixes -- one per leading index, strided
+        apart by `S_cap * D`. Copying them block by block touches no device
+        memory at all. The PCIe bytes are UNCHANGED: the old `.contiguous()`
+        was a device-to-device copy, so that path too sent only `used`
+        positions over the bus. What this removes is one device ALLOCATION and
+        one device-side copy. Bit-identical to the old reference by
+        construction: the same bytes, in the same order.
+
+        Every copy is BLOCKING. The destination is pageable (never pinned --
+        pinned pages are unreclaimable and walked the cgroup into a SIGKILL,
+        `cbb1bf4`), and a `non_blocking=True` D2H into pageable memory returns
+        before any byte has arrived.
+
+        `out` lets a caller fill a slice of a larger CPU tensor (windowed_kv's
+        ring tail). It is checked, not trusted: `copy_` BROADCASTS, so a
+        wrong-shaped destination would silently replicate one position across
+        the rest instead of failing. Every shape is read off `src`/`out` -- no
+        layer, head or dim count appears here (§5).
+        """
+        used = int(used)
+        if src.dim() < 2:
+            raise ValueError(
+                f"_compact_to_cpu needs a [*lead, S, D] buffer; got "
+                f"{src.dim()} dim(s), shape {tuple(src.shape)}")
+        if not 0 <= used <= src.shape[-2]:
+            raise ValueError(
+                f"used={used} is off this buffer's sequence axis "
+                f"[0, {src.shape[-2]}] (shape {tuple(src.shape)})")
+        want = (*src.shape[:-2], used, src.shape[-1])
+        if out is None:
+            out = torch.empty(want, dtype=src.dtype, device="cpu")
+        elif tuple(out.shape) != want:
+            raise ValueError(
+                f"out has shape {tuple(out.shape)}, expected {want}")
+        if not src.is_contiguous():
+            # The per-block argument holds only for a contiguous source: a
+            # transposed or otherwise strided buffer has no contiguous
+            # [used, D] prefixes to copy. Take the old path, which DOES
+            # allocate on the device, rather than copy the wrong bytes --
+            # announced, because an OOM from here would otherwise be
+            # indistinguishable from the pre-fix defect (§5: warn, never
+            # degrade silently).
+            if not FP8DynamicCache._park_fallback_warned:
+                FP8DynamicCache._park_fallback_warned = True
+                print(f"[Vaayu-Prefix] WARNING: parking a non-contiguous KV "
+                      f"buffer (shape {tuple(src.shape)}, strides "
+                      f"{tuple(src.stride())}) -- it has no contiguous "
+                      f"per-position blocks to copy, so the park is staging on "
+                      f"the GPU again and allocating device memory that no "
+                      f"VRAM budget charges. Printed once per process. "
+                      f"(a real limit, announced -- not a swallowed error)")
+            out.copy_(src[..., :used, :])
+        elif used == src.shape[-2]:
+            # Contiguous end to end: one DMA. Still device-clean when `out` is a
+            # non-contiguous view (windowed_kv's ring tail), but then copy_ has
+            # to stage a CONTIGUOUS HOST temp of `out.numel()` elements -- a
+            # host transient, on a branch named for the host-RAM ceiling.
+            out.copy_(src)
+        else:
+            for idx in itertools.product(*(range(n) for n in src.shape[:-2])):
+                out[idx].copy_(src[idx][:used])
+        return out
 
     def to_cpu(self) -> None:
         """Compact each layer to its used length and move all buffers to CPU
-        (pinned when CUDA is available), for RAM-resident prefix-cache storage
-        between turns. Drops the geometric-growth capacity tail. The recurrent
+        (ordinary reclaimable memory, NOT pinned: pinned pages are
+        unreclaimable and the pool walks the cgroup into a SIGKILL), for
+        RAM-resident prefix-cache storage between turns. Drops the geometric-growth capacity tail. The recurrent
         state travels with the KV."""
-        pin = torch.cuda.is_available()
         for name in self._BUFFER_LISTS:
             lst = getattr(self, name)
             for i in range(len(lst)):
-                used = self._seq_len[i]
-                compact = lst[i][..., :used, :].contiguous().to("cpu")
-                if pin:
-                    compact = compact.pin_memory()
-                lst[i] = compact
-        self._move_recurrent_state("cpu", pin=pin)
+                lst[i] = self._compact_to_cpu(lst[i], self._seq_len[i])
+        self._move_recurrent_state("cpu")
 
     def to_device(self, device) -> None:
         """Move all buffers to `device` (GPU) for an in-flight request. The
@@ -6839,7 +6925,36 @@ class VaayuBaseModel(GenerationMixin):
             # value here indexes one position past what the cache actually holds.
             self._kv_writer.enqueue_append(
                 resolved_sid, kv, self.config, token_ids, kv.get_seq_length())
-        pc.store(resolved_sid, token_ids, kv)
+        # The store only, never the enqueue above: a persist failure is a
+        # different failure with a different meaning. All three callers reach
+        # it through here, which is why the handler lives here.
+        try:
+            pc.store(resolved_sid, token_ids, kv)
+        except Exception as e:      # noqa: BLE001 -- announced, never re-raised
+            # The reply was generated and streamed to the user ~130 s ago (D1,
+            # logs/run-2026-11-25T07-45-35Z: the park's own device allocation
+            # OOM'd here, at ttft_s 133.16, and turned a finished answer into a
+            # 500). This is called OUTSIDE generate()'s `except BaseException`,
+            # so re-raising also skipped restore_on_abort and dropped the popped
+            # entry. Cache housekeeping is not the user's problem.
+            #
+            # The exception is kept NOWHERE -- not on self, not in the pool, not
+            # in a log record. A retained exception holds its traceback, which
+            # holds this frame, which holds `kv`: the engine's own
+            # `row["error"] = ex` (server/engine.py) would then pin the whole
+            # device KV for as long as that row lives.
+            print(f"[Vaayu-Prefix] WARNING: could not store session "
+                  f"{resolved_sid!r} in the prefix pool ({type(e).__name__}: "
+                  f"{e}); the answer already sent is unaffected, and the next "
+                  f"turn on this session prefills in full. "
+                  f"(a real limit, announced -- not a swallowed error)")
+            # No pc.drop(resolved_sid) here, deliberately: there is nothing
+            # half-converted to forget (store() raises inside
+            # to_cpu()/compress_cache(), both before the lock and before any
+            # insertion) and a drop is destructive -- lookup() leaves the entry
+            # in the pool on a BORROWED hit and on a recurrent one-length
+            # refusal, so dropping by resolved_sid deletes a VALID entry this
+            # store never inserted. Guarded by test_prefix_cache.py.
 
     def _adopt_prefix_hit(self, kv, match_len: int, prompt_len: int,
                           session_id) -> int:

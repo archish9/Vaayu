@@ -301,6 +301,122 @@ def test_persist_runs_before_store_compresses():
     assert [o[0] for o in order] == ["persist", "store"]
 
 
+# ── D1: a failed store must not fail an already-answered request ────────────
+#
+# Measured in logs/run-2026-11-25T07-45-35Z, session d1-none-1: the park's own
+# device allocation raised a CUDA OOM inside store() -> to_cpu(), 130 s AFTER
+# the prefill and AFTER the reply had been streamed. _persist_and_store is
+# called outside generate()'s `except BaseException`, so the raise (a) turned a
+# finished answer into a 500, (b) skipped restore_on_abort and (c) handed the
+# engine an exception whose traceback holds frames referencing `kv`.
+
+def _oom_on_park(cache):
+    """Make this cache's park raise the OOM the D1 run raised."""
+    import torch
+
+    def _boom():
+        raise torch.cuda.OutOfMemoryError(
+            "CUDA out of memory. Tried to allocate 44.00 MiB")
+    cache.to_cpu = _boom
+
+
+def test_store_failure_does_not_fail_the_request(capsys):
+    import types
+    from vaayu.prefix_cache import PrefixCacheStore
+    from vaayu.vaayu_base import VaayuBaseModel
+
+    pc = PrefixCacheStore(budget_bytes=10 ** 9)
+    pc.store("other", [9, 9, 9], _bf16_cache(seq=6))
+    kept = pc._current_bytes
+    assert kept > 0, "premise: the pool holds another session's entry"
+
+    c = _bf16_cache(seq=4)
+    _oom_on_park(c)
+    fake = types.SimpleNamespace(_kv_writer=None, config=None)
+    VaayuBaseModel._persist_and_store(fake, pc, "sess", c, [1, 2, 3, 4, 5])
+    assert pc.peek_match("sess", [1, 2, 3, 4]) == 0
+    # The blast radius stops at the failed session: a neighbour sharing the
+    # pool keeps its entry, and the byte count still accounts for exactly it.
+    assert pc.peek_match("other", [9, 9, 9]) == 3
+    assert pc._current_bytes == kept
+    out = capsys.readouterr().out
+    assert "WARNING" in out and "sess" in out and "OutOfMemoryError" in out
+
+
+def test_store_failure_keeps_the_entry_already_under_that_id(capsys):
+    """A failed store may NOT delete the entry sitting under its own id.
+
+    `lookup()` does not always pop: a BORROWED hit (`key != session_id and m <
+    len(entry.token_ids)`) hands back a copy and leaves the entry in the pool,
+    and a recurrent one-length refusal returns `None, 0` without touching it.
+    The id a store resolves to is the same one that entry sits under -- with no
+    `session_id` the server's default, `_auto_session_id()` hashes the prompt
+    head, which is exactly what matched. So a `drop(resolved_sid)` in the
+    failure handler deletes a VALID entry this store never inserted, and the
+    next turn prefills in full. The neighbour-session assertion above cannot
+    see that: it only proves the blast radius misses OTHER ids."""
+    import types
+    from vaayu.prefix_cache import PrefixCacheStore
+    from vaayu.vaayu_base import VaayuBaseModel
+
+    pc = PrefixCacheStore(budget_bytes=10 ** 9)
+    pc.store("sess", [1, 2, 3, 4, 5, 6], _bf16_cache(seq=6))
+    kept = pc._current_bytes
+    assert pc.peek_match("sess", [1, 2, 3, 4, 5, 6]) == 6, "premise"
+
+    c = _bf16_cache(seq=4)
+    _oom_on_park(c)
+    fake = types.SimpleNamespace(_kv_writer=None, config=None)
+    VaayuBaseModel._persist_and_store(fake, pc, "sess", c, [1, 2, 3, 4, 5])
+    assert "WARNING" in capsys.readouterr().out, "premise: the store failed"
+    assert pc.peek_match("sess", [1, 2, 3, 4, 5, 6]) == 6, (
+        "the failed store deleted the entry already pooled under its id")
+    assert pc._current_bytes == kept
+
+
+def test_a_persist_failure_still_propagates():
+    """The handler wraps the POOL STORE only. A kv_persist failure means the
+    on-disk record silently missed this turn's tokens -- a different failure
+    with a different meaning, undetectable until a restore serves the previous
+    turn's bytes. Widening the `try` to cover `enqueue_append` would swallow
+    it, so this pins the scope."""
+    import types
+    import pytest
+    from vaayu.prefix_cache import PrefixCacheStore
+    from vaayu.vaayu_base import VaayuBaseModel
+
+    class _Writer:
+        def enqueue_append(self, sid, cache, cfg, toks, length):
+            raise RuntimeError("the kv writer died")
+
+    c = _bf16_cache(seq=4)
+    pc = PrefixCacheStore(budget_bytes=10 ** 9)
+    fake = types.SimpleNamespace(_kv_writer=_Writer(), config=None)
+    with pytest.raises(RuntimeError, match="the kv writer died"):
+        VaayuBaseModel._persist_and_store(fake, pc, "sess", c, [1, 2, 3, 4, 5])
+
+
+def test_store_failure_retains_no_reference_to_the_cache():
+    """Hygiene: once the caller's local goes, the device KV must be
+    collectable. A re-raised exception's retained traceback holds frames
+    referencing `kv` -- ~7.75 GiB of device KV that nothing can free."""
+    import gc
+    import types
+    import weakref
+    from vaayu.prefix_cache import PrefixCacheStore
+    from vaayu.vaayu_base import VaayuBaseModel
+
+    c = _bf16_cache(seq=4)
+    _oom_on_park(c)
+    alive = (weakref.ref(c), weakref.ref(c.key_cache[0]))
+    pc = PrefixCacheStore(budget_bytes=10 ** 9)
+    fake = types.SimpleNamespace(_kv_writer=None, config=None)
+    VaayuBaseModel._persist_and_store(fake, pc, "sess", c, [1, 2, 3, 4, 5])
+    del c
+    gc.collect()
+    assert [r() for r in alive] == [None, None]
+
+
 # ── cross-session cannibalisation ───────────────────────────────────────────
 #
 # Found 2026-09-09 by P10 T10's arms. Two agent sessions that share a system

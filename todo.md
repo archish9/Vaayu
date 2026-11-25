@@ -78,19 +78,37 @@ Status keys: `[ ]` pending · `[~]` in progress · `[!]` blocked · `[bug]` open
 Protocol: `CLAUDE.md` §6 (this ledger), §7 (all plans / RESULTS go in `docs/`, gitignored — so every row carries its
 own numbers), §8 (every change must reach the server; say if it is banked).
 
-**Suite floor (CURRENT, after HARD-HANG's SQE-PLUG work, 2026-11-17): `4267 passed, 92 skipped, 1 failed`**
-(364.50 s, FOREGROUND, `./venv/bin/python -m pytest -q`), reconciled **4360 collected** = the 2026-11-09
-WIRE-TELEMETRY floor's 4335 + 25 new (16 `tests/test_sqe_caps.py`, 1 `test_server_config_module.py`, 8
-`test_docs_speed_knobs.py`). `cargo test` in `vaayu_rust/`: **46 passed, 0 failed, 1 ignored** — needs a current
+**Suite floor (CURRENT, measured 2026-11-25 at the tip of `d1-host-ram-ceiling`): `4304 passed, 92 skipped,
+0 failed`** (361.36 s, `./venv/bin/python -m pytest -q`), reconciled **4396 collected** = D1 Task 1's 4384
+at `c525e29` + 12, every one of them in the only four test files this branch touches
+(`git diff --stat c525e29..HEAD -- tests/`): `test_fp8_prefix_cache_moves.py` 3 -> 8,
+`test_hybrid_attention_cache.py` 43 -> 45, `test_prefix_cache.py` 42 -> 46, `test_windowed_kv.py` 35 -> 36
+(123 -> 135 collected across the four). 11 of the 12 are the branch's own commits; the 12th is the final
+fix wave's `test_store_failure_keeps_the_entry_already_under_that_id`.
+Previous floor, for the record: `4292 passed, 92 skipped, 0 failed` (426.13 s, 2026-11-25 at `c525e29`,
+4384 collected) = the 2026-11-17 SQE-PLUG floor's 4360 + 24 new: 23 in five new files (12
+`tests/test_cgroup_aware_budget.py`, 3 `test_budget_sites_cgroup_aware.py`, 3
+`test_direct_io_cgroup_aware.py`, 2 `test_envinfo_cgroup_fields.py`, 3 `test_prefix_hit_bitwise_gate.py`)
++ net 1 in `test_server_app.py` (`ccfbfd1` added, `6af2747` dropped one).
+**THE SUITE IS NOW FULLY GREEN — the long-standing "1 failed" is GONE**, see the paragraph below.
+Previous floor line, for the record: `4267 passed, 92 skipped, 1 failed` (364.50 s, 2026-11-17, 4360 collected).
+`cargo test` in `vaayu_rust/`: **46 passed, 0 failed, 1 ignored** — needs a current
 build (`maturin develop --release` in `vaayu_rust/`, with `VIRTUAL_ENV` set).
 **Reconcile by COLLECTED count at each commit, never assume it** (`pytest --collect-only -q`). Earlier floors
 (4242 / 4136 / 4134 / 4094 / 4092) and their per-commit reconciliations are in `git log -p -- todo.md`.
 
-**The 1 failure is not a regression:** `test_max_batch_size_defaults_to_one`, a machine-local artifact — `config.py:195`
-ships `MAX_BATCH_SIZE = 1` and the gitignored `config_local.py:12` shadows it to `3` (proven 2026-11-02; 12/12 green
-with `config_local` absent). Two on-device gates skip unless their env is set: `DENSE_CKPT=`
+**The old "1 failure" is CLOSED, 2026-11-25:** it was `test_max_batch_size_defaults_to_one`, failing because the
+gitignored `config_local.py` shadowed `config.py:195`'s `MAX_BATCH_SIZE = 1` with `3`. **That override was removed
+from `config_local.py` on 2026-11-17** (its own comment says so; verified on disk 2026-11-25, md5
+`bbabfcc08c88ad92314efcd2c23403c4`), so the floor line kept carrying a failure the box no longer had. Measured
+clean today: `0 failed`. Do not expect or excuse a failure here again. Two on-device gates skip unless their env is set: `DENSE_CKPT=`
 (`tests/test_dense_gate.py`, Llama-3.2-1B 6 s + Llama-3.3-70B 2 min) and `FUSED_EXL3_CKPT=`
 (`tests/test_fused_exl3_gate.py`, `darkbit1001--Qwen3.6-35B-A3B-EXL3-6.00bpw-hb6`, 3/3 in ~24 s, ppl 5.98).
+**All three ran GREEN at this floor, 2026-11-25** (FOREGROUND; both gates assert a perplexity ceiling, so
+a pass carries the ppl): dense `DENSE_CKPT=.../Llama-3.2-1B-Instruct` **6 passed, 5.84 s**, ppl 11.90;
+dense `DENSE_CKPT=.../archish9--Llama-3.3-70B-Instruct-exl3-4.5bpw` **6 passed, 93.20 s**, ppl 8.87;
+fused-EXL3 `FUSED_EXL3_CKPT=.../darkbit1001--Qwen3.6-35B-A3B-EXL3-6.00bpw-hb6` **3 passed, 28.21 s**,
+ppl 5.98 (`attn=sdpa`, 40 layers).
 **Re-establish this floor at the top of the next session before changing CODE.**
 
 ---
@@ -124,18 +142,55 @@ torch.OutOfMemoryError: Tried to allocate 20.00 MiB. GPU 0 has 15.48 GiB total, 
 The NEXT request was then refused by admission with `VramPlanError: ... The largest context that fits
 RIGHT NOW is max_seq_len=8192` — i.e. the failed request left the allocator holding the reserve.
 
-**Why it is boot-order, not size.** The identical 21,551-token prompt succeeded six times in a row on
-a server that had first served four 3.3 k-token requests, with an identical VRAM plan. The cold run's
-own telemetry shows the difference: `expert_cache=0hit/14896miss/0evict usage=0.00GB/9.12GB` — the
-host arena was empty and the expert VRAM tier was filling WHILE the prefill transient peaked.
+**PREMISE CORRECTED 2026-11-25 — the boot-order argument is CONFOUNDED.** This paragraph used to read
+"Why it is boot-order, not size", arguing that the identical 21,551-token prompt succeeded six times in a
+row on a server that had first served four 3.3 k-token requests, with an identical VRAM plan. The VRAM
+plan was identical; **`PREFIX_COMPRESS` was not.** The six successes ran `prefix_compress=9` and the cold
+failure ran `prefix_compress=None`, so the comparison crosses a changed variable and cannot establish boot
+order as the cause. Measured across five runs (env.json `config.prefix_compress` against requests.jsonl
+rows with `prompt_tokens > 18000` and `finish != "error"`), all at `MAX_SEQ_LEN=32768` under
+`flash_attention_2`, spanning two commits:
+
+| run | `prefix_compress` | long sessions | served |
+|---|---|---|---|
+| `run-2026-11-24T12-02-16Z` | 9 | 6 | **6** |
+| `run-2026-11-25T07-17-14Z` | 9 | 10 | **10** |
+| `run-2026-11-24T12-52-41Z` (this row's own run) | None | 3 | 1 |
+| `run-2026-11-24T12-59-09Z` | None | 1 | 1 |
+| `run-2026-11-25T07-45-35Z` | None | 10 | 1 |
+| `run-2026-11-25T08-05-42Z` | None | 3 | **0** |
+| `run-2026-11-25T08-20-57Z` | None | 3 | 1 |
+
+**RECOUNTED 2026-11-25, and the first count was wrong in BOTH directions.** This block first said
+"Packed 16/16, uncompressed 3/16". The packed side is right (16 of 16 across 2 runs). The uncompressed side
+was not: it omitted `12-59-09Z` and `08-05-42Z`, and a per-run "served 1 of 3" ratio counts
+post-cascade rows and `VramPlanError` admission refusals — which never ran a forward pass — as if they were
+independent trials of the mechanism. **Uncompressed is 4 of 20 long requests across 5 runs**, and the
+honest, sharper form of the finding is this: **no uncompressed run has EVER served a second long request.**
+Packed has served 6 and 10 in a row. Verified twice, independently, by parsing every `env.json` on disk
+against its `requests.jsonl` (prompts over 18,000 tokens, `finish != "error"`). Boot order is not ruled out as a contributing factor, but it is not
+what the evidence on disk separates: `prefix_compress` is. What survives unchanged from the original
+argument is the cold run's telemetry, `expert_cache=0hit/14896miss/0evict usage=0.00GB/9.12GB` — the host
+arena was empty and the expert VRAM tier was filling WHILE the prefill transient peaked.
+
+**Reproduced 2026-11-25 at `e49081b` while attributing D1's store OOM** (`run-2026-11-25T08-20-57Z`): same
+`build_exl3_qmatrix -> t.to(device)` signature at `model.layers.0`, 20.00 MiB wanted, 18.12 MiB free, on a
+WARM server after four warm-ups and one served 21,551-token session. **So this defect is not specific to a
+cold boot** — the second distinct long session fails too.
 
 **Why it matters more than it looks.** This is exactly the shape of an agent's first request after a
 restart — and Vaayu restarts itself 5 s after every OOM kill (HOST-RAM-CEILING), so a crash-loop can
 convert into a second, different failure that the client sees as a 500.
 
 **Tasks**
+- [ ] **FIRST, run the two cells nobody has run** (they decide whether this row is about boot order at
+      all): the warm six-session shape at `PREFIX_COMPRESS=None`, and the cold single-request shape at
+      `PREFIX_COMPRESS=9`. -> verify: the split above (packed 16/16 across 2 runs; uncompressed 4/20
+      across 5, never a second long request in any of them) either survives or collapses. Until both
+      exist, do NOT describe the defect as boot-order.
 - [ ] Reproduce deliberately: boot, send ONE request at ~20-22 k tokens as the first request, both
-      kernels. -> verify: it OOMs cold and passes warm, with the plan line identical.
+      kernels. -> verify: it OOMs cold and passes warm, with the plan line identical. NOTE: "passes warm"
+      is now in doubt — it has only ever been observed at `PREFIX_COMPRESS=9`.
 - [ ] Then decide where the charge belongs: the expert VRAM tier should not be able to fill into the
       prefill reserve of the request that is running (compare `elastic_tier.py`'s rules, which are OFF
       on MiniMax because decode graphs own the pool), or admission must charge the cold-tier case.
@@ -205,10 +260,15 @@ flash@32768 9.12+13.09=**22.21** (expert arena GB + prefix pool GB). `max_seq_le
 `sessions x max_seq_len` is visible downstream"). **So no config change can fix this; only code can.**
 
 **Two defects behind it:**
-- `vaayu_base.py:3667` — `prefix_budget = effective_available_bytes() - 3.5 GiB`, i.e. all remaining
-  RAM minus a flat constant. The same codebase already learned this for the I/O-mode decision
-  (`safetensor_model_persister.py:303` subtracts the arena explicitly, with the 2026-10-04 regression
-  in its comment). The prefix budget never got that treatment.
+- `vaayu_base.py:3667` — `prefix_budget = effective_available_bytes() - 3.5 GiB`, i.e. the cgroup-aware
+  basis minus a flat constant. **CORRECTED 2026-11-25:** this bullet used to say the budget "never got"
+  `safetensor_model_persister.py:303`'s treatment of subtracting the expert arena explicitly. **It must not
+  get it** — that site runs at load START, before the arena is pinned, while this one runs at load END,
+  after (`vaayu_base.py:383`, `:759`), so the arena is already charged in `memory.current` and already out
+  of `effective_available_bytes()`. Subtracting it twice double-counts ~12 GB: the §2.3 pinned-arena trap
+  the shipped 2026-11-22 cgroup-budgeter design prices at ~9 GB. The genuine hole is the flat 3.5 GiB
+  reserve against ~1.5 GB of real margin, and the keep-one-entry floor below, which ignores the budget
+  outright. D1's Task 5 is re-scoped accordingly (warn when budget < one full-length entry).
 - **No feedback anywhere.** All four `effective_available_bytes()` call sites run at LOAD time
   (`vaayu_base.py:2996,3065,3196,3667`, `safetensor_model_persister.py:303`); nothing re-reads memory
   during a run. systemd hands the process `MEMORY_PRESSURE_WATCH` + `MEMORY_PRESSURE_WRITE` (PSI) and
@@ -221,12 +281,45 @@ flash@32768 9.12+13.09=**22.21** (expert arena GB + prefix pool GB). `max_seq_le
 32,768 ceiling). That doubles the floor into the 1.5 GB margin. **The live flash+32768 pin is safe only
 while Rudra's own window stays 16 k** — Vaayu's ceiling does not lengthen chains, Rudra's trigger does.
 
+**§8 (CLAUDE.md, stated explicitly — the row shipped without it until 2026-11-25): NO KNOB.** Where the
+pool parks (anon vs pinned), whether a failed store 500s an answered request, and whether the park stages
+on the GPU are all **correctness, not policy** — nobody should be able to configure the fatal shape back
+on. `PREFIX_COMPRESS` stays the capacity lever and is unchanged by this row. **Plumbed and reachable
+today at N=1:** every store goes through `_persist_and_store`, reached from all three generate paths
+(`vaayu_base.py:6790`, `:7104`, `:7257`) under `engine.py`'s one-request-at-a-time `slot()`, on every
+turn that stores a prefix — dense included, where `use_prompt_lookup="auto"` resolves True so the
+speculative path is the one every dense load takes. Nothing here is banked.
+
 **Tasks**
 - [x] **Step 0 DONE 2026-11-24** — the A/B above. Driver and 1 Hz cgroup samples in the session
       scratchpad (`v0_repro.py`, `v0_mem.csv`, `v0_mem_uncomp2.csv`). No engine code was touched.
 - [x] **Option B refuted** by the PSI columns (see above). Option C turns out to be what
       `PREFIX_COMPRESS=9` already does, by accident rather than by design.
-- [ ] **DECIDE THE FIX SHAPE — this is the open question now.** `PREFIX_COMPRESS=9` is today holding
+- [x] **Task 1 (suite floor) DONE 2026-11-25:** `4292 passed, 92 skipped, 0 failed`, 426.13 s, 4384 collected
+      — see the floor paragraph at the top of this file. Also corrected in the D1 doc: its §0 floor was the
+      2026-11-09 one (25 tests stale), §3 claimed "no swap configured" against an 8 GiB `/swap.img` that its
+      own A/B table shows swapping 1.42 GB, and §4 said "7 call sites, all at load time" for
+      `effective_available_bytes()` when there are 6, one of them telemetry (`server/envinfo.py:278`) — this
+      row's own "all four" also lists five.
+- [x] **FIXED 2026-11-25 by `cbb1bf4` (Task 2a, same commit as the unpin) — found while checking D1's
+      Task 2 premise: `_move_recurrent_state` (`vaayu_base.py:2017-2029`) parked recurrent state with an
+      ASYNC D2H.** The CPU direction is now `non_blocking=False`; re-verified on device 2026-11-25 by
+      `tests/test_fused_exl3_gate.py` on Qwen3.6-35B-A3B EXL3 (`FUSED_EXL3_CKPT=`, 3/3, ppl 5.98, 28.2 s),
+      the only checkpoint on disk that reaches it. Original text: It passes
+      `non_blocking=True` for both directions, so the park is a CUDA→pageable-host async copy and the
+      following `.pin_memory()` is a CPU→CPU copy that does not synchronize the stream. The KV path beside
+      it is already blocking. Today's pin narrows the window; D1's unpin removes it, so the CPU direction
+      must become `non_blocking=False` **in the same commit** (D1 doc Task 2a). Unreachable on MiniMax (no
+      recurrent layers) — reachable on **Qwen3.6-35B-A3B EXL3** (on disk, gated-delta). The existing
+      round-trip test `test_hybrid_attention_cache.py:505` is CPU-only and cannot catch it; the guard needs
+      CUDA tensors with queued GPU work. Same class as DeepSeek's documented 220M/220M-wrong measurement
+      (`model_code/deepseek_v4/modeling_deepseek_v4.py:952`).
+- [x] **DECIDED + BUILT 2026-11-25 — option (i).** The park is unpinned (`cbb1bf4`), PROVED on device:
+      `prefix_compress=null`, `shmem` FLAT at 11.94 GB (min == max after load), the one parked entry
+      landed in `anon` (2.96 -> 9.28 GB, one step then flat), peak `memory.current` 22.11 GB against the
+      30.06 GB cap, swap 0, PSI some avg10 max 0.00, no kill of any kind. Option (iii) survives as Task 5's
+      second belt. Original argument kept below for the record.
+- [x] ~~**DECIDE THE FIX SHAPE — this is the open question now.**~~ `PREFIX_COMPRESS=9` is today holding
       the box up from a MACHINE-LOCAL config line (`config_local.py`, gitignored), which is exactly
       CLAUDE.md section 8's "banked, not shipped": any other user on 32 GB of RAM hits the same SIGKILL with
       Vaayu's defaults, because `config.py` ships `PREFIX_COMPRESS = None`. Candidate shapes:
@@ -236,6 +329,133 @@ while Rudra's own window stays 16 k** — Vaayu's ceiling does not lengthen chai
       arena minus a derived reserve (the old option A), which is still right as a second belt.
       **(i) is the honest fix and does not cost the 0.7 s/hit or any output bits; (ii) is the cheap
       one.** Not model-specific: derive it (section 5).
+- [x] **Task 2 DONE 2026-11-25 (`cbb1bf4`)** — park unpinned. Both `pin_memory()` sites gone plus a THIRD
+      the brief's grep missed: `windowed_kv.py:186` allocated with `pin_memory=pin`, so `pin_memory()` with
+      parens never matched it. Task 2a landed in the same commit and is load-bearing, not hygiene: verified
+      on this box (torch 2.11.0+cu130) that `.to('cpu', non_blocking=True).is_pinned()` is **True** — an
+      async D2H ALLOCATES A PINNED DESTINATION, so dropping `.pin_memory()` alone would have left recurrent
+      state pinned anyway. Suite `4294 passed, 92 skipped, 0 failed`, 4386 collected.
+- [x] **Task 6 DONE 2026-11-25** — `DEFAULT_STREAM = False` removed from the gitignored `config_local.py`;
+      a request that OMITS `stream` now returns `text/event-stream`, with `ttft_s` populated (11.47) and a
+      `wire` block. `ttft_s` is recorded only on the streaming path (`server/engine.py:757-978`), so this
+      unblocks every later TTFT measurement on this row.
+- [!] **Task 3 PARTIAL 2026-11-25 — the host-RAM claim is PROVED (see the fix-shape line above), but §4's
+      `>= 6 sessions` bar is NOT met and is NOT reachable on this row.** 1 of 10 served; a reproduction run
+      served 0 of 3. What stops it is **VRAM, not host RAM** — see `[bug]` PREFIX-PARK-DEVICE-ALLOC below
+      and the D2 row. Unblocks when D2 does. Tasks 4 (prefix-HIT restore pricing, ABBA) and 5 (the
+      load-time budget warning) are blocked behind the same thing: both need several long sessions to
+      survive in one boot.
+- [ ] **Task 4 is probably measurable TODAY at `MAX_SEQ_LEN=16384`, so "blocked on D2" must not quietly
+      become permanent** (added 2026-11-25). 16 k is the window Rudra actually runs, the one the ~13,926-
+      token chain and the ~3.3 GiB-per-entry figures above are quoted for, and the handoff's own advice is
+      "stay at the 16 k window — we have not reproduced any of this at that size". Every failure that
+      blocks Task 4 was measured at 32,768 with 21.5k-token requests. Prefix-HIT restore pricing is the
+      engine's largest lever (136-377x TTFT), so parking it behind D2 at the 32 k shape is the expensive
+      choice: re-run Task 4's ABBA block at 16 k before accepting the block.
+- [x] **`cbb1bf4` EXONERATED 2026-11-25 by an A/B at `e49081b`** (`run-2026-11-25T08-20-57Z`): VRAM is
+      exhausted after the FIRST stored session at BOTH commits. Pre-fix fails EARLIER and worse — in the
+      prefill at `model.layers.0` with `tokens: 0`, no answer at all — and with LESS free VRAM (18.12 vs
+      42.12 MiB; "non-PyTorch memory" 0.39 vs 0.38 GiB, about the device-side cost of the pinned host
+      pages). So the unpin does not COST VRAM, and the 0.01 GiB is consistent with the device-side cost of
+      the pinned host pages (n=1, and the two arms failed at different sites — not a measurement of a VRAM
+      saving; do not quote it as one).
+- [x] **PREFIX-PARK-DEVICE-ALLOC — found 2026-11-25 on device; FIXED by `be2aa25` + `4044eb1`, review
+      closed clean 2026-11-25** (the park now stages nothing on the device; `_compact_to_cpu` validates
+      `out=` and announces its non-contiguous fallback). The
+      uncompressed park allocated on the GPU in order to compact:
+      `lst[i][..., :used, :].contiguous().to("cpu")` (`vaayu_base.py:2039`) materialized the compacted
+      layer ON THE DEVICE before the D2H, and those bytes are in nobody's budget — the same class as row
+      12a, where the drafter's VRAM was in nobody's budget. It raised
+      `OutOfMemoryError: Tried to allocate 44.00 MiB ... 42.12 MiB is free` from `prefix_cache.py:200
+      store()` AFTER a 21,551-token request had already streamed its answer (`ttft_s` 133.16, `finish`
+      error). **Not fragmentation:** 14.74 GiB allocated by PyTorch against only 92.56 MiB
+      reserved-but-unallocated, and the caching allocator frees cached blocks and retries before raising —
+      so `expandable_segments:True` and `empty_cache()` are both dead ends. Fix: park via contiguous
+      per-block D2H into a preallocated CPU tensor (a contiguous `[B,H,S_cap,D]` buffer's `[..., :used, :]`
+      is a set of contiguous `[used, D]` blocks), zero device bytes, exactly `used` bytes over PCIe.
+      Evidence `logs/run-2026-11-25T07-45-35Z/requests.jsonl`.
+- [x] **STORE-FAILURE-500s-A-SERVED-ANSWER — found 2026-11-25; FIXED by `70b11b0`, review closed clean
+      2026-11-25.**
+      `_persist_and_store` is called OUTSIDE the `try/except BaseException` that guards
+      `super().generate(...)` (`vaayu_base.py:6780-6791`) and `store()` has no handler of its own, so a
+      pool-housekeeping failure turns an already-streamed reply into a 500 AND skips `restore_on_abort`,
+      draining the pooled entry. Three call sites: `:6790`, `:7104`, `:7257`, which is why the handler goes
+      inside `_persist_and_store`. Measured aggravator: `server/engine.py:731-732` does
+      `except BaseException as ex: row["error"] = ex` — retaining the exception OBJECT keeps its traceback,
+      whose frames reference the live cache, so ~7.75 GiB of device KV could not be collected. That is why
+      the tip's cascade (`VramPlanError`, 0.04 GiB free) was worse than `e49081b`'s.
+      **REFUTED, so do not re-propose it:** the retained traceback is NOT what explains the persistent
+      exhaustion — at `e49081b` store #1 succeeded cleanly and VRAM was still exhausted for the next
+      request. It makes the aftermath worse, not the defect.
+- [ ] **OPEN, unexplained — pinned parks step +8.32 GB per 21,551-token entry** (matching the plan's KV
+      7.75 GiB exactly) while the unpinned arm stepped `anon` only +6.32 GB (2.96 -> 9.28) for the same
+      compacted entry. ~2 GB apart, same bytes. Candidates: malloc trim / `release_freed_host_pages()`, or
+      the 1 Hz sampler missing the true peak. Matters because Task 5's load-time warning sizes an entry, so
+      a 2 GB error in entry size is a 2 GB error in the threshold.
+- [ ] **M8 (minor, from Task 8's review; worth knowing on a branch named for the host-RAM ceiling):
+      `to_cpu()` is no longer a no-op on an ALREADY-PARKED CPU cache, so a double park's transient host
+      peak grows by one cache.** Cannot occur on the server path — the request's `kv` is on CUDA — but it
+      is real: `WindowedKVCache.to_cpu`'s "already pooled" `continue` (`windowed_kv.py:305-307`) skips the
+      ring/log rebuild and no longer protects the parent's pass, because `super().to_cpu()` (`:331`) then
+      runs `_compact_to_cpu` over every layer, and that now ALLOCATES a fresh CPU tensor and copies. So a
+      double park re-copies each windowed layer's full-length CPU tensor, where pre-fix `.contiguous()`
+      (already contiguous, `used == shape[-2]`) and `.pin_memory()` (already pinned) were both no-ops
+      there. A cheap guard would be an early return when every buffer is already CPU and compact.
+- [ ] **Better behaviour than the shipped fix, found in Task 8's review — swallow the store failure AND
+      attempt the cropped re-park.** Fix B (`70b11b0`) returns normally instead of raising, which is right
+      for the user, but it also stops the speculative path's existing recovery: at `vaayu_base.py:7329`
+      `_persist_and_store` sits inside a `try/except BaseException: restore_on_abort(*_checked_out); raise`,
+      and pre-fix a store failure DID fire `restore_on_abort`, cropping to `prefix_len` and re-storing a
+      SMALLER entry that might have fit (`prefix_cache.py:396-397`). Ruling 2026-11-25: Fix B stands — the
+      user keeps a 133 s answer and pays one cold prefill next turn — but the handler could do both if the
+      caller hands it the checked-out tuple. Reachable on **every dense load** (`use_prompt_lookup="auto"`
+      resolves True for dense, so `choose_speculative_target` never returns `generate` there).
+      **CORRECTION to `70b11b0`'s commit message** (repointed 2026-11-25: this correction named `be2aa25`,
+      but the claim is in `70b11b0`'s message — and no commit was amended or rebased to fix that, by the
+      user's explicit ruling, because `be2aa25`'s SHA is cited across this ledger and the handoff): its
+      claim that the raise "skipped `restore_on_abort` so the popped entry was lost" is true only of the
+      `generate()` path (`:6826-6834`); on the speculative path it did NOT skip it — and that is the path
+      `vaayu_base.py:7374`'s own comment calls "the path EVERY DENSE LOAD takes".
+- [x] **Task 8 re-open condition — REWRITTEN 2026-11-25 in the final fix wave, because its premise was
+      FALSE.** It used to say `PrefixCacheStore.drop()` "is unreachable today … so it can only no-op. It is
+      deliberate defence." It was reachable and destructive, so **its only caller is now removed**
+      (`_persist_and_store`'s store-failure handler, which was `vaayu_base.py:6949`; the deletion is this
+      wave's only engine change).
+      Why: `lookup()` does NOT pop on a BORROWED hit — `borrowed = (key != session_id and m <
+      len(entry.token_ids))` takes `move_to_end(key)` and returns a copy, leaving the entry in the pool —
+      and a recurrent one-length refusal returns `None, 0` without popping either. With no `session_id`
+      (the server's default: `schemas.py` leaves `session_key` None unless `session_id`/`user` is sent)
+      `resolved_sid` is `_auto_session_id(ids_list)`, a hash of the prompt's first 64 tokens — the very key
+      that surviving entry sits under. So the drop deleted a VALID entry this store never inserted, and the
+      next turn prefilled in full. It protected nothing: `store()` raises inside
+      `to_cpu()`/`compress_cache()`, both before the lock and before any insertion, so no partial entry can
+      exist. `drop()` itself stays in `prefix_cache.py`, now with NO caller and **no direct test of its
+      own** — nothing in `tests/` calls it; do not record it as covered. Guarded by
+      `tests/test_prefix_cache.py::test_store_failure_keeps_the_entry_already_under_that_id`, verified both
+      ways 2026-11-25 (call restored → 1 failed/45 passed; removed again → 46 passed).
+      **Re-open if any failure point moves inside `store()`'s locked block** — a cleanup would then be
+      warranted, but it must distinguish a partial entry from a valid one, which keying off `resolved_sid`
+      alone cannot do.
+- [x] **DONE 2026-11-25 in `4044eb1` — the FALSE perf claim in `vaayu_base.py`'s `_compact_to_cpu`
+      docstring is corrected** (it now states the PCIe bytes are unchanged and the win is one fewer device
+      allocation and one fewer device-side copy). This was a merge gate by its own wording, so it closes
+      before the merge, not after. Original text: It says the
+      block copy "moves exactly `used` positions across PCIe, fewer than the capacity-sized read it
+      replaces". The replaced code already moved exactly `used` positions; its `.contiguous()` was a
+      DEVICE-to-device copy, so **PCIe bytes are unchanged**. The real win is one fewer device allocation
+      and one fewer device-side copy. Same wording is in `be2aa25`'s message and was in the task brief
+      (corrected there 2026-11-25). Flagged because §0 exists to un-rot exactly this kind of claim.
+- [x] **Final review wave DONE 2026-11-25 — this is the merge-ready state.** ONE engine change: the
+      `pc.drop(resolved_sid)` call in `_persist_and_store`'s store-failure handler is REMOVED (it was the
+      only caller of `PrefixCacheStore.drop()`; why it was destructive rather than defensive is the
+      rewritten re-open condition above), with a guard test that fails if the call returns. Everything
+      else in the wave was the RECORD: the three `[bug]` rows above closed, the M7 premise rewritten, the
+      `be2aa25` -> `70b11b0` misattribution repointed, M8 and the Task-4-at-16k note added, the §8 line
+      added, the suite floor re-measured, and the Rudra handoff's §17 downgraded to what the evidence
+      supports. Evidence: suite `4304 passed, 92 skipped, 0 failed` (4396 collected, 361.36 s) and all
+      three on-device gates green — both in the floor paragraph at the top of this file. **No commit was
+      amended or rebased** (user ruling: `be2aa25`'s SHA is cited across this ledger and the handoff, so a
+      rewrite would invalidate every recorded pointer).
 - [ ] The hang travels with this row — see [bug] SIGNAL-STOP-IGNORED, which is the SAME bug seen from
       the shutdown end. NOTE the killed arm also shows why a stuck request looks like a hang: with
       `anon` reclaimed to 0.02 GB the process thrashes before it dies.

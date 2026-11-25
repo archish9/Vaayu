@@ -220,6 +220,20 @@ class PrefixCacheStore:
                 self._capacity_warned = True
                 self._warn_over_capacity(nbytes)
 
+    def drop(self, session_id: str) -> None:
+        """Forget this session's entry, if the pool holds one.
+
+        For a `store()` that failed partway: the pool must not keep a
+        half-converted cache (some layers on CPU, some still on CUDA), and
+        `_current_bytes` must not drift by the size of an entry that is no
+        longer there. Not an eviction -- nothing was displaced -- so no counter
+        moves.
+        """
+        with self._lock:
+            entry = self._pool.pop(session_id, None)
+            if entry is not None:
+                self._current_bytes -= entry.nbytes
+
     def _warn_over_capacity(self, sess_bytes: int) -> None:
         """Announce that the pool is over capacity, on the first budget-pressure
         eviction. Called under _lock.
