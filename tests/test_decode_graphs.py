@@ -998,11 +998,19 @@ def test_make_room_is_once_per_request_and_best_effort(capsys):
 
     BEST-EFFORT: the second request's re-base itself raises out-of-memory. Making
     room is for the reference, so it must not become a new raise site in front of
-    it: the reference still runs and the request is still answered.
+    it: the reference still runs and the request is still answered -- and it says
+    so in one line, because a dropped error nobody can see in a mailed-in
+    logs/run-*/ folder is indistinguishable from a re-base that did nothing.
 
     And the REFUSAL ORDER each path has always had: `_guarded` refuses before
     running stock (so a reference that runs out of memory anyway still leaves the
-    layer and its WARNING on the record), `_checked` after."""
+    layer and its WARNING on the record), `_checked` after.
+
+    The `sys.exc_info()` line pins the handler-end mechanism on BOTH belted paths
+    (`l0` runs through `_checked`, `l1` through `_guarded`): while the `except`
+    block is still active the thread keeps the exception -- and its traceback's
+    hold on `_capture`'s frame, `cap`'s graphs and `out` -- alive, which is the
+    very memory make-room is trying to hand this call."""
     layers = _stack(SPECS["hybrid"])
     model = _model(layers)
     calls = []
@@ -1034,14 +1042,17 @@ def test_make_room_is_once_per_request_and_best_effort(capsys):
                       position_ids=pos[:, t:t + 1])
             for i, (name, path, refused_first) in enumerate(entries):
                 def stock(seq, _n=name, _i=i, _first=refused_first, **kwargs):
+                    assert sys.exc_info() == (None, None, None)   # the handler has ENDED
                     assert (_n in runner._refused) is _first      # the order, both ways
                     return layers[_i](seq, **kwargs)
 
                 assert path(name, stock, xs[t], kw, oom_capture) is not None
             assert len(calls) == t + 1           # once in this request, however many layers
     assert len(calls) == 2 and runner.stats["made_room"] == 2
+    out = capsys.readouterr().out
     # all three refusals carry the same reason, so the WARNING is printed once (existing dedupe)
-    assert capsys.readouterr().out.count("WARNING: decode graphs refused") == 1
+    assert out.count("WARNING: decode graphs refused") == 1
+    assert "make-room re-base raised" in out     # best-effort, but never silent in a log
 
 
 @cuda

@@ -653,7 +653,9 @@ class DecodeGraphRunner:
         Best-effort by design: making room is for the caller's reference, so the
         class we are already handling here must not become a NEW raise site in
         front of it -- a memory error from the re-base itself is dropped and the
-        reference still gets its try. Anything else propagates."""
+        reference still gets its try. Anything else propagates. Dropped, but never
+        SILENT: in a mailed-in logs/run-*/ folder "the re-base raised" and "the
+        re-base did nothing" are otherwise indistinguishable."""
         if self._made_room:
             return
         self._made_room = True
@@ -661,13 +663,19 @@ class DecodeGraphRunner:
         rebase = getattr(self._model, "_rebase_expert_tier", None)
         if rebase is None:
             return
+        why = None
         try:
             rebase()
         except Exception as exc:
             if not _is_memory_error(exc):
                 raise
+            why = _exc_summary(exc)    # not `_why`: that one reads "capture failed",
+                                       # and nothing captured here
             del exc                    # as everywhere on this path: its traceback is
                                        # itself memory the reference is about to want
+        if why is not None:            # printed with no handler live, as above
+            print(f"[Vaayu] WARNING: decode graphs: the make-room re-base raised {why}; "
+                  f"the stock forward runs anyway")
 
     def _refuse(self, name, layer, seq, kwargs, why):
         self._refuse_only(name, why)
