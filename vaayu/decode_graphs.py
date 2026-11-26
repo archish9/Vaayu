@@ -278,6 +278,19 @@ def _why(exc):
     return f"capture failed: {_exc_summary(exc)}"
 
 
+def _is_memory_error(exc):
+    """A failure for want of memory, whichever class the raising code used. D2's
+    cold cell raises BOTH shapes in one token: a torch.AcceleratorError ("CUDA
+    error: out of memory") from a graph's `capture_end`, then a
+    torch.OutOfMemoryError from the expert injection's `build_exl3_qmatrix`.
+    Neither class is the other's subclass (both are plain RuntimeErrors), so match
+    the one class we know plus CUDA's own text -- broad enough for both, narrow
+    enough that an unrelated RuntimeError still propagates untouched."""
+    if isinstance(exc, torch.OutOfMemoryError):
+        return True
+    return isinstance(exc, RuntimeError) and "out of memory" in str(exc).lower()
+
+
 def _cleanup_pool(pool):
     """Undo a failed `capture_end`'s effect on PyTorch's device caching allocator
     for `pool` -- but only as far as `capture_end` itself actually got. There is no
@@ -449,6 +462,8 @@ class DecodeGraphRunner:
         self._warming = False
         self._cache = None        # the CURRENT forward's cache; replays write here (I1)
         self._refused = set()
+        self._transient_refused = set()   # the memory-class subset of _refused: cleared
+                                          # at the next request (begin_forward)
         self._warned = set()
         self._checks = collections.Counter()
         self._request_captures = collections.Counter()
@@ -479,6 +494,11 @@ class DecodeGraphRunner:
             # A prefill -- or any other stock forward -- starts a request: the
             # give-up rule counts captures between two of them.
             self._request_captures.clear()
+            # A memory failure is a property of the moment, not of the layer: one
+            # request that ran the card dry must not cost the PROCESS its graphs
+            # (`_refused` is never otherwise cleared). Structural refusals stay.
+            self._refused -= self._transient_refused
+            self._transient_refused.clear()
             return False
         self._announce()
         self._token += 1
@@ -516,6 +536,11 @@ class DecodeGraphRunner:
             self.stats["replays"] += 1
             if checked:
                 return self._checked(name, layer, seq, kwargs, rec.replay)
+            # NOT belted (D2), unlike `_checked`/`_guarded`: this path takes no
+            # `_snapshot`, so a memory failure here must propagate. Re-running a
+            # layer whose cache write already landed corrupts every cache family
+            # (I4, `f54a799`) and the engine's own "Not retried" error is the
+            # correct outcome. Same for `_warm_up`.
             return rec.replay()
         rec = None                         # drop the reference before popping (M1): its
         self._records.pop(name, None)      # graphs' blocks really return to the pool first
@@ -546,12 +571,22 @@ class DecodeGraphRunner:
         bitwise with stock's; the tensor returned is always stock's own output."""
         cache = self._cache
         before = _snapshot(cache)
+        failed = None
         try:
             out = _clone(step())
         except Exception as exc:
+            # Only a string and a flag leave this block, and the block ENDS before
+            # the eager reference runs: while the handler is active the thread holds
+            # the exception alive whatever is done with the local name, and its
+            # traceback pins `_capture`'s frame -- that capture's graphs and its
+            # output, device memory the reference below is about to need (D2).
+            failed = (_why(exc), _is_memory_error(exc))
+            del exc, step
+        if failed is not None:
+            why, mem = failed
             _restore(cache, before)
-            ref = layer(seq, **kwargs)
-            self._refuse_only(name, _why(exc))
+            ref = self._stock_with_room(name, layer, seq, kwargs, cache, before)
+            self._refuse_only(name, why, transient=mem)
             return ref
         after_step = _snapshot(cache)
         _restore(cache, before)
@@ -567,18 +602,66 @@ class DecodeGraphRunner:
         already did (a replayed state update, a KV write), then run stock once."""
         cache = self._cache
         before = _snapshot(cache)
+        failed = None
         try:
             return capture()
         except Exception as exc:
-            _restore(cache, before)
-            return self._refuse(name, layer, seq, kwargs, _why(exc))
+            failed = (_why(exc), _is_memory_error(exc))   # see `_checked`: the handler
+            del exc, capture                              # must END before stock runs
+        why, mem = failed
+        _restore(cache, before)
+        ref = self._stock_with_room(name, layer, seq, kwargs, cache, before)
+        self._refuse_only(name, why, transient=mem)
+        return ref
+
+    def _stock_with_room(self, name, layer, seq, kwargs, cache, before):
+        """The eager reference, with ONE retry after making room when it runs out of
+        memory: a memory failure refuses this layer's graphs, it does not kill the
+        request. D2's cold first long request died exactly here -- the capture raised
+        out-of-memory, and the eager reference `_checked` fell back to raised it again
+        from the expert injection, which is the raise the client saw.
+
+        Sound ONLY where the caller holds `before = _snapshot(cache)` (`_checked`,
+        `_guarded`): the cache goes back to where this token started before the layer
+        runs again, and stock's write then supersedes the failed attempt's at the same
+        positions (F1). The unchecked `rec.replay()` path and `_warm_up` hold no
+        snapshot and are deliberately NOT belted -- re-running a layer there corrupts
+        every cache family (I4, `f54a799`), and the engine's own "Not retried" error is
+        the correct outcome.
+
+        Make room = the model's own per-request tier re-base (D2), read off the model
+        the way `_charge` reads the tier, so a model without one (dense, a test double)
+        is a no-op. That re-base is a RELATIVE cut which refunds only what it took:
+        never `set_budget` from here (`_release_pool` says why: an absolute restore
+        hands back bytes the card no longer has, S19 vi), and never a second eviction
+        mechanism (`set_budget` already evicts LRU to fit)."""
+        try:
+            return layer(seq, **kwargs)
+        except Exception as exc:
+            if not _is_memory_error(exc):
+                raise
+            del exc                 # its traceback holds the failed attempt's own
+                                    # device memory alive; the retry needs those bytes
+        rebase = getattr(self._model, "_rebase_expert_tier", None)
+        if rebase is not None:
+            rebase()
+        _restore(cache, before)
+        self.stats["made_room"] += 1
+        try:
+            return layer(seq, **kwargs)
+        except Exception as again:
+            self._refuse_only(name, f"it ran out of memory even after making room: "
+                                    f"{_exc_summary(again)}", transient=True)
+            raise
 
     def _refuse(self, name, layer, seq, kwargs, why):
         self._refuse_only(name, why)
         return layer(seq, **kwargs)
 
-    def _refuse_only(self, name, why):
+    def _refuse_only(self, name, why, *, transient=False):
         self._refused.add(name)
+        if transient:
+            self._transient_refused.add(name)
         self._records.pop(name, None)
         self.stats["refused"] += 1
         if why not in self._warned:
@@ -589,7 +672,11 @@ class DecodeGraphRunner:
     def _warm_up(self, layer, seq, kwargs):
         """The process's first eligible token runs eager ON the capture stream: the
         lazy state a capture cannot create (cuBLAS workspace for that stream, Triton
-        JIT) exists before the first capture."""
+        JIT) exists before the first capture.
+
+        NOT belted (D2): no `_snapshot` is taken here either, so a memory failure
+        propagates -- a second run of this layer would corrupt every cache family
+        (I4, `f54a799`)."""
         cur = torch.cuda.current_stream()
         self._stream.wait_stream(cur)
         with torch.cuda.stream(self._stream):

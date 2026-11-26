@@ -923,3 +923,137 @@ def test_gc_is_disabled_during_a_capture():
     _decode(layers, _cache(1), runner)
     assert seen.get("inside") is False
     assert gc.isenabled()
+
+
+# --- D2: the belt -- a memory failure refuses graphs instead of killing the request ---
+
+@cuda
+@pytest.mark.parametrize("spec", [SPECS["attn+moe"], SPECS["state+moe"]], ids=["attn", "state"])
+def test_checked_makes_room_and_retries_once_when_the_eager_reference_ooms(spec, capsys):
+    """D2's cold cell in miniature: the capture raises CUDA's out-of-memory at
+    `capture_end` (a torch.AcceleratorError), and the eager reference `_checked`
+    falls back to then runs out of memory too -- AFTER it has written this token's
+    cache, which is where the real one raised (`build_exl3_qmatrix`). The belt
+    makes room ONCE (the model's own tier re-base), puts the cache back and runs
+    the layer ONE more time, so the request is answered instead of killed and the
+    answer is bitwise the stock forward's."""
+    layers = _stack(spec)
+    calls = {"rebase": 0, "eager": 0}
+    model = _model(layers)
+
+    def _rebase():
+        calls["rebase"] += 1
+
+    model._rebase_expert_tier = _rebase
+    runner = dg.install_decode_graphs(model)
+    with torch.inference_mode():
+        xs, cos, sin, pos = _inputs(1)
+        emb, ids = (cos[:, :1], sin[:, :1]), pos[:, :1]
+        ref_cache = _cache(1)
+        ref = layers[0](xs[0], use_cache=True, past_key_values=ref_cache,
+                        position_embeddings=emb, position_ids=ids)
+
+        def flaky(seq, **kwargs):
+            calls["eager"] += 1
+            out = layers[0](seq, **kwargs)     # this token's cache is written FIRST
+            if calls["eager"] == 1:
+                raise torch.OutOfMemoryError("CUDA out of memory. Tried to allocate 20.00 MiB")
+            return out
+
+        def oom_capture():
+            raise torch.AcceleratorError("CUDA error: out of memory")
+
+        cache = _cache(1)
+        assert not runner.begin_forward(batch=[torch.zeros(1, 4)], past_key_values=cache,
+                                        output_hidden_states=False)
+        assert runner.begin_forward(batch=[torch.zeros(1, 1)], past_key_values=cache,
+                                    output_hidden_states=False)
+        out = runner._checked("l0", flaky, xs[0], dict(use_cache=True, past_key_values=cache,
+                                                       position_embeddings=emb,
+                                                       position_ids=ids), oom_capture)
+    assert calls == {"rebase": 1, "eager": 2}        # room made once, exactly ONE retry
+    assert out is not None and torch.equal(out, ref)  # and the answer is stock's own
+    assert _same_caches(ref_cache, cache)             # the failed attempt was undone
+    assert runner.stats["made_room"] == 1
+    # the capture's own failure is memory-class, so its refusal is transient (next request)
+    assert "l0" in runner._refused and "l0" in runner._transient_refused
+    assert "WARNING: decode graphs refused for l0 (capture failed" in capsys.readouterr().out
+
+
+@cuda
+def test_a_memory_refusal_is_cleared_at_the_next_request(capsys):
+    """Review Focus 5 / spec 5.3.8 (5): `_refused` is never cleared, so without
+    this one cold request would decode its tail layers eagerly for the life of the
+    process."""
+    runner = dg.install_decode_graphs(_model(_stack(SPECS["attn+dense"])))
+    runner._refuse_only("l3", "CUDA out of memory", transient=True)
+    assert "l3" in runner._refused
+    # a stock (prefill-shaped) forward = a new request
+    assert not runner.begin_forward(batch=[torch.zeros(1, 4)], past_key_values=None,
+                                    output_hidden_states=False)
+    assert "l3" not in runner._refused and not runner._transient_refused
+    assert "WARNING: decode graphs refused for l3" in capsys.readouterr().out
+
+
+@cuda
+def test_a_structural_refusal_is_not_cleared(capsys):
+    """The mirror of the test above: a refusal that is a property of the LAYER
+    (unbindable kwargs, bitwise disagreement, capture #3) stays permanent."""
+    runner = dg.install_decode_graphs(_model(_stack(SPECS["attn+dense"])))
+    runner._refuse_only("l4", "its graphs disagree bitwise with the stock forward")
+    assert not runner.begin_forward(batch=[torch.zeros(1, 4)], past_key_values=None,
+                                    output_hidden_states=False)
+    assert "l4" in runner._refused
+    assert "WARNING: decode graphs refused for l4" in capsys.readouterr().out
+
+
+@cuda
+def test_the_unchecked_replay_path_does_not_retry():
+    """Review Focus 5: the plain `rec.replay()` path holds no `_snapshot`, so a
+    memory failure there must PROPAGATE -- re-running a layer whose cache write
+    already landed corrupts every cache family (I4, `f54a799`), and the engine's
+    own "Not retried" error is the correct outcome. The belt covers the two
+    snapshotted paths only."""
+    layers = _stack(SPECS["attn+moe"])
+    calls = {"rebase": 0}
+    model = _model(layers)
+
+    def _rebase():
+        calls["rebase"] += 1
+
+    model._rebase_expert_tier = _rebase
+    runner = dg.install_decode_graphs(model)
+    runner._checks["l0"] = dg._CHECK_TOKENS      # past the self-checks: unchecked replays
+    cache = _cache(1)
+    eager = []
+    with torch.inference_mode():
+        xs, cos, sin, pos = _inputs(4)
+        assert not runner.begin_forward(batch=[torch.zeros(1, 4)], past_key_values=cache,
+                                        output_hidden_states=False)
+        for t in range(3):                       # warm, capture, replay
+            assert runner.begin_forward(batch=[torch.zeros(1, 1)], past_key_values=cache,
+                                        output_hidden_states=False)
+            runner.run("l0", layers[0], xs[t],
+                       dict(use_cache=True, past_key_values=cache,
+                            position_embeddings=(cos[:, t:t + 1], sin[:, t:t + 1]),
+                            position_ids=pos[:, t:t + 1]))
+            runner.end_forward()
+        assert runner.stats["replays"] == 1 and "l0" not in runner._refused
+
+        def _oom():
+            raise torch.OutOfMemoryError("CUDA out of memory. Tried to allocate 20.00 MiB")
+
+        runner._records["l0"].steps.insert(0, _oom)   # the next replay runs out of memory
+
+        def counting(seq, **kwargs):
+            eager.append(1)
+            return layers[0](seq, **kwargs)
+
+        assert runner.begin_forward(batch=[torch.zeros(1, 1)], past_key_values=cache,
+                                    output_hidden_states=False)
+        with pytest.raises(torch.OutOfMemoryError):
+            runner.run("l0", counting, xs[3],
+                       dict(use_cache=True, past_key_values=cache,
+                            position_embeddings=(cos[:, 3:4], sin[:, 3:4]),
+                            position_ids=pos[:, 3:4]))
+    assert eager == [] and calls["rebase"] == 0       # no retry, and no make-room
