@@ -307,10 +307,15 @@ arm served ten full prefills back to back at the same size as the arm that died.
       shape at `PREFIX_COMPRESS=9`. -> verify: the split above (packed 16/16 across 2 runs; uncompressed 4/20
       across 5, never a second long request in any of them) either survives or collapses. Until both
       exist, do NOT describe the defect as boot-order.
-- [x] **DONE for flash (cold OOMs, warm passes); sdpa UNRUN** — its `S_max` (~26.1-26.6k) would refuse the
-      pinned `MAX_SEQ_LEN=32768` (exit 3). Reproduce deliberately: boot, send ONE request at ~20-22 k tokens as the first request, both
-      kernels. -> verify: it OOMs cold and passes warm, with the plan line identical. NOTE: "passes warm"
-      is now in doubt — it has only ever been observed at `PREFIX_COMPRESS=9`.
+- [~] **DONE for flash (cold OOMs, warm passes); sdpa UNRUN, so this is HALF done** — sdpa's `S_max`
+      (~26.1-26.6k) would refuse the pinned `MAX_SEQ_LEN=32768` (exit 3), and changing that pin was out of
+      scope. Marker corrected from `[x]` 2026-11-26: the flash half is real, but a row that reads done on an
+      unrun kernel is how a later session skips it. Reproduce deliberately: boot, send ONE request at
+      ~20-22 k tokens as the first request, both kernels. -> verify: it OOMs cold and passes warm, with the
+      plan line identical. **The old NOTE here — "passes warm is now in doubt, it has only ever been observed
+      at `PREFIX_COMPRESS=9`" — is SETTLED and no longer in doubt:** the warm six-session cell served **6/6 at
+      `PREFIX_COMPRESS=None`** after the tier margin (`run-2026-11-25T14-09-05Z`), so warm passes at the
+      shipped default. Only the COLD cell still fails.
 - [ ] Then decide where the charge belongs: the expert VRAM tier should not be able to fill into the
       prefill reserve of the request that is running (compare `elastic_tier.py`'s rules, which are OFF
       on MiniMax because decode graphs own the pool), or admission must charge the cold-tier case.
