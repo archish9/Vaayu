@@ -1815,10 +1815,11 @@ boots on its pinned config. Decode cost of the smaller tier is **not resolvable 
 
 So §17.2's "a long SECOND session still fails" is **resolved at the default**, and repeated long requests now
 work without the packed-pool workaround. But the cold first long request — the shape an agent produces
-immediately after any restart — still dies in prefill. The cold case is proven cold by Vaayu's own telemetry
-(empty host expert arena, empty VRAM tier, no prefix match) and it streams 131.56 GB for that single prefill:
-it grows the host arena and the VRAM tier *while* the prefill transient peaks, and a 0.20 GiB margin does not
-cover that.
+immediately after any restart — still fails. The cold case is proven cold by Vaayu's own telemetry
+(empty host expert arena, empty VRAM tier, no prefix match) and it streams 131.56 GB for that single prefill.
+The prefill itself completes (all 43 chunks); the failure is on the first decode forward, during decode-graph
+capture, at an expert injection that needs 20.00 MiB with 37.75 MiB free and about 944 MiB reserved by PyTorch
+but unallocated. Host RAM was not a factor (peak RSS 14.25 GB against a 28 GiB cap).
 
 ### 18.3 What this changes for Rudra: R1 stays held, for the reason §16.3 gave
 
