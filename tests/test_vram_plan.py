@@ -1547,3 +1547,55 @@ def test_a_load_too_small_without_the_margin_is_not_the_margins_fault():
     assert warn_tier_lost_to_margin(budget_bytes=0,
                                     expert_bytes=int(8.8 * MB),
                                     margin_bytes=int(1 * MB)) is None
+
+
+# ---- D2 cold cell: re-size the tier against free VRAM at each request -----
+from vaayu.vram_plan import rebased_tier_budget
+
+
+def test_rebase_caps_growth_at_measured_free():
+    # 1.0 GiB held, 0.5 GiB free, 0.2 GiB margin -> may grow by 0.3 GiB only
+    assert rebased_tier_budget(free_bytes=512 * MB, tier_usage=1024 * MB,
+                               planned_budget=3072 * MB,
+                               margin_bytes=200 * MB) == (1024 + 512 - 200) * MB
+
+
+def test_rebase_never_exceeds_the_planned_budget():
+    assert rebased_tier_budget(free_bytes=8 * GB, tier_usage=0,
+                               planned_budget=3 * GB,
+                               margin_bytes=200 * MB) == 3 * GB
+
+
+def test_rebase_sheds_when_free_is_under_the_margin():
+    # 2.0 GiB held, 50 MiB free, 200 MiB margin -> must give back 150 MiB
+    assert rebased_tier_budget(free_bytes=50 * MB, tier_usage=2048 * MB,
+                               planned_budget=3072 * MB,
+                               margin_bytes=200 * MB) == (2048 - 150) * MB
+
+
+def test_rebase_floors_at_zero_with_an_empty_tier_and_no_free():
+    assert rebased_tier_budget(free_bytes=0, tier_usage=0,
+                               planned_budget=3 * GB,
+                               margin_bytes=200 * MB) == 0
+
+
+def test_rebase_does_not_ratchet_across_requests():
+    # the SECOND call sizes against planned_budget, not against the first result
+    first = rebased_tier_budget(free_bytes=100 * MB, tier_usage=2 * GB,
+                                planned_budget=3 * GB, margin_bytes=200 * MB)
+    second = rebased_tier_budget(free_bytes=3 * GB, tier_usage=1 * GB,
+                                 planned_budget=3 * GB, margin_bytes=200 * MB)
+    assert first < 2 * GB and second == 3 * GB
+
+
+@pytest.mark.parametrize("name", sorted(GEOMETRIES))
+def test_rebase_is_geometry_agnostic(name):
+    # The rule reads bytes only. Size the held tier from this geometry's KV
+    # (1024 tokens, as bytes), then check against a bytes-only reference: a
+    # version that read a geometry would miss the reference on some geometry.
+    held = 1024 * kv_bytes_per_token(**_kv_kwargs(GEOMETRIES[name]),
+                                     kv_cache_mode="bf16")
+    expected = min(3 * GB, max(0, held + 512 * MB - 200 * MB))
+    assert rebased_tier_budget(free_bytes=512 * MB, tier_usage=held,
+                               planned_budget=3 * GB,
+                               margin_bytes=200 * MB) == expected

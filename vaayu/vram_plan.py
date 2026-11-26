@@ -933,6 +933,30 @@ def tier_margin_bytes(*, injection_bytes: int, hardware_floor: int,
     return max(floor, -(-need // unit) * unit)
 
 
+def rebased_tier_budget(*, free_bytes: int, tier_usage: int,
+                        planned_budget: int, margin_bytes: int) -> int:
+    """Budget the expert VRAM tier may hold FOR THE REQUEST THAT IS STARTING,
+    given driver-free VRAM measured at that request's start:
+    `min(planned_budget, max(0, tier_usage + free_bytes - margin_bytes))`.
+
+    Why this exists: `expert_vram_budget_for` applies the same inequality at
+    LOAD, but the load cannot know a 21.5 k-token prefill's transient. Left
+    alone, `ExpertVRAMCache.put` is budget-only (`persist/expert_cache.py:897-912`)
+    and never reads driver-free VRAM, so the tier fills to its load-time budget
+    on a request whose free VRAM the prefill has already spent. Re-applying the
+    rule at the prefill->decode boundary, against measured free, lets the tier
+    grow only into what is really free and shed back below the margin when the
+    prefill has taken it.
+
+    `planned_budget` is the load-time ceiling and is never exceeded, so each
+    request sizes against it afresh: a shrunken result does not ratchet into the
+    next request. Every figure is a byte count passed in; nothing here reads a
+    model, geometry or device. Pure: no torch, no I/O.
+    """
+    grown = int(tier_usage) + int(free_bytes) - int(margin_bytes)
+    return min(int(planned_budget), max(0, grown))
+
+
 def warn_tier_lost_to_margin(*, budget_bytes: int, expert_bytes: int,
                              margin_bytes: int) -> str | None:
     """WARNING text when the tier margin is what left the expert VRAM tier under
