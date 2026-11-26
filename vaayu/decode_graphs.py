@@ -464,6 +464,7 @@ class DecodeGraphRunner:
         self._refused = set()
         self._transient_refused = set()   # the memory-class subset of _refused: cleared
                                           # at the next request (begin_forward)
+        self._made_room = False   # the belt's per-request latch (see _make_room)
         self._warned = set()
         self._checks = collections.Counter()
         self._request_captures = collections.Counter()
@@ -499,6 +500,7 @@ class DecodeGraphRunner:
             # (`_refused` is never otherwise cleared). Structural refusals stay.
             self._refused -= self._transient_refused
             self._transient_refused.clear()
+            self._made_room = False    # the belt makes room once per request
             return False
         self._announce()
         self._token += 1
@@ -536,11 +538,12 @@ class DecodeGraphRunner:
             self.stats["replays"] += 1
             if checked:
                 return self._checked(name, layer, seq, kwargs, rec.replay)
-            # NOT belted (D2), unlike `_checked`/`_guarded`: this path takes no
-            # `_snapshot`, so a memory failure here must propagate. Re-running a
-            # layer whose cache write already landed corrupts every cache family
-            # (I4, `f54a799`) and the engine's own "Not retried" error is the
-            # correct outcome. Same for `_warm_up`.
+            # NOT belted (D2). `_checked` and `_guarded` make room before a stock
+            # reference they were ALREADY going to run; this path runs no reference
+            # and takes no `_snapshot`, so the only belt available here would be a
+            # second execution of the layer -- which corrupts every cache family
+            # (I4, `f54a799`). A memory failure propagates, and the engine's own
+            # "Not retried" error is the correct outcome. Same for `_warm_up`.
             return rec.replay()
         rec = None                         # drop the reference before popping (M1): its
         self._records.pop(name, None)      # graphs' blocks really return to the pool first
@@ -585,7 +588,9 @@ class DecodeGraphRunner:
         if failed is not None:
             why, mem = failed
             _restore(cache, before)
-            ref = self._stock_with_room(name, layer, seq, kwargs, cache, before)
+            if mem:
+                self._make_room()       # BEFORE the reference below, which is the call
+            ref = layer(seq, **kwargs)  # that killed D2's cold first long request
             self._refuse_only(name, why, transient=mem)
             return ref
         after_step = _snapshot(cache)
@@ -610,49 +615,40 @@ class DecodeGraphRunner:
             del exc, capture                              # must END before stock runs
         why, mem = failed
         _restore(cache, before)
-        ref = self._stock_with_room(name, layer, seq, kwargs, cache, before)
+        if mem:
+            self._make_room()          # see `_checked`: BEFORE the reference, not after
+        ref = layer(seq, **kwargs)
         self._refuse_only(name, why, transient=mem)
         return ref
 
-    def _stock_with_room(self, name, layer, seq, kwargs, cache, before):
-        """The eager reference, with ONE retry after making room when it runs out of
-        memory: a memory failure refuses this layer's graphs, it does not kill the
-        request. D2's cold first long request died exactly here -- the capture raised
-        out-of-memory, and the eager reference `_checked` fell back to raised it again
-        from the expert injection, which is the raise the client saw.
+    def _make_room(self):
+        """Room for the eager reference `_checked` / `_guarded` are about to run,
+        after a capture failed for want of memory. D2's cold first long request died
+        on that reference -- the capture raised CUDA's out-of-memory at `capture_end`
+        and the reference raised it again from the expert injection -- so the room is
+        made BETWEEN the restore and that one call. The reference still runs exactly
+        once: a second run of it would be a THIRD execution of the layer, which
+        corrupts every cache family (I4, `f54a799`, and the engine's own "Not
+        retried" error says the same).
 
-        Sound ONLY where the caller holds `before = _snapshot(cache)` (`_checked`,
-        `_guarded`): the cache goes back to where this token started before the layer
-        runs again, and stock's write then supersedes the failed attempt's at the same
-        positions (F1). The unchecked `rec.replay()` path and `_warm_up` hold no
-        snapshot and are deliberately NOT belted -- re-running a layer there corrupts
-        every cache family (I4, `f54a799`), and the engine's own "Not retried" error is
-        the correct outcome.
-
-        Make room = the model's own per-request tier re-base (D2), read off the model
-        the way `_charge` reads the tier, so a model without one (dense, a test double)
+        Make room = the model's own per-request tier re-base, read off the model the
+        way `_charge` reads the tier, so a model without one (dense, a test double)
         is a no-op. That re-base is a RELATIVE cut which refunds only what it took:
-        never `set_budget` from here (`_release_pool` says why: an absolute restore
-        hands back bytes the card no longer has, S19 vi), and never a second eviction
-        mechanism (`set_budget` already evicts LRU to fit)."""
-        try:
-            return layer(seq, **kwargs)
-        except Exception as exc:
-            if not _is_memory_error(exc):
-                raise
-            del exc                 # its traceback holds the failed attempt's own
-                                    # device memory alive; the retry needs those bytes
+        never `set_budget` from here (`_release_pool` says why -- an absolute restore
+        hands back bytes the card no longer has, S19 vi) and never a second eviction
+        mechanism (`set_budget` already evicts LRU to fit).
+
+        ONCE per request, not once per layer: the re-base prints a line on every
+        call, including when it changes nothing, and that log is the artifact users
+        mail in; this also bounds the belt to one `mem_get_info` per request. The
+        flag clears where `_request_captures` does."""
+        if self._made_room:
+            return
+        self._made_room = True
+        self.stats["made_room"] += 1
         rebase = getattr(self._model, "_rebase_expert_tier", None)
         if rebase is not None:
             rebase()
-        _restore(cache, before)
-        self.stats["made_room"] += 1
-        try:
-            return layer(seq, **kwargs)
-        except Exception as again:
-            self._refuse_only(name, f"it ran out of memory even after making room: "
-                                    f"{_exc_summary(again)}", transient=True)
-            raise
 
     def _refuse(self, name, layer, seq, kwargs, why):
         self._refuse_only(name, why)
