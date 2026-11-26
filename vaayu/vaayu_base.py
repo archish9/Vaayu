@@ -2854,6 +2854,7 @@ class VaayuBaseModel(GenerationMixin):
         self._vram_plan = None
         self._expert_tier_margin_bytes = 0
         self._expert_tier_planned_budget = 0   # load-time tier ceiling; 0 = no tier
+        self._rebase_cut = 0                   # bytes the re-base itself has taken from the tier
         if device.startswith("cuda") and torch.cuda.is_available():
             from .vram_plan import (DEFAULT_ALLOC_FACTOR, VramShape,
                                     plan_vram, reserve_floor_bytes,
@@ -3096,9 +3097,6 @@ class VaayuBaseModel(GenerationMixin):
             _expert_budget_planned = _expert_budget_for(
                 self._vram_plan, _free_vram,
                 margin_bytes=self._expert_tier_margin_bytes)
-            # D2: remembered so each request's boundary re-base sizes against the
-            # PLAN, never against the budget a previous request left behind.
-            self._expert_tier_planned_budget = _expert_budget_planned
             _gib = 1024.0 ** 3
             print(f"[Vaayu-VRAM] {self._vram_plan.reason}; "
                   f"pinning_budget={self._vram_plan.pinning_budget / _gib:.2f} GiB; "
@@ -3645,6 +3643,10 @@ class VaayuBaseModel(GenerationMixin):
                         _vram_budget,
                         track_evicted_keys=bool(getattr(self, "enable_expert_usage", False)),
                     )
+                    # D2: the REAL post-pinning ceiling, remembered so each
+                    # request's boundary re-base sizes against the PLAN, never
+                    # against the budget a previous request left behind.
+                    self._expert_tier_planned_budget = _vram_budget
                     print(f"[Vaayu-MoE] Expert VRAM cache: {_vram_budget / 1e9:.1f} GB "
                           f"(~{int(_vram_budget // max(1, self._moe_geometry['expert_bytes']))} "
                           f"experts resident on GPU)")
@@ -6036,7 +6038,6 @@ class VaayuBaseModel(GenerationMixin):
             output.past_key_values = None
         return output
 
-    @torch.no_grad()
     def _rebase_expert_tier(self) -> Optional[int]:
         """D2: re-apply the load-time tier inequality against driver-free VRAM
         measured NOW (the prefill->decode boundary), so the tier fills only into
@@ -6049,22 +6050,35 @@ class VaayuBaseModel(GenerationMixin):
         are not reachable by the allocation that fails. Sized against the PLANNED
         ceiling every time, so repeated requests never ratchet the tier down."""
         tier = getattr(self, "_expert_vram_cache", None)
-        if tier is None or not torch.cuda.is_available():
+        if (tier is None or not torch.cuda.is_available()
+                or getattr(self, "_elastic_tier", None) is not None):
+            # The elastic tier owns the budget per request (its grant covers the
+            # first decode forward); a re-fit here would bypass its callback.
             return None
         from .vram_plan import rebased_tier_budget
         _free = int(torch.cuda.mem_get_info()[0])
         _old = int(tier.budget_bytes)
         _usage = int(tier.current_usage)
         _margin = self._expert_tier_margin_bytes
-        _new = rebased_tier_budget(
+        _target = rebased_tier_budget(
             free_bytes=_free, tier_usage=_usage,
             planned_budget=self._expert_tier_planned_budget,
             margin_bytes=_margin)
-        tier.set_budget(_new)
-        if _new < _old:
+        # RELATIVE: other writers (decode-graph pool charge, admission cap) lower
+        # budget_bytes too; only ever refund what THIS re-base took.
+        _new = _old
+        if _target < _old:
+            _new = _target
+            self._rebase_cut = getattr(self, "_rebase_cut", 0) + (_old - _target)
+            tier.set_budget(_new)
             # Eviction only frees whole 20 MiB segments (partial-free physics):
             # realise them now so the driver sees the bytes.
             torch.cuda.empty_cache()
+        elif _target > _old and getattr(self, "_rebase_cut", 0):
+            _give = min(self._rebase_cut, _target - _old)
+            _new = _old + _give
+            tier.set_budget(_new)
+            self._rebase_cut -= _give
         _mib = 1024.0 ** 2
         print(f"[Vaayu-VRAM] tier re-base: driver-free {_free / _mib:.0f} MiB, "
               f"margin {_margin / _mib:.0f} MiB, "
@@ -6077,6 +6091,7 @@ class VaayuBaseModel(GenerationMixin):
                   "nothing to evict, the tier stays at 0 for this request")
         return _new
 
+    @torch.no_grad()
     def forward(
             self,
             input_ids: torch.LongTensor = None,

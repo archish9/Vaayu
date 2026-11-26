@@ -153,9 +153,6 @@ def test_layer_range_still_returns_none_when_the_batch_working_set_fits():
 # ── D2: re-base the expert tier at the prefill->decode boundary ─────────────
 # CPU-only: a fake tier, a bare engine object, a monkeypatched torch.cuda.
 
-import types
-
-import pytest
 import torch
 
 MiB = 1024 ** 2
@@ -258,17 +255,55 @@ def test_rebase_restores_the_budget_when_the_transient_is_gone(monkeypatch):  # 
     tier = _FakeTier(usage=1 * GiB, budget=1 * GiB)        # already cut by an earlier request
     _patch_free(monkeypatch, free=4 * GiB)
     m = _fake_model(tier=tier, planned=3 * GiB, margin=200 * MiB)
+    m._rebase_cut = 2 * GiB                                # what an earlier re-base took
     assert m._rebase_expert_tier() == 3 * GiB
+    assert m._rebase_cut == 0
 
 
 def test_rebase_sizes_against_the_plan_not_its_last_answer(monkeypatch):
-    """8 requests with the same free VRAM never ratchet the tier toward zero."""
+    """Request 1 loses VRAM to a long prefill; request 2 finds it back. The tier
+    (filled by request 1) must be restored to the PLAN, not stay at 1 's answer."""
     GiB = 1024 ** 3
     tier = _FakeTier(usage=0, budget=3 * GiB)
-    _patch_free(monkeypatch, free=2 * GiB)
+    calls = _patch_free(monkeypatch, free=2 * GiB)
     m = _fake_model(tier=tier, planned=3 * GiB, margin=200 * MiB)
-    answers = [m._rebase_expert_tier() for _ in range(8)]
-    assert answers == [2 * GiB - 200 * MiB] * 8
+    assert m._rebase_expert_tier() == 2 * GiB - 200 * MiB
+    assert m._rebase_cut == 3 * GiB - (2 * GiB - 200 * MiB)
+    tier.current_usage = tier.budget_bytes                 # the request fills the tier
+    _patch_free(monkeypatch, free=4 * GiB)
+    assert m._rebase_expert_tier() == 3 * GiB
+    assert m._rebase_cut == 0
+
+
+def test_rebase_never_refunds_another_writers_charge(monkeypatch):
+    """The decode-graph pool lowered the budget (decode_graphs.py charge); the
+    re-base did not cut anything, so it must not hand those bytes back."""
+    GiB = 1024 ** 3
+    tier = _FakeTier(usage=0, budget=3 * GiB - 500 * MiB)  # planned 3 GiB less a graph charge
+    _patch_free(monkeypatch, free=8 * GiB)
+    m = _fake_model(tier=tier, planned=3 * GiB, margin=200 * MiB)
+    assert m._rebase_expert_tier() == 3 * GiB - 500 * MiB
+    assert tier.set_budget_calls == []
+    # and a later refund is capped at its own cut, not at the plan
+    m._rebase_cut = 100 * MiB
+    assert m._rebase_expert_tier() == 3 * GiB - 400 * MiB
+
+
+def test_rebase_leaves_an_elastic_tier_alone(monkeypatch):
+    calls = _patch_free(monkeypatch, free=100 * MiB)
+    tier = _FakeTier(usage=2 * 1024 ** 3, budget=3 * 1024 ** 3)
+    m = _fake_model(tier=tier, planned=3 * 1024 ** 3, margin=200 * MiB)
+    m._elastic_tier = object()
+    assert m._rebase_expert_tier() is None
+    assert tier.set_budget_calls == [] and calls["mem_get_info"] == 0
+
+
+def test_forward_keeps_its_no_grad_guard():
+    """An inserted method once slid between `@torch.no_grad()` and `def forward`,
+    leaving ~240 preamble lines running with grad enabled. Pin the wrapper."""
+    from vaayu.vaayu_base import VaayuBaseModel
+    assert hasattr(VaayuBaseModel.forward, "__wrapped__")
+    assert not hasattr(VaayuBaseModel._rebase_expert_tier, "__wrapped__")
 
 
 class _Stop(Exception):
