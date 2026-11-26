@@ -102,3 +102,23 @@ def test_expert_helpers_safe_over_two_geometries_when_basis_shrinks(geo):
     assert s_budget >= 0 and h_budget >= 0 and s_ne >= 0
     assert s_ceil <= h_ceil
     assert s_budget <= h_budget
+
+
+def test_projection_and_sizing_use_the_same_margin():
+    """The plan line's ceiling and the tier actually created must not disagree:
+    both `expert_vram_budget_for` call sites in the loader take the same
+    `margin_bytes`, so a reader of the log sees the tier that was built."""
+    import inspect
+    import textwrap
+    tree = ast.parse(textwrap.dedent(inspect.getsource(vb.VaayuBaseModel.__init__)))
+    margins = []
+    for call in ast.walk(tree):
+        if not isinstance(call, ast.Call):
+            continue
+        name = getattr(call.func, "id", getattr(call.func, "attr", None))
+        if name in ("expert_vram_budget_for", "_expert_budget_for"):
+            kw = next((k.value for k in call.keywords if k.arg == "margin_bytes"), None)
+            assert kw is not None, f"line {call.lineno}: no margin_bytes keyword"
+            margins.append(ast.dump(kw))
+    assert len(margins) == 2, f"expected two budget call sites, found {len(margins)}"
+    assert margins[0] == margins[1]

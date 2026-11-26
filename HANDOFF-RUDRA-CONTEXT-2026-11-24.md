@@ -1789,3 +1789,46 @@ guess at it in a document you plan against.
   at that size.
 - **§11.7's order is otherwise unchanged**, and step 2 (R6 + R2) is still clear to go.
 - Nothing here asks Rudra for work, a config change, or a reply.
+
+
+## 18. The repeated-long-request failure is FIXED; the COLD first long request is NOT. R1 STAYS HELD.
+
+**2026-11-25, after §17.** One change shipped on Vaayu's side and two cells were measured. Read the second
+table before planning anything: the number §17.2 said was blocked is now fixed, and a DIFFERENT cell — the one
+§16.3 actually named as your release signal — still fails.
+
+### 18.1 What changed
+
+Vaayu's VRAM planner used to hand the expert VRAM tier every byte above its reserve, so a later unbudgeted
+~20 MiB device allocation (the CUDA allocator's large-pool segment, during expert injection) had nowhere to go.
+It now holds back a derived margin, which on this box resolves to **0.20 GiB**. The expert tier shrinks from
+~374 to ~349 resident experts; **the advertised `max_seq_len` is unchanged at 32768** and the service still
+boots on its pinned config. Decode cost of the smaller tier is **not resolvable at this n** (bound +-1.1 %).
+
+### 18.2 The two cells, and they disagree
+
+| cell | before | after |
+|---|---|---|
+| 4 short warm-ups, then **6 distinct 21.5 k-token sessions**, at the shipped `PREFIX_COMPRESS` default | 1 of 6 | **6 of 6** |
+| the same, with `PREFIX_COMPRESS=9` | 6 of 6 | **6 of 6** |
+| **ONE 21.5 k-token request as the FIRST request of a fresh boot, no warm-ups** | never measured | **NOT SERVED** |
+
+So §17.2's "a long SECOND session still fails" is **resolved at the default**, and repeated long requests now
+work without the packed-pool workaround. But the cold first long request — the shape an agent produces
+immediately after any restart — still fails. The cold case is proven cold by Vaayu's own telemetry
+(empty host expert arena, empty VRAM tier, no prefix match) and it streams 131.56 GB for that single prefill.
+The prefill itself completes (all 43 chunks); the failure is on the first decode forward, during decode-graph
+capture, at an expert injection that needs 20.00 MiB with 37.75 MiB free and about 944 MiB reserved by PyTorch
+but unallocated. Host RAM was not a factor (peak RSS 14.25 GB against a 28 GiB cap).
+
+### 18.3 What this changes for Rudra: R1 stays held, for the reason §16.3 gave
+
+- **R1 stays HELD.** §16.3 said "Vaayu will say explicitly when a cold long first request is safe, and that is
+  the signal to ship R1." We are saying the opposite, explicitly: **it is not safe.** §14's "ceiling 32768"
+  remains verified WARM ONLY. We will not grow the margin until that cell passes — doing so would trade your
+  decode throughput against a mechanism we have not named, and we would rather tell you the truth about one
+  cell than hand you a green number.
+- **Stay at the 16 k window.** Unchanged. Your chains cap at ~13.9 k there and none of this has been
+  reproduced at that size.
+- **R6 and R2 remain clear to go**, and §11.7's order is otherwise unchanged.
+- Nothing here asks Rudra for work, a config change, or a reply.

@@ -198,6 +198,44 @@ def compute_moe_geometry(expert_offset_index, num_layers, moe_top_k, moe_num_exp
     }
 
 
+def largest_injection_group_bytes(expert_offset_index) -> int:
+    """Bytes ONE `build_exl3_qmatrix` call moves H2D for the largest single
+    expert submodule: the max, over every layer, expert and submodule path, of
+    the summed `byte_length` of that submodule's tensors.
+
+    Grouped exactly as `moe_patch._inject_expert_weights` does it: the index
+    stores FULL checkpoint keys (`...experts.<n>.w1.trellis`), so the expert
+    prefix is stripped with `_EXPERT_PREFIX_RE` and the rest is split at its
+    last dot (`w1` is the group, `trellis` the tensor).
+
+    The max, never a sample: this is a ceiling a VRAM margin is sized on, and
+    one outsized expert in any layer would OOM an underestimate. Unlike
+    `compute_moe_geometry` it therefore scans EVERY layer.
+
+    Returns 0 for None, an empty index, or one whose keys carry no
+    `.experts.<n>.` prefix (the fused-3D whole-layer forward keys differently);
+    a load must not die because an index is shaped unexpectedly.
+    """
+    from .moe_patch import _EXPERT_PREFIX_RE
+
+    layers = getattr(expert_offset_index, "index", None)
+    if not layers:
+        return 0
+    largest = 0
+    for layer_tensors in layers.values():
+        for expert_tensors in layer_tensors.values():
+            groups: dict[str, int] = {}
+            for param_key, tensor in expert_tensors.items():
+                m = _EXPERT_PREFIX_RE.match(param_key)
+                if m is None:
+                    continue
+                submod_path = param_key[m.end():].rpartition(".")[0]
+                groups[submod_path] = groups.get(submod_path, 0) + tensor.byte_length
+            if groups:
+                largest = max(largest, max(groups.values()))
+    return largest
+
+
 def compute_spec_working_set(geometry: dict, verify_positions: int) -> int:
     """Expert working set of ONE speculative verify pass, in bytes (Fix #9).
 
@@ -722,6 +760,13 @@ _RESIDENCY_FIRST_PIN_MARGIN_BYTES = int(0.20 * 1024 ** 3)
 # with ~0.20 GiB to spare. Only the DERIVED context uses it; a user-set MAX_SEQ_LEN
 # is validated against s_max as before.
 _STAGE3_ADMISSION_MARGIN_BYTES = int(0.30 * 1024 ** 3)
+
+# D2: the CUDA caching allocator expands a segment by a whole contiguous unit, so
+# a per-expert H2D allocation can fail with MORE free than it asked for. Measured:
+# 20.00 MiB requested against 21.75 MiB free, five times
+# (logs/run-2026-11-25T11-50-18Z). An allocator/hardware property, not a model
+# number (CLAUDE.md §5); `tier_margin_bytes` adds one such unit to the margin.
+_CUDA_ALLOCATOR_EXPANSION_BYTES = int(20 * 1024 ** 2)
 
 
 def stage3_derive_floor(*, reserve_floor: int, base_floor: int, raised: bool,
@@ -2807,6 +2852,7 @@ class VaayuBaseModel(GenerationMixin):
         self._build_moe_geometry()
 
         self._vram_plan = None
+        self._expert_tier_margin_bytes = 0
         if device.startswith("cuda") and torch.cuda.is_available():
             from .vram_plan import (DEFAULT_ALLOC_FACTOR, VramShape,
                                     plan_vram, reserve_floor_bytes,
@@ -3037,11 +3083,23 @@ class VaayuBaseModel(GenerationMixin):
             # (below) actually consumes; the real post-pinning figure is
             # printed at the expert-cache-creation call site further down.
             from .vram_plan import expert_vram_budget_for as _expert_budget_for
-            _expert_budget_planned = _expert_budget_for(self._vram_plan, _free_vram)
+            # D2: the tier does not get the last byte above the reserve. Derived
+            # ONCE per load and reused at the real sizing site below, so the
+            # printed ceiling and the tier actually built cannot disagree. Comes
+            # out of the tier only: plan_vram / max_seq_len are untouched.
+            from .vram_plan import tier_margin_bytes as _tier_margin_bytes
+            self._expert_tier_margin_bytes = _tier_margin_bytes(
+                injection_bytes=largest_injection_group_bytes(self._expert_offset_index),
+                hardware_floor=_RESIDENCY_FIRST_PIN_MARGIN_BYTES,
+                allocator_unit=_CUDA_ALLOCATOR_EXPANSION_BYTES)
+            _expert_budget_planned = _expert_budget_for(
+                self._vram_plan, _free_vram,
+                margin_bytes=self._expert_tier_margin_bytes)
             _gib = 1024.0 ** 3
             print(f"[Vaayu-VRAM] {self._vram_plan.reason}; "
                   f"pinning_budget={self._vram_plan.pinning_budget / _gib:.2f} GiB; "
-                  f"expert cache ceiling={_expert_budget_planned / _gib:.2f} GiB")
+                  f"expert cache ceiling={_expert_budget_planned / _gib:.2f} GiB; "
+                  f"tier margin={self._expert_tier_margin_bytes / _gib:.2f} GiB")
             # CLAUDE.md §5: warn rather than silently degrade when the plan
             # leaves nothing for pinning -- a real hardware limit, not a bug
             # to hide. (The parallel "expert budget under one expert" case is
@@ -3565,7 +3623,7 @@ class VaayuBaseModel(GenerationMixin):
 
             # VRAM-resident expert cache (Fix #7): hot experts skip per-token H2D.
             if torch.cuda.is_available() and str(self.device).startswith("cuda"):
-                from .vram_plan import expert_vram_budget_for
+                from .vram_plan import expert_vram_budget_for, warn_tier_lost_to_margin
                 _free_vram, _ = torch.cuda.mem_get_info()
                 # S42 residency-first: a non-expert transformer layer streams every
                 # token (100 % read) and so dominates, per byte, an expert slot it
@@ -3575,7 +3633,9 @@ class VaayuBaseModel(GenerationMixin):
                 # thrash gate sees the tier's real size and the budget below shrinks
                 # by exactly what this pins.
                 _free_vram = self._resident_streamed_nonexpert_layers(_free_vram)
-                _vram_budget = expert_vram_budget_for(self._vram_plan, _free_vram)
+                _vram_budget = expert_vram_budget_for(
+                    self._vram_plan, _free_vram,
+                    margin_bytes=self._expert_tier_margin_bytes)
                 if _vram_budget >= self._moe_geometry["expert_bytes"]:
                     self._expert_vram_cache = ExpertVRAMCache(
                         _vram_budget,
@@ -3584,10 +3644,16 @@ class VaayuBaseModel(GenerationMixin):
                     print(f"[Vaayu-MoE] Expert VRAM cache: {_vram_budget / 1e9:.1f} GB "
                           f"(~{int(_vram_budget // max(1, self._moe_geometry['expert_bytes']))} "
                           f"experts resident on GPU)")
+                elif (_margin_msg := warn_tier_lost_to_margin(
+                        budget_bytes=_vram_budget,
+                        expert_bytes=self._moe_geometry["expert_bytes"],
+                        margin_bytes=self._expert_tier_margin_bytes)) is not None:
+                    print(_margin_msg)
                 else:
                     print(f"[Vaayu-MoE] WARNING: Expert VRAM cache disabled — free VRAM "
                           f"{_free_vram/1e9:.2f}GB leaves {_vram_budget/1e9:.2f}GB after the "
-                          f"{self._vram_plan.reserve_bytes/1e9:.2f}GB reserve, under one "
+                          f"{self._vram_plan.reserve_bytes/1e9:.2f}GB reserve and the "
+                          f"{self._expert_tier_margin_bytes/1e9:.2f}GB tier margin, under one "
                           f"{self._moe_geometry['expert_bytes']/1e6:.1f}MB expert. Every expert "
                           f"streams per token; expect very slow decode (a real hardware limit, "
                           f"not a bug).")

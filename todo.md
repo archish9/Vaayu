@@ -288,30 +288,109 @@ arm served ten full prefills back to back at the same size as the arm that died.
       serves 6/6, there is a real store-path -> device-VRAM mechanism that must be understood BEFORE a fix
       (candidate: uncompressed `store()` calls `cache.to_cpu()` and so frees + reallocates the device KV
       ring between requests, while `compress_cache()` leaves the live cache alone — UNTESTED).
-- [ ] **Then instrument (task 3), sharpened by 1b:** sample driver-free VRAM (after `empty_cache()`),
+- [x] **CONFIRMED-AND-CORRECTED by `d2-tier-margin` (prime suspect below).** **Then instrument (task 3), sharpened by 1b:** sample driver-free VRAM (after `empty_cache()`),
       torch allocated/reserved, and the tier's `usage=x/y` **per request across sessions 1 -> 2**, in both
       arms. Session 1 serves in EVERY arm on record; what grows before session 2's first decode is the
       whole question. Prime suspect, derived from the plan line: the tier fills to its 3.3 GB ceiling
       during session 1, and nothing budgets the **per-injection H2D staging** (20 MiB) that
       `build_exl3_qmatrix` needs on a miss — the s42 trap (`s42-residency-first-vram-basis`) one level
       down. Confirm or kill it with numbers, do not build against it.
+      -> RESULT: the staging is real, but the 20 MiB is the allocator's large-pool segment, not a tensor
+      group; the measured largest group is 2.821 MiB on MiniMax (see the D2 block below).
 - [ ] **Confound to carry, not bury:** rustdesk (pid 426218) held **148 MiB of GPU memory** for the whole
       run, named in the OOM text. Constant across this arm and the §4 runs, but it is 148 MiB against a
       **22 MiB** failure margin, so "unchanged" is not "negligible". Decide whether to kill it for the
       next arm, and say which way the arm was run.
-- [ ] **FIRST, run the two cells nobody has run** (they decide whether this row is about boot order at
+- [~] **HALF DONE: warm uncompressed cell ran (6/6, `run-2026-11-25T14-09-05Z`); the cold cell at
+      `PREFIX_COMPRESS=9` is still UNRUN.** **FIRST, run the two cells nobody has run** (they decide whether this row is about boot order at
       all): the warm six-session shape at `PREFIX_COMPRESS=None` (= task 1b), and the cold single-request
       shape at `PREFIX_COMPRESS=9`. -> verify: the split above (packed 16/16 across 2 runs; uncompressed 4/20
       across 5, never a second long request in any of them) either survives or collapses. Until both
       exist, do NOT describe the defect as boot-order.
-- [ ] Reproduce deliberately: boot, send ONE request at ~20-22 k tokens as the first request, both
-      kernels. -> verify: it OOMs cold and passes warm, with the plan line identical. NOTE: "passes warm"
-      is now in doubt — it has only ever been observed at `PREFIX_COMPRESS=9`.
+- [~] **DONE for flash (cold OOMs, warm passes); sdpa UNRUN, so this is HALF done** — sdpa's `S_max`
+      (~26.1-26.6k) would refuse the pinned `MAX_SEQ_LEN=32768` (exit 3), and changing that pin was out of
+      scope. Marker corrected from `[x]` 2026-11-26: the flash half is real, but a row that reads done on an
+      unrun kernel is how a later session skips it. Reproduce deliberately: boot, send ONE request at
+      ~20-22 k tokens as the first request, both kernels. -> verify: it OOMs cold and passes warm, with the
+      plan line identical. **The old NOTE here — "passes warm is now in doubt, it has only ever been observed
+      at `PREFIX_COMPRESS=9`" — is SETTLED and no longer in doubt:** the warm six-session cell served **6/6 at
+      `PREFIX_COMPRESS=None`** after the tier margin (`run-2026-11-25T14-09-05Z`), so warm passes at the
+      shipped default. Only the COLD cell still fails.
 - [ ] Then decide where the charge belongs: the expert VRAM tier should not be able to fill into the
       prefill reserve of the request that is running (compare `elastic_tier.py`'s rules, which are OFF
       on MiniMax because decode graphs own the pool), or admission must charge the cold-tier case.
 - [ ] Until then: do NOT claim `MAX_SEQ_LEN=32768` is safe for a cold long first request. The handoff
       (section 14) tells Rudra the ceiling is 32768; that number is only verified warm.
+
+**THE MARGIN IS BUILT, MEASURED AND PARTLY SUFFICIENT — branch `d2-tier-margin`, 2026-11-25.** Five commits:
+`468a5a0` (pure `tier_margin_bytes`), `9210b2e` (`largest_injection_group_bytes`), `167d804` (+`debec18`)
+(the margin wired into `expert_vram_budget_for` at both load-time call sites, plan line now prints
+`tier margin=`), `c787585` (`warn_tier_lost_to_margin`, fires only when the margin is the CAUSE). Design
+`docs/superpowers/specs/2026-11-25-D2-cold-first-long-prefill-oom-design.md` §5.1; plan
+`docs/superpowers/plans/2026-11-25-D2-tier-margin.md`; results
+`docs/superpowers/specs/2026-11-25-D2-artifacts/margin-RESULTS.md`. §8: **NO KNOB** (correctness, not policy),
+plumbed at both sites, reachable at N=1 on every MoE CUDA load, not banked.
+
+| cell | before | after |
+|---|---|---|
+| warm, 4 warm-ups + 6 x 21.5k, `PREFIX_COMPRESS=None` | **1 of 6** | **6 of 6** (`run-2026-11-25T14-09-05Z`) |
+| same, `PREFIX_COMPRESS=9` | 6 of 6 | **6 of 6** (`run-2026-11-25T14-27-01Z`) |
+| **COLD: ONE 21.5k request as the FIRST request, no warm-ups** | never run | **NOT SERVED** (`run-2026-11-25T14-56-06Z`) |
+
+Verified on the raw oracle (`requests.jsonl`, `prompt_tokens>18000`, `finish != "error"`), not off a driver's
+stdout. Plan line: `expert cache ceiling=6.40 -> 6.20 GiB; tier margin=0.20 GiB`, tier **3.3 GB/~374 experts ->
+3.1 GB/~349**, partial caching 46/62 -> 43/62 layers. **Advertised `max_seq_len` unchanged at 32768**
+(`validated against S_max=32768`), no `VramPlanError`, so the pinned-config boot is intact. Peaks fell by about
+the margin (packed 14.1292 -> 13.9161 GB; uncompressed 15.804/15.813 -> 15.591/15.624). Suite
+`4323 passed, 92 skipped, 0 failed` (4415 collected); all three gates green, ppl 11.90 / 8.87 / 5.98 unmoved.
+**Decode price is NOT resolvable at this n, bound +-1.1 %** (+0.69 % at 1500 tok, -0.52...-1.09 % at 21.5k; arm
+order reversed vs the control, so no sign is claimed).
+
+**IT PASSES ON THE HARDWARE FLOOR, NOT ON THE DERIVATION — and this corrects the spec AND two earlier claims
+in this row.** Measured largest injection group: **2.821 MiB on MiniMax-M2.7, 0.755 MiB on Qwen3.6-35B**, so
+the derived term is ~40 MiB against the 204.80 MiB floor and **never binds on either on-disk MoE model** (it
+binds only above 180.00 MiB). **The 20.00 MiB in every traceback is the CUDA allocator's large-pool SEGMENT,
+not a tensor group** — so this row's earlier "the group is >= 20 MiB" and the §5.1 sentence it came from were
+both wrong, and are corrected in the doc. The derivation stays (CLAUDE.md §5 forbids assuming a model's
+numbers, and it binds on a big-expert checkpoint) but it is **inert today** and must not be cited as the thing
+that works.
+
+- [x] **Margin built + merged on branch, warm cell FIXED** (above).
+- [bug] **THE COLD FIRST LONG REQUEST STILL FAILS, so this row is NOT closed and R1 STAYS HELD.**
+      `run-2026-11-25T14-56-06Z`: one boot, flash, pinned 32768, `PREFIX_COMPRESS=None`, ONE 21,550-token
+      request as the very first request, no warm-ups -> `finish: error`, `tokens: 0`, `ttft_s` 125.6 (which is
+      time-to-FAILURE, not TTFT). **Cold is PROVEN by telemetry, not assumed:**
+      `expert_cache=0hit/14803miss/0evict hit_rate=0% usage=0.00GB/9.12GB`, `cache=0hit/0miss`,
+      `vram=0hit/0miss/0evict`, and `prefix_hit=false` with `prefix_match_tokens=0` — the only such row in the
+      series. It streamed **131.56 GB** for that one prefill (`gb_tok=131.56`, `expert_disk=11.8s`,
+      `compute=113.7s`). The 43-chunk prefill COMPLETED; the OOM is on the FIRST DECODE forward, inside decode-graph
+      capture (`vaayu_base.py:6577/6597 forward` -> `decode_graphs.py:530 run` -> `:550 _checked` / `:553`
+      eager reference -> `:618 _capture` -> `moe_patch.py:2061 sparse_forward` -> `:1976 _load_inject_run`
+      -> `:1328 _inject_expert_weights` -> `persist/loader_strategy.py:402 build_exl3_qmatrix`
+      `t.to(device)`): `CUDA OOM on model.layers.36`, 20.00 MiB wanted, **37.75 MiB free**, 13.93 GiB
+      allocated, **944.04 MiB reserved-but-unallocated** (the warm failures showed only 113-139 MiB, so the
+      cold case carries a fragmentation component the warm one did not; PyTorch suggests
+      `expandable_segments:True`), rustdesk 148.32 MiB. Host RAM was NOT a factor (`peak_rss_gb` 14.25,
+      cgroup peak 13.74 GiB, PSI 0.00, against a 28 GiB cap). The host expert arena reached 4.41 GB of its
+      9.12 GB BUDGET on the decode token (token summaries `usage=0.00GB/9.12GB` then `usage=4.41GB/9.12GB`).
+      The 0.20 GiB margin does not cover this. Durable record: commit `10d7e2f` (its message carries the
+      full cold-cell record; the `logs/` path is gitignored). Driver `d2_cold.py`
+      (`d2_arm.py` with the warm-up and session loops removed; prompt byte-identical to the warm arm's). n=1.
+- [ ] **NEXT: the cold cell needs the tier-vs-running-request charge (the "decide where the charge belongs"
+      bullet below), NOT the churn.** Do NOT grow the margin to buy this cell: that trades Rudra's decode
+      throughput against a mechanism nobody has named. The release/re-acquire churn still measurable after the
+      fix — ~6.5 GB released between long requests, a cold-tier re-grow (`vram=0hit/344miss/0evict`) on the
+      first decode token of each request, and a 1.71 GB arm-to-arm peak gap — is the design for requests 2..N
+      (spec §5.1's fourth option, "stop the churn"). It CANNOT close the cold cell: on a cold boot the tier
+      starts empty whatever the release policy, so the ~344-expert fill on the first decode token happens
+      regardless (`margin-RESULTS.md`: every warm session re-reads `vram=0hit/344miss/0evict` too). Second,
+      separable CANDIDATE for the cold cell, not a conclusion: the 944.04 MiB reserved-but-unallocated at the
+      prefill -> decode boundary (fragmentation).
+- [ ] Residual risks recorded with the fix: slack is now ~0.21 GiB and the fatal transient is **sub-second**
+      (below a 1 Hz sampler), so any later change adding >190 MiB at the prefill -> decode transition re-opens
+      this; host RAM peaks **27.2 GiB of the 28 GiB cap** in both warm arms (PSI 0.98), independent of this
+      fix; **sdpa is UNRUN** (its `S_max` is ~26.1-26.6k, so the pinned `MAX_SEQ_LEN=32768` refuses the load,
+      exit 3 — changing that pin was out of scope).
 
 ## [bug] HOST-RAM-CEILING — **ROOT-CAUSED 2026-11-24 by a mirrored A/B: UNCOMPRESSED pooled prefix entries are PINNED (shmem), so the pool is unreclaimable and walks the cgroup into a SIGKILL. `PREFIX_COMPRESS=9` moves it to ANON and survives.** Fix shape is now a code decision, not an investigation
 

@@ -890,14 +890,69 @@ def admission_headroom(*, free_vram: int, plan: VramPlan,
     return min(usable, int(plan.reserve_bytes) + max(0, int(expert_giveback_bytes)))
 
 
-def expert_vram_budget_for(plan: VramPlan, free_vram_now: int) -> int:
+def expert_vram_budget_for(plan: VramPlan, free_vram_now: int,
+                           margin_bytes: int = 0) -> int:
     """VRAM the resident expert cache may take, measured AFTER pinning.
 
     Subtracts the SAME reserve pinning did. Replaces
     `compute_vram_expert_budget(free) = free - 3.5 GB`, whose flat constant was
     context-insensitive by its own admission.
+
+    `margin_bytes` is held back from the TIER only (never the reserve or the
+    context): see `tier_margin_bytes`. The default 0 is the old behaviour.
     """
-    return max(0, int(free_vram_now) - plan.reserve_bytes)
+    return max(0, int(free_vram_now) - plan.reserve_bytes - int(margin_bytes))
+
+
+def tier_margin_bytes(*, injection_bytes: int, hardware_floor: int,
+                      allocator_unit: int) -> int:
+    """Bytes the expert VRAM tier must NOT be given: `max(hardware_floor,
+    ceil_to_unit(injection_bytes + allocator_unit))`.
+
+    Why the tier may not have the last byte: `expert_vram_budget_for` hands it
+    everything above the reserve, so a later per-expert H2D allocation that no
+    budget counted has no room. Same failure as `_STAGE3_ADMISSION_MARGIN_BYTES`
+    (`vaayu_base.py:711-724`): a plan that maximizes to its limit leaves nothing
+    at admission.
+
+    The measured failing allocation was 20.00 MiB requested against 21.75 MiB
+    FREE, more free than requested. PyTorch's caching allocator had to expand a
+    segment by a whole contiguous unit, so the allocator unit, not the expert's
+    own size, dominates the margin on this model. The margin is therefore one
+    injection group plus one spare unit, rounded up to whole units.
+
+    `injection_bytes` is DERIVED by the caller from the checkpoint's expert
+    offset index (CLAUDE.md §5), never a literal. 0 (dense) yields the floor, and
+    `allocator_unit <= 0` disables the derived term. Pure: no torch, no I/O.
+    """
+    floor = int(hardware_floor)
+    unit = int(allocator_unit)
+    if unit <= 0:
+        return floor
+    need = max(0, int(injection_bytes)) + unit
+    return max(floor, -(-need // unit) * unit)
+
+
+def warn_tier_lost_to_margin(*, budget_bytes: int, expert_bytes: int,
+                             margin_bytes: int) -> str | None:
+    """WARNING text when the tier margin is what left the expert VRAM tier under
+    one expert, else None (CLAUDE.md §5: a real limit is announced, never a
+    silent degrade).
+
+    Fires only when the margin is the CAUSE: the budget is under one expert, and
+    would not have been without the margin. A load too small for one expert even
+    with the margin returned keeps only the tier-disabled warning at the call
+    site. Every figure is passed in; nothing here is model-specific.
+    """
+    if budget_bytes >= expert_bytes or budget_bytes + margin_bytes < expert_bytes:
+        return None
+    mib = 1024 ** 2
+    return (f"[Vaayu-MoE] WARNING: Expert VRAM cache disabled by the tier margin — "
+            f"the {margin_bytes / 1024 ** 3:.2f} GiB held back from the tier "
+            f"(budget {budget_bytes / mib:.1f} MiB after it, "
+            f"{(budget_bytes + margin_bytes) / mib:.1f} MiB before it) leaves less "
+            f"than one {expert_bytes / mib:.1f} MiB expert. Every expert streams "
+            f"per token; expect very slow decode.")
 
 
 def residency_first_allows_pin(*, used: int, size: int, budget: int,

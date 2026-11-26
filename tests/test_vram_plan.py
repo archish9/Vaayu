@@ -1455,3 +1455,95 @@ def test_a_ceiling_is_never_offered_above_the_load_time_one():
         msg = _too_big_message(requested=4096, s_max=2048, free_vram=free, shape=sh,
                                min_resident=EXPERT_BYTES, headroom=budget)
         assert "max_seq_len=2048" in msg
+
+
+# ---- D2: the margin the expert VRAM tier may not take --------------------
+from vaayu.vram_plan import tier_margin_bytes
+
+_UNIT = 20 * MB          # the allocator's expansion granularity, this box
+_FLOOR = int(0.20 * GB)  # _RESIDENCY_FIRST_PIN_MARGIN_BYTES
+
+
+def test_margin_is_never_below_the_hardware_floor():
+    # MiniMax-like: one injection group is ~8.4 MiB, far under the floor.
+    assert tier_margin_bytes(injection_bytes=int(8.4 * MB),
+                             hardware_floor=_FLOOR, allocator_unit=_UNIT) == _FLOOR
+
+
+def test_a_large_injection_group_raises_the_margin_above_the_floor():
+    # DeepSeek-V4-like: a 12.750 MiB expert whose group is most of it, scaled up
+    # to a geometry whose group exceeds the floor outright.
+    big = int(0.30 * GB)
+    m = tier_margin_bytes(injection_bytes=big, hardware_floor=_FLOOR,
+                          allocator_unit=_UNIT)
+    assert m > _FLOOR
+    assert m >= big + _UNIT          # the group PLUS one spare unit
+    assert m % _UNIT == 0            # rounded up to whole allocator units
+
+
+def test_dense_has_no_injection_and_gets_the_floor():
+    assert tier_margin_bytes(injection_bytes=0, hardware_floor=_FLOOR,
+                             allocator_unit=_UNIT) == _FLOOR
+
+
+def test_an_allocator_unit_of_zero_does_not_divide_by_zero():
+    assert tier_margin_bytes(injection_bytes=int(8.4 * MB), hardware_floor=_FLOOR,
+                             allocator_unit=0) == _FLOOR
+
+
+# --- D2: the margin comes off the tier's budget, and only the tier's ---------
+
+@pytest.mark.parametrize("name", sorted(GEOMETRIES))
+def test_the_margin_comes_off_the_tier_and_nothing_else(name):
+    p = _plan(name)
+    free_after_pinning = USABLE_VRAM - p.pinning_budget
+    margin = int(0.20 * GB)
+    before = expert_vram_budget_for(p, free_after_pinning)
+    after = expert_vram_budget_for(p, free_after_pinning, margin_bytes=margin)
+    assert before - after == margin
+    # the reserve, the context and the pinning budget are untouched
+    assert expert_vram_budget_for(p, free_after_pinning) == before
+    assert p.max_seq_len == _plan(name).max_seq_len
+
+
+def test_the_budget_clamps_at_zero_when_the_margin_exceeds_what_is_left():
+    p = _plan("minimax-m2.7")
+    assert expert_vram_budget_for(p, p.reserve_bytes + MB,
+                                  margin_bytes=int(1.0 * GB)) == 0
+
+
+def test_the_default_is_the_old_behaviour_exactly():
+    p = _plan("llama-70b")
+    assert (expert_vram_budget_for(p, USABLE_VRAM)
+            == max(0, USABLE_VRAM - p.reserve_bytes))
+
+
+from vaayu.vram_plan import warn_tier_lost_to_margin
+
+
+def test_a_surviving_tier_says_nothing():
+    assert warn_tier_lost_to_margin(budget_bytes=int(3.3 * GB),
+                                    expert_bytes=int(8.8 * MB),
+                                    margin_bytes=int(0.20 * GB)) is None
+
+
+def test_the_margin_that_kills_the_tier_announces_itself():
+    """CLAUDE.md §5: a real limit gets a WARNING, never a silent degrade. If the
+    margin drops the budget below ONE expert, no tier is created -- the load must
+    say so, with the margin's size and the budget it left."""
+    msg = warn_tier_lost_to_margin(budget_bytes=int(4 * MB),
+                                   expert_bytes=int(8.8 * MB),
+                                   margin_bytes=int(0.20 * GB))
+    assert msg is not None
+    assert "WARNING" in msg
+    assert "0.20" in msg          # the margin, in GiB
+    assert "4" in msg and "8.8" in msg   # budget left and one expert's bytes
+
+
+def test_a_load_too_small_without_the_margin_is_not_the_margins_fault():
+    """Even with the margin returned the budget is under one expert, so the
+    older tier-disabled warning owns this case; a second message would only
+    overlap it."""
+    assert warn_tier_lost_to_margin(budget_bytes=0,
+                                    expert_bytes=int(8.8 * MB),
+                                    margin_bytes=int(1 * MB)) is None
