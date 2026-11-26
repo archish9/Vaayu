@@ -1580,22 +1580,21 @@ def test_rebase_floors_at_zero_with_an_empty_tier_and_no_free():
 
 
 def test_rebase_does_not_ratchet_across_requests():
-    # the SECOND call sizes against planned_budget, not against the first result
+    # the SECOND call sizes against planned_budget, not against the first result:
+    # feed `first` back in as the held tier and the cap must still be planned_budget
     first = rebased_tier_budget(free_bytes=100 * MB, tier_usage=2 * GB,
                                 planned_budget=3 * GB, margin_bytes=200 * MB)
-    second = rebased_tier_budget(free_bytes=3 * GB, tier_usage=1 * GB,
+    second = rebased_tier_budget(free_bytes=3 * GB, tier_usage=first,
                                  planned_budget=3 * GB, margin_bytes=200 * MB)
     assert first < 2 * GB and second == 3 * GB
 
 
-@pytest.mark.parametrize("name", sorted(GEOMETRIES))
-def test_rebase_is_geometry_agnostic(name):
-    # The rule reads bytes only. Size the held tier from this geometry's KV
-    # (1024 tokens, as bytes), then check against a bytes-only reference: a
-    # version that read a geometry would miss the reference on some geometry.
-    held = 1024 * kv_bytes_per_token(**_kv_kwargs(GEOMETRIES[name]),
-                                     kv_cache_mode="bf16")
-    expected = min(3 * GB, max(0, held + 512 * MB - 200 * MB))
-    assert rebased_tier_budget(free_bytes=512 * MB, tier_usage=held,
-                               planned_budget=3 * GB,
-                               margin_bytes=200 * MB) == expected
+def test_rebase_matches_the_measured_cold_boundary():
+    # The prefill->decode boundary of the cold cell that OOMs, measured on device
+    # 2026-11-26 (docs/superpowers/specs/2026-11-25-D2-artifacts/cold-probe-cold2.jsonl,
+    # `boundary` record): an empty tier, 1.98 GiB driver-free after a 21,550-token
+    # prefill, against a 3.10 GB planned budget and the 0.20 GiB tier margin.
+    # The number's authority is that measurement, not the formula: a regression anchor.
+    assert rebased_tier_budget(free_bytes=2_126_249_984, tier_usage=0,
+                               planned_budget=3_104_014_072,
+                               margin_bytes=214_748_364) == 1_911_501_620
