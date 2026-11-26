@@ -148,3 +148,183 @@ def test_layer_range_still_returns_none_when_the_batch_working_set_fits():
     from vaayu.vaayu_base import compute_vram_layer_range
     assert compute_vram_layer_range(int(20e9), MINIMAX_GEO, list(range(62)),
                                     experts_per_layer=24) is None
+
+
+# ── D2: re-base the expert tier at the prefill->decode boundary ─────────────
+# CPU-only: a fake tier, a bare engine object, a monkeypatched torch.cuda.
+
+import types
+
+import pytest
+import torch
+
+MiB = 1024 ** 2
+
+
+class _FakeTier:
+    def __init__(self, usage, budget):
+        self.current_usage = usage
+        self.budget_bytes = budget
+        self.set_budget_calls = []
+
+    def set_budget(self, budget_bytes):
+        self.set_budget_calls.append(int(budget_bytes))
+        self.budget_bytes = int(budget_bytes)
+        self.current_usage = min(self.current_usage, self.budget_bytes)
+        return 0
+
+
+def _fake_model(tier, planned=0, margin=0):
+    from vaayu.vaayu_base import VaayuBaseModel
+    m = VaayuBaseModel.__new__(VaayuBaseModel)
+    m._expert_vram_cache = tier
+    m._expert_tier_planned_budget = planned
+    m._expert_tier_margin_bytes = margin
+    return m
+
+
+def _patch_free(monkeypatch, free):
+    """Pretend CUDA is present with `free` bytes driver-free; count the calls."""
+    calls = {"empty_cache": 0, "mem_get_info": 0}
+
+    def _mem_get_info(*a, **k):
+        calls["mem_get_info"] += 1
+        return (free, 16 * 1024 ** 3)
+
+    def _empty_cache():
+        calls["empty_cache"] += 1
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "mem_get_info", _mem_get_info)
+    monkeypatch.setattr(torch.cuda, "empty_cache", _empty_cache)
+    return calls
+
+
+def test_rebase_is_a_noop_without_a_tier(monkeypatch):    # Review Focus 1 (dense)
+    calls = _patch_free(monkeypatch, free=100 * MiB)
+    m = _fake_model(tier=None, planned=0, margin=200 * MiB)
+    assert m._rebase_expert_tier() is None                # and no AttributeError
+    assert calls == {"empty_cache": 0, "mem_get_info": 0}
+
+
+def test_rebase_is_a_noop_without_cuda(monkeypatch):      # Review Focus 4
+    calls = _patch_free(monkeypatch, free=100 * MiB)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    tier = _FakeTier(usage=0, budget=3 * 1024 ** 3)
+    m = _fake_model(tier=tier, planned=3 * 1024 ** 3, margin=200 * MiB)
+    assert m._rebase_expert_tier() is None
+    assert calls == {"empty_cache": 0, "mem_get_info": 0}
+    assert tier.set_budget_calls == []
+
+
+def test_rebase_lowers_the_budget_and_evicts(monkeypatch):
+    GiB = 1024 ** 3
+    tier = _FakeTier(usage=2 * GiB, budget=3 * GiB)
+    calls = _patch_free(monkeypatch, free=100 * MiB)       # 100 MiB free, 200 MiB margin
+    m = _fake_model(tier=tier, planned=3 * GiB, margin=200 * MiB)
+    new = m._rebase_expert_tier()
+    assert new == 2 * GiB + 100 * MiB - 200 * MiB
+    assert new == tier.budget_bytes < 2 * GiB and tier.set_budget_calls == [new]
+    # Segments the eviction freed are realised -- once, after the budget went down;
+    # the pre-read must NOT harvest cached bytes (decision: read free as the engine has it).
+    assert calls["empty_cache"] == 1
+
+
+def test_rebase_does_not_empty_the_cache_before_reading_free(monkeypatch):
+    """The pre-read empty_cache() would fold decode-graph-stream cached bytes
+    into `free` and hand them to the tier; with an unchanged budget there is no
+    reason to call it at all."""
+    GiB = 1024 ** 3
+    tier = _FakeTier(usage=0, budget=GiB)
+    calls = _patch_free(monkeypatch, free=4 * GiB)
+    m = _fake_model(tier=tier, planned=GiB, margin=200 * MiB)
+    assert m._rebase_expert_tier() == GiB
+    assert calls["empty_cache"] == 0 and calls["mem_get_info"] == 1
+
+
+def test_rebase_warns_once_when_an_empty_tier_cannot_make_room(monkeypatch, capsys):  # Review Focus 2
+    GiB = 1024 ** 3
+    _patch_free(monkeypatch, free=100 * MiB)               # below the 200 MiB margin
+    tier = _FakeTier(usage=0, budget=3 * GiB)
+    m = _fake_model(tier=tier, planned=3 * GiB, margin=200 * MiB)
+    assert m._rebase_expert_tier() == 0                    # clean: zero, never negative
+    m._rebase_expert_tier()
+    assert capsys.readouterr().out.count("WARNING") == 1
+    assert all(b >= 0 for b in tier.set_budget_calls)
+
+
+def test_rebase_restores_the_budget_when_the_transient_is_gone(monkeypatch):  # Review Focus 3
+    GiB = 1024 ** 3
+    tier = _FakeTier(usage=1 * GiB, budget=1 * GiB)        # already cut by an earlier request
+    _patch_free(monkeypatch, free=4 * GiB)
+    m = _fake_model(tier=tier, planned=3 * GiB, margin=200 * MiB)
+    assert m._rebase_expert_tier() == 3 * GiB
+
+
+def test_rebase_sizes_against_the_plan_not_its_last_answer(monkeypatch):
+    """8 requests with the same free VRAM never ratchet the tier toward zero."""
+    GiB = 1024 ** 3
+    tier = _FakeTier(usage=0, budget=3 * GiB)
+    _patch_free(monkeypatch, free=2 * GiB)
+    m = _fake_model(tier=tier, planned=3 * GiB, margin=200 * MiB)
+    answers = [m._rebase_expert_tier() for _ in range(8)]
+    assert answers == [2 * GiB - 200 * MiB] * 8
+
+
+class _Stop(Exception):
+    pass
+
+
+def test_forward_rebases_exactly_once_per_request(monkeypatch):
+    """Drive the REAL `forward` through several passes (one prefill, then
+    decode passes) and count re-base calls: the hook must ride
+    `decode_stats_reset`'s once-per-request edge, not fire every token.
+    `forward` is run on a MagicMock `self` and halted by `_Stop` right after the
+    reset block (`prefetching` is the first attribute read past it)."""
+    from unittest import mock
+    from vaayu.vaayu_base import VaayuBaseModel
+
+    fake = mock.MagicMock()
+    type(fake).prefetching = mock.PropertyMock(side_effect=_Stop)
+    fake.prefill_chunk_size = 0
+    fake.is_moe = True
+    fake.speculator = None
+    fake.draft_tokens = 0
+    fake._decode_stats_reset = False
+    fake._moe_blocks = []
+    fake._batch_decode_active = False
+    fake._chunk_major_lens = None
+    fake._elastic_tier = None
+    fake._active_attn_impl = "flash_attention_2"
+    fake.running_device = "cpu"
+    fake.running_dtype = torch.float32
+    fake.max_seq_len = 64
+    fake._position_ids_cache_key = None
+    fake._rope_cache_key = None
+    fake._token_count = 0
+    fake._expert_cache = mock.MagicMock()
+    fake.profiling_mode = False
+    fake._fwd_executor = mock.MagicMock()
+    fake.layers = []
+    fake._moe_shard_names_cache = (fake._moe_blocks, frozenset())
+    fake._expert_vram_cache = mock.MagicMock()
+    rebases = []
+    fake._rebase_expert_tier = lambda: rebases.append(1)
+    monkeypatch.setattr(torch, "arange", lambda *a, **k: torch.zeros(1, 1, dtype=torch.long))
+
+    def _pass(n_tokens):
+        try:
+            VaayuBaseModel.forward(fake, input_ids=torch.zeros(1, n_tokens, dtype=torch.long))
+        except _Stop:
+            return
+        raise AssertionError("forward did not reach the halt point")
+
+    _pass(8)                       # prefill: no re-base
+    assert rebases == []
+    for _ in range(5):             # decode passes of the same request
+        _pass(1)
+    assert len(rebases) == 1
+    _pass(8)                       # the next request's prefill re-arms the latch
+    for _ in range(3):
+        _pass(1)
+    assert len(rebases) == 2
