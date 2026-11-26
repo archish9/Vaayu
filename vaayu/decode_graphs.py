@@ -615,11 +615,15 @@ class DecodeGraphRunner:
             del exc, capture                              # must END before stock runs
         why, mem = failed
         _restore(cache, before)
+        # Refused BEFORE the reference, as this path always did (it used to call
+        # `_refuse` here): if the reference runs out of memory anyway, the layer is
+        # still on record and the `capture failed: ...` WARNING is still in the
+        # logs/run-*/ folder the user mails in -- which is the one case where that
+        # stage-1 reason matters most.
+        self._refuse_only(name, why, transient=mem)
         if mem:
             self._make_room()          # see `_checked`: BEFORE the reference, not after
-        ref = layer(seq, **kwargs)
-        self._refuse_only(name, why, transient=mem)
-        return ref
+        return layer(seq, **kwargs)
 
     def _make_room(self):
         """Room for the eager reference `_checked` / `_guarded` are about to run,
@@ -641,14 +645,29 @@ class DecodeGraphRunner:
         ONCE per request, not once per layer: the re-base prints a line on every
         call, including when it changes nothing, and that log is the artifact users
         mail in; this also bounds the belt to one `mem_get_info` per request. The
-        flag clears where `_request_captures` does."""
+        flag clears where `_request_captures` does.
+
+        `stats["made_room"]` counts this belt FIRING, not room obtained: a model
+        with no re-base at all still records one.
+
+        Best-effort by design: making room is for the caller's reference, so the
+        class we are already handling here must not become a NEW raise site in
+        front of it -- a memory error from the re-base itself is dropped and the
+        reference still gets its try. Anything else propagates."""
         if self._made_room:
             return
         self._made_room = True
         self.stats["made_room"] += 1
         rebase = getattr(self._model, "_rebase_expert_tier", None)
-        if rebase is not None:
+        if rebase is None:
+            return
+        try:
             rebase()
+        except Exception as exc:
+            if not _is_memory_error(exc):
+                raise
+            del exc                    # as everywhere on this path: its traceback is
+                                       # itself memory the reference is about to want
 
     def _refuse(self, name, layer, seq, kwargs, why):
         self._refuse_only(name, why)

@@ -3,6 +3,7 @@
 matters: the runner's output and cache state are BITWISE the stock forward's, token
 after token, through captures, replays, recaptures and refusals."""
 import gc
+import sys
 import types
 import weakref
 
@@ -936,7 +937,15 @@ def test_checked_makes_room_before_the_eager_reference(spec, capsys):
     raised in `build_exl3_qmatrix`). So the belt makes room BETWEEN the restore and
     that reference, and the reference still runs exactly ONCE -- running it twice
     would be a third execution of the layer, which corrupts every cache family
-    (I4). The ORDER assertion is what pins that: rebase, then eager."""
+    (I4). The ORDER assertion is what pins that: rebase, then eager.
+
+    The `sys.exc_info()` assertion inside the stub pins the OTHER half, the one
+    that makes the belt effective rather than merely non-fatal: the `except` block
+    must have ENDED before room is made and the reference runs. While a handler is
+    active CPython keeps the handled exception alive whatever is done with the
+    local name, and its traceback pins `_capture`'s frame -- so `cap`'s graphs and
+    `out` would still be holding the very device memory make-room is trying to
+    hand this call."""
     layers = _stack(spec)
     order = []
     model = _model(layers)
@@ -954,6 +963,7 @@ def test_checked_makes_room_before_the_eager_reference(spec, capsys):
                         position_embeddings=emb, position_ids=ids)
 
         def counting(seq, **kwargs):
+            assert sys.exc_info() == (None, None, None)   # the handler has ENDED
             order.append("eager")
             return layers[0](seq, **kwargs)
 
@@ -978,15 +988,31 @@ def test_checked_makes_room_before_the_eager_reference(spec, capsys):
 
 
 @cuda
-def test_make_room_runs_once_per_request(capsys):
-    """The re-base prints a line on every call, including when it changes nothing,
-    and that log is the artifact users mail in -- so a request whose capture fails
-    on many layers must make room ONCE, not once per layer. A new request arms it
-    again."""
+def test_make_room_is_once_per_request_and_best_effort(capsys):
+    """Three properties of make-room, over both belted paths and two requests.
+
+    ONCE per request: the re-base prints a line on every call, including when it
+    changes nothing, and that log is the artifact users mail in -- so a request
+    whose capture fails on many layers must make room once, not once per layer. A
+    new request arms it again.
+
+    BEST-EFFORT: the second request's re-base itself raises out-of-memory. Making
+    room is for the reference, so it must not become a new raise site in front of
+    it: the reference still runs and the request is still answered.
+
+    And the REFUSAL ORDER each path has always had: `_guarded` refuses before
+    running stock (so a reference that runs out of memory anyway still leaves the
+    layer and its WARNING on the record), `_checked` after."""
     layers = _stack(SPECS["hybrid"])
     model = _model(layers)
     calls = []
-    model._rebase_expert_tier = lambda: calls.append(1)
+
+    def _rebase():
+        calls.append(1)
+        if len(calls) == 2:            # the second request's re-base fails for want of memory
+            raise torch.OutOfMemoryError("CUDA out of memory. Tried to allocate 20.00 MiB")
+
+    model._rebase_expert_tier = _rebase
     runner = dg.install_decode_graphs(model)
 
     def oom_capture():
@@ -994,7 +1020,10 @@ def test_make_room_runs_once_per_request(capsys):
 
     with torch.inference_mode():
         xs, cos, sin, pos = _inputs(2)
-        for t, names in enumerate((("l0", "l1"), ("l2",))):     # two requests
+        # (name, the belted path, whether that path has refused BEFORE it runs stock)
+        plan = ((("l0", runner._checked, False), ("l1", runner._guarded, True)),   # request 1
+                (("l2", runner._checked, False),))                                 # request 2
+        for t, entries in enumerate(plan):
             cache = _cache(3)
             assert not runner.begin_forward(batch=[torch.zeros(1, 4)], past_key_values=cache,
                                             output_hidden_states=False)
@@ -1003,8 +1032,12 @@ def test_make_room_runs_once_per_request(capsys):
             kw = dict(use_cache=True, past_key_values=cache,
                       position_embeddings=(cos[:, t:t + 1], sin[:, t:t + 1]),
                       position_ids=pos[:, t:t + 1])
-            for i, name in enumerate(names):
-                assert runner._checked(name, layers[i], xs[t], kw, oom_capture) is not None
+            for i, (name, path, refused_first) in enumerate(entries):
+                def stock(seq, _n=name, _i=i, _first=refused_first, **kwargs):
+                    assert (_n in runner._refused) is _first      # the order, both ways
+                    return layers[_i](seq, **kwargs)
+
+                assert path(name, stock, xs[t], kw, oom_capture) is not None
             assert len(calls) == t + 1           # once in this request, however many layers
     assert len(calls) == 2 and runner.stats["made_room"] == 2
     # all three refusals carry the same reason, so the WARNING is printed once (existing dedupe)
