@@ -78,8 +78,14 @@ Status keys: `[ ]` pending · `[~]` in progress · `[!]` blocked · `[bug]` open
 Protocol: `CLAUDE.md` §6 (this ledger), §7 (all plans / RESULTS go in `docs/`, gitignored — so every row carries its
 own numbers), §8 (every change must reach the server; say if it is banked).
 
-**Suite floor (CURRENT, measured 2026-11-25 at the tip of `d1-host-ram-ceiling`): `4304 passed, 92 skipped,
-0 failed`** (361.36 s, `./venv/bin/python -m pytest -q`), reconciled **4396 collected** = D1 Task 1's 4384
+**Suite floor (CURRENT, measured 2026-11-26 on `main` at `8cbad32`, the D2 merge): `4323 passed, 92 skipped,
+0 failed`** (371.92 s on the merged tree, `./venv/bin/python -m pytest -q`), reconciled **4415 collected** =
+the 4396 below + 19, every one of them in the only three test files `d2-tier-margin` touched
+(`git diff --stat 1278cab..8cbad32 -- tests/`): `test_vram_plan.py` 139 -> 152, `test_moe_geometry.py` 4 -> 9,
+`test_budget_sites_cgroup_aware.py` 3 -> 4 (146 -> 165 collected across the three; re-collected per file
+2026-11-26, not assumed).
+Previous floor, for the record: `4304 passed, 92 skipped,
+0 failed` (361.36 s, 2026-11-25 at the tip of `d1-host-ram-ceiling`), reconciled **4396 collected** = D1 Task 1's 4384
 at `c525e29` + 12, every one of them in the only four test files this branch touches
 (`git diff --stat c525e29..HEAD -- tests/`): `test_fp8_prefix_cache_moves.py` 3 -> 8,
 `test_hybrid_attention_cache.py` 43 -> 45, `test_prefix_cache.py` 42 -> 46, `test_windowed_kv.py` 35 -> 36
@@ -125,6 +131,50 @@ of them by name (e.g. `ATTN-AB`'s `sdpa` +2.2 %) — look there, not in git.
 ## [bug] COLD-FIRST-LONG-PREFILL-OOM — **the FIRST request after boot, at 21,551 tokens, CUDA-OOM'd at `MAX_SEQ_LEN=32768`; the same prompt succeeds once the server is warm**
 
 **BUILD DOC (self-contained, build it cold):** `docs/superpowers/specs/2026-11-25-D2-cold-first-long-prefill-oom-design.md` — **D2 of 8.** **This row is Rudra's R1 release signal** (handoff §16.3): R1 ships when Vaayu reports a cold long first request is safe, NOT when HOST-RAM-CEILING lands.
+
+> **START HERE, NEXT SESSION ON THIS ROW (pre-gathered 2026-11-26; the margin half is MERGED and CLOSED,
+> only the COLD cell is open).** Scope: the cold cell alone. Do not re-open, re-measure or re-design the
+> tier margin — it is on `main` at `8cbad32` and the warm cell is 6/6 at the shipped default.
+>
+> **The one failure to explain** (`run-2026-11-25T14-56-06Z`, full detail in the `[bug]` bullet below and in
+> commit `10d7e2f`'s message): one boot, flash, pinned `MAX_SEQ_LEN=32768`, `PREFIX_COMPRESS=None`, ONE
+> 21,550-token request as the very first request. The 43-chunk prefill COMPLETES; the OOM is on the FIRST
+> DECODE forward, inside decode-graph capture, at `build_exl3_qmatrix` on `model.layers.36`: **20.00 MiB
+> wanted, 37.75 MiB free, 13.93 GiB allocated, 944.04 MiB reserved-but-unallocated.** Not prefill, not host
+> RAM (`peak_rss_gb` 14.25 against a 28 GiB cap, PSI 0.00), not H1, not the expert tier being too small.
+>
+> **Three candidate mechanisms, none yet priced. Rank them with numbers before building anything:**
+> 1. **The tier fills inside the running request's own reserve.** The first decode token re-grows the tier
+>    (`vram=0hit/344miss/0evict`) and the host arena goes `0.00GB/9.12GB` -> `4.41GB/9.12GB` on that same
+>    token. `vaayu/elastic_tier.py` already encodes "size the tier to the request that is running", but it is
+>    **OFF on MiniMax** because decode graphs own the pool — so the rules exist and the wiring does not.
+>    This is the mechanism the row has named as primary; it has not been measured.
+> 2. **Decode-graph capture is itself the peak.** `decode_graphs.py:550 _checked` runs the captured step AND
+>    (`:553`) an eager reference of the same layer, and capture allocates into a private pool. A peak that
+>    only exists during capture would be invisible to any plan that prices steady-state decode.
+> 3. **Fragmentation.** 944 MiB reserved-but-unallocated here against only **113-139 MiB** in the warm
+>    failures — so the cold path carries a component the warm one did not. PyTorch's own suggestion in the
+>    traceback is `expandable_segments:True`; `cuda_allocator_partial_free` (memory) says that allocator
+>    returns VRAM only in fully-free 20 MiB units, which is the same unit as the failing request.
+>
+> **Hard constraints, all of them already paid for:** (a) do NOT buy this cell by growing the margin — that
+> trades Rudra's decode throughput against an unnamed mechanism, and handoff §18.3 has already promised them
+> we would not; (b) do NOT change what `max_seq_len` advertises or the pinned-config boot dies on exit 3;
+> (c) MiniMax is one of only TWO covered MoE forwards, so anything built here must hold on fused-EXL3
+> (Qwen3.6-35B) too, and CLAUDE.md §5 forbids a model number in the fix; (d) **one change per measured run.**
+>
+> **Reproduction, ready to run:** `docs/superpowers/specs/2026-11-25-D2-artifacts/d2_cold.py` (it is
+> `d2_arm.py` with the warm-up and session loops removed; prompt byte-identical to the warm arm's). GPU work
+> runs FOREGROUND (`gate_scope_and_reaper`). **`requests.jsonl` is the only oracle — the driver's own stdout
+> LIES**, because its first-content test matches an SSE heartbeat chunk and once reported 6/6 while 5 of 6
+> sessions had died. n=1 today; the cell is deterministic so far but has never been repeated.
+>
+> **Two cells still unrun that bear on this:** the cold request at `PREFIX_COMPRESS=9` (packing has carried
+> every warm arm, so it may carry this one and would locate the mechanism), and anything under **sdpa** —
+> whose `S_max` (~26.1-26.6k) refuses the pinned 32768, so it needs a config decision, not just a run.
+> **Standing confound:** rustdesk (pid 426218) held **148.32 MiB** of GPU memory through the failing run,
+> named in the OOM text — 148 MiB against a 37.75 MiB margin. Decide whether to kill it and say which way
+> the arm ran.
 
 Found 2026-11-24 as a confound while running HOST-RAM-CEILING's A/B, and it is a separate defect.
 
@@ -355,7 +405,19 @@ both wrong, and are corrected in the doc. The derivation stays (CLAUDE.md §5 fo
 numbers, and it binds on a big-expert checkpoint) but it is **inert today** and must not be cited as the thing
 that works.
 
-- [x] **Margin built + merged on branch, warm cell FIXED** (above).
+- [x] **Margin built, warm cell FIXED, and MERGED TO `main` 2026-11-26 as `8cbad32`** (`--no-ff`, matching
+      D1's merge style); branch `d2-tier-margin` deleted at `9e73cfb`. Suite on the MERGED tree:
+      `4323 passed, 92 skipped, 0 failed` (371.92 s) — the floor line above. **Re-audited against disk and
+      the raw logs 2026-11-26 before merging, nothing taken from an earlier session's word:** the two
+      margined call sites' enclosing guards re-derived (the real tier-sizing site at `vaayu_base.py:3625-3638`
+      is inside `if self.running_device.startswith("cuda") and self.is_moe:` at `:3271`, so dense never
+      reaches it; the derivation + plan print at `:3086-3101` is under the CUDA-only guard, so a DENSE CUDA
+      load does derive and print `tier margin=` — verified cosmetic, `_expert_budget_planned` is read at
+      exactly one line, `:3101`'s print, and nowhere else); `self._expert_offset_index = None` at `:2841`
+      precedes its use at `:3092`, so dense cannot `AttributeError`; the two injection-group figures
+      RE-MEASURED off the engine's real `splitted_model/` checkpoints (2.821 MiB / 0.755 MiB, floor binds
+      both); and the 1/6 -> 6/6 and cold-failure cells re-derived from `requests.jsonl` + the raw traceback.
+      **Not pushed** — `main` is 14 commits ahead of `origin/main`.
 - [bug] **THE COLD FIRST LONG REQUEST STILL FAILS, so this row is NOT closed and R1 STAYS HELD.**
       `run-2026-11-25T14-56-06Z`: one boot, flash, pinned 32768, `PREFIX_COMPRESS=None`, ONE 21,550-token
       request as the very first request, no warm-ups -> `finish: error`, `tokens: 0`, `ttft_s` 125.6 (which is
