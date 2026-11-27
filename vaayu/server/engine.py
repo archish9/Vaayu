@@ -331,6 +331,15 @@ class EngineHandle:
                 # admission queue.
                 set_current_session(session_key)
                 try:
+                    # D2: hand back the tier re-base's outstanding cut at the
+                    # request boundary. A request with no prefill pass (a 100%
+                    # prefix hit decodes its one position) never reaches the
+                    # `forward` hook, which stays for library callers. Relative
+                    # and a no-op when nothing is outstanding; admission's own
+                    # cap runs after this and still wins.
+                    refund = getattr(self.model, "_refund_expert_tier", None)
+                    if callable(refund):
+                        refund()
                     yield
                 finally:
                     # The slot must outlive the generation on EVERY exit path.

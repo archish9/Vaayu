@@ -153,6 +153,7 @@ def test_layer_range_still_returns_none_when_the_batch_working_set_fits():
 # ── D2: re-base the expert tier at the prefill->decode boundary ─────────────
 # CPU-only: a fake tier, a bare engine object, a monkeypatched torch.cuda.
 
+import pytest
 import torch
 
 MiB = 1024 ** 2
@@ -569,3 +570,92 @@ def test_forward_refunds_only_on_the_first_prefill_pass_of_a_request(monkeypatch
     _pass(8)                       # ...its second prefill pass must NOT call it again
     _pass(8)
     assert len(refunds) == 1
+
+
+# ── D2 task 5c: the same refund at the server's request boundary ────────────
+# `engine.py`'s slot() is the true one-at-a-time gate. A request whose prompt
+# extends cached KV by <=1 token has NO prefill pass (its single position runs
+# as a decode pass), so `forward`'s refund never fires for it and a cut latches.
+
+def _run_slot(model):
+    import asyncio
+    from vaayu.server.engine import EngineHandle
+
+    async def main():
+        if not hasattr(model, "_vram_plan"):
+            model._vram_plan = object()          # skip the CPU-fallback warning
+        e = EngineHandle(model)
+        async with e.slot():
+            pass
+    asyncio.run(main())
+
+
+def test_slot_entry_refunds_an_outstanding_cut(monkeypatch):
+    GiB = 1024 ** 3
+    tier = _FakeTier(usage=0, budget=1 * GiB)
+    _patch_free(monkeypatch, free=8 * GiB)
+    m = _fake_model(tier=tier, planned=3 * GiB)
+    m._rebase_cut = 2 * GiB
+    _run_slot(m)
+    assert tier.budget_bytes == 3 * GiB and m._rebase_cut == 0
+
+
+def test_slot_refund_is_relative_not_absolute(monkeypatch):
+    GiB = 1024 ** 3
+    tier = _FakeTier(usage=0, budget=1 * GiB - 500 * MiB)   # cut, then charged/capped
+    _patch_free(monkeypatch, free=8 * GiB)
+    m = _fake_model(tier=tier, planned=3 * GiB)
+    m._rebase_cut = 2 * GiB
+    _run_slot(m)
+    assert tier.budget_bytes == 3 * GiB - 500 * MiB != 3 * GiB
+
+
+def test_slot_refund_is_a_noop_with_nothing_outstanding(monkeypatch):
+    GiB = 1024 ** 3
+    tier = _FakeTier(usage=0, budget=3 * GiB)
+    _patch_free(monkeypatch, free=8 * GiB)
+    m = _fake_model(tier=tier, planned=3 * GiB)
+    m._rebase_cut = 0
+    _run_slot(m)
+    assert tier.set_budget_calls == []
+
+
+def test_slot_refund_is_a_noop_without_cuda_tier_or_with_elastic(monkeypatch):
+    GiB = 1024 ** 3
+    # no CUDA
+    tier = _FakeTier(usage=0, budget=1 * GiB)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    m = _fake_model(tier=tier, planned=3 * GiB)
+    m._rebase_cut = 2 * GiB
+    _run_slot(m)
+    assert tier.set_budget_calls == [] and m._rebase_cut == 2 * GiB
+    # no tier (dense)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    m = _fake_model(tier=None)
+    m._rebase_cut = 2 * GiB
+    _run_slot(m)
+    # elastic tier owns the budget
+    tier = _FakeTier(usage=0, budget=1 * GiB)
+    m = _fake_model(tier=tier, planned=3 * GiB)
+    m._elastic_tier = object()
+    m._rebase_cut = 2 * GiB
+    _run_slot(m)
+    assert tier.set_budget_calls == [] and m._rebase_cut == 2 * GiB
+
+
+def test_a_request_with_no_prefill_pass_still_gets_its_cut_refunded(monkeypatch):
+    """The point of 5c: no `forward` prefill pass ever runs here -- only slot()."""
+    GiB = 1024 ** 3
+    tier = _FakeTier(usage=0, budget=1 * GiB)
+    _patch_free(monkeypatch, free=8 * GiB)
+    m = _fake_model(tier=tier, planned=3 * GiB)
+    m._rebase_cut = 2 * GiB
+    m.forward = lambda *a, **k: pytest.fail("a prefill pass ran")
+    _run_slot(m)
+    assert m._rebase_cut == 0 and tier.budget_bytes == 3 * GiB
+    _run_slot(m)                                  # idempotent: second request refunds nothing
+    assert tier.set_budget_calls == [3 * GiB]
+
+
+def test_slot_tolerates_a_model_without_the_helper():
+    _run_slot(type("M", (), {})())
