@@ -663,3 +663,134 @@ def test_a_request_with_no_prefill_pass_still_gets_its_cut_refunded(monkeypatch)
 
 def test_slot_tolerates_a_model_without_the_helper():
     _run_slot(type("M", (), {})())
+
+
+# ── D2 (c): a failed request must not poison the next admission ─────────────
+
+class _CardLoader:
+    """A streamed layer's weights cost VRAM from inject_to_gpu until free_from_gpu --
+    which, in the real loop, sits AFTER the compute and so is skipped by a raise."""
+
+    def __init__(self, card, layer_bytes):
+        self.card, self.layer_bytes = card, layer_bytes
+
+    def inject_to_gpu(self, model, layer_name, sd, device, dtype, quantizer, remap):
+        self.card["allocated"] += self.layer_bytes
+        return [layer_name]
+
+    def free_from_gpu(self, model, layer, moved, quantizer):
+        self.card["allocated"] -= self.layer_bytes
+
+
+def _poison_setup(monkeypatch, geometry, *, persistent=True):
+    """A model whose real forward streams one layer that OOMs (EVERY attempt unless
+    `persistent` is False), over a fake card; plus the real admission guard."""
+    import types
+    from tests.test_s33_host_edits import _Graphs, make
+    from vaayu.vram_plan import (VramShape, kv_bytes_per_token, score_elem_bytes)
+    kv_layers, kv_heads, head_dim, hidden, n_heads, vocab = geometry
+    shape = VramShape(
+        kv_per_token=kv_bytes_per_token(num_hidden_layers=kv_layers,
+                                        num_key_value_heads=kv_heads,
+                                        head_dim=head_dim, kv_cache_mode="bf16"),
+        N=1, chunk=512, hidden=hidden, n_heads=n_heads, vocab=vocab, elem_bytes=2,
+        score_elem_bytes=score_elem_bytes("sdpa"), alloc_factor=1.0,
+        kv_growth_factor=2, kv_capacity_buckets=True)
+    s_max = 32768
+    from vaayu.vram_plan import predict_peak_vram
+    reserve = predict_peak_vram(shape, s_max)
+    GiB_ = 1024 ** 3
+    card = {"total": 4 * GiB_ + 2 * reserve, "allocated": 0, "pool": 0}
+    # The weights of the layer being streamed: big enough that, still held, only
+    # half the plan's reserve is left -- the card cannot take its own max_seq_len.
+    layer_bytes = reserve + reserve // 2
+    card["allocated"] = 4 * GiB_                     # resident weights, always there
+
+    def _free():
+        return card["total"] - card["allocated"] - card["pool"]
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda *a, **k: (_free(), card["total"]))
+    monkeypatch.setattr(torch.cuda, "memory_reserved", lambda *a, **k: card["allocated"] + card["pool"])
+    monkeypatch.setattr(torch.cuda, "memory_allocated", lambda *a, **k: card["allocated"])
+
+    def _empty_cache():
+        card["pool"] = 0
+    monkeypatch.setattr(torch.cuda, "empty_cache", _empty_cache)
+
+    m = make(n_dec=2, pinned={"embed", "norm", "lm_head", "layers.0"}, graphs=_Graphs())
+    m.loader_strategy = _CardLoader(card, layer_bytes)
+    m.layer_names_dict["layer_prefix"] = "layers"
+    attempts = {"n": 0}
+
+    class _Boom:
+        layer_idx = 1
+
+        def __call__(self, seq, **kw):
+            attempts["n"] += 1
+            card["pool"] += 64 * MiB                 # the failed forward's cached blocks
+            if persistent or attempts["n"] == 1:
+                raise torch.cuda.OutOfMemoryError("CUDA out of memory. (test)")
+            return (seq + 1.0,)
+
+    m.layers[2] = m.dec[1] = _Boom()
+    m._vram_plan = types.SimpleNamespace(reserve_bytes=int(reserve), s_max=s_max)
+    m._vram_shape = shape
+    m._moe_geometry = {"expert_bytes": 8 * MiB}
+    m._expert_vram_cache = None                      # no tier: the dense shape
+    m._elastic_tier = None
+    m.device = "cuda"
+    return m, s_max, card
+
+
+_POISON_GEOMETRIES = {"minimax-like": (62, 8, 128, 3072, 48, 200064),
+                      "qwen3.6-like": (10, 2, 256, 2048, 16, 248320)}
+
+
+@pytest.mark.parametrize("geometry", sorted(_POISON_GEOMETRIES))
+def test_poison_a_failed_request_does_not_clamp_the_next_admission(monkeypatch, geometry):
+    """The failed request dies in a streamed layer's forward, BEFORE the loop's own
+    free_from_gpu. Without the release, that layer's weights stay on the card and the
+    next request is refused down to a small `max_seq_len` -- the planned context is
+    only reachable after the failure if the dying forward hands its VRAM back.
+
+    The OOM is injected on EVERY attempt, not once: the decode-graph belt absorbs a
+    one-shot memory failure, and the request would then serve and prove nothing."""
+    import re
+    from vaayu.vram_plan import VramPlanError
+    m, s_max, card = _poison_setup(monkeypatch, _POISON_GEOMETRIES[geometry])
+
+    assert m._assert_context_fits(s_max) is not None      # the plan's own context fits, fresh
+
+    with pytest.raises(RuntimeError) as err:
+        run_forward = __import__("tests.test_s33_host_edits", fromlist=["run"]).run
+        run_forward(m, new=1)
+    # the caller still gets the clean, original error
+    assert isinstance(err.value.__cause__, torch.cuda.OutOfMemoryError)
+    assert not isinstance(err.value, torch.cuda.OutOfMemoryError)
+    assert "CUDA OOM on layers.1. Not retried" in str(err.value)
+
+    try:
+        admitted = m._assert_context_fits(s_max)
+    except VramPlanError as e:
+        planned = int(re.search(r"max_seq_len=(\d+)", str(e)).group(1))
+        pytest.fail(f"the next request was clamped to max_seq_len={planned} "
+                    f"of a planned {s_max}")
+    assert admitted is not None
+    assert card["pool"] == 0                  # the allocator's cache was emptied too
+
+
+def test_poison_release_is_a_noop_off_cuda_and_without_a_tier(monkeypatch):
+    """CPU suite, no tier (dense): the error path must not touch either."""
+    from tests.test_s33_host_edits import make, run
+    m = make(n_dec=2, pinned={"embed", "norm", "lm_head", "layers.0"})
+
+    class _Boom:
+        layer_idx = 1
+
+        def __call__(self, seq, **kw):
+            raise torch.cuda.OutOfMemoryError("CUDA out of memory. (test)")
+
+    m.layers[2] = m.dec[1] = _Boom()
+    with pytest.raises(RuntimeError, match="CUDA OOM on layers.1"):
+        run(m, new=1)

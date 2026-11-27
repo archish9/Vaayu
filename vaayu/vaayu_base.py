@@ -6091,6 +6091,28 @@ class VaayuBaseModel(GenerationMixin):
                   "nothing to evict, the tier stays at 0 for this request")
         return _new
 
+    def _release_failed_forward(self, held, batch) -> None:
+        """D2 (c): hand back what a forward that is dying still holds on the
+        device -- the streamed layer's weights (its `free_from_gpu` sits after the
+        compute, so a raise skips it), the hidden states, and the allocator's
+        cache. Best-effort and silent on failure: it runs while another error is
+        propagating and must never replace it. A no-op on CPU, and on a dense
+        model (no tier is touched here; the tier's budget is `_refund_expert_tier`'s)."""
+        try:
+            if held is not None:
+                _layer, _moved = held
+                self.loader_strategy.free_from_gpu(
+                    self.model, _layer, _moved, self.hf_quantizer)
+        except Exception as _e:            # noqa: BLE001
+            print(f"[Vaayu-VRAM] WARNING: releasing the failed layer's weights "
+                  f"raised {type(_e).__name__}: {_e}")
+        try:
+            batch.clear()
+            clean_memory()
+        except Exception as _e:            # noqa: BLE001
+            print(f"[Vaayu-VRAM] WARNING: emptying the allocator after a failed "
+                  f"forward raised {type(_e).__name__}: {_e}")
+
     def _refund_expert_tier(self) -> Optional[int]:
         """D2: hand the re-base's outstanding cut back at the FIRST prefill pass
         of a new request. Returns the budget set, or None when it did nothing
@@ -6489,6 +6511,10 @@ class VaayuBaseModel(GenerationMixin):
                 batch=batch, past_key_values=past_key_values,
                 output_hidden_states=output_hidden_states)
 
+            # D2 (c): the streamed layer whose weights this forward has put on the
+            # device and not yet taken off it -- (layer, moved_layers), or None.
+            # A request that dies mid-layer must hand it back (see the except below).
+            _held = None
             try:
                 for i, (layer_name, layer) in tqdm(enumerate(zip(self.layer_names, self.layers)),
                                                    desc=f'running layers({self.running_device})',
@@ -6611,6 +6637,7 @@ class VaayuBaseModel(GenerationMixin):
                             self.profiler.add_profiling_time('create_layer_from_safe_tensor', elapsed_time)
 
                     # Run layer
+                    _held = None if _layer_pinned else (layer, moved_layers)
 
                     for j, seq in enumerate(batch):
 
@@ -6738,6 +6765,7 @@ class VaayuBaseModel(GenerationMixin):
                         self.loader_strategy.free_from_gpu(
                             self.model, layer, moved_layers, self.hf_quantizer
                         )
+                    _held = None
 
                     # No per-layer record for a VRAM-resident layer on a forward
                     # that is ELIGIBLE for decode graphs (one token, N=1): every
@@ -6763,6 +6791,20 @@ class VaayuBaseModel(GenerationMixin):
                     # per-token empty_cache() defeats the CUDA caching allocator.
                     if self._token_count == 0 and i % 40 == 39:
                         clean_memory()
+            except BaseException:
+                # D2 (c): a request that dies mid-forward -- the layer-OOM raise
+                # above, a cancellation, anything -- must not leave the device
+                # holding what it was using, or the NEXT request is admitted
+                # against a card that looks full (measured on the cold cell: "the
+                # largest context that fits RIGHT NOW is max_seq_len=8192", from a
+                # planned 32768). The exception's traceback keeps this frame's
+                # locals alive for as long as anyone holds it, so drop them here.
+                # Releases only: the layer is NOT re-run and the KV cache is NOT
+                # truncated (I4) -- the original error propagates unchanged.
+                seq = layer_out = kwargs = _mask_args = _base = None
+                _kw_base.clear()
+                self._release_failed_forward(_held, batch)
+                raise
             finally:
                 if getattr(self, "_prefill_stager_active", False):
                     self._prefill_stop.set()
