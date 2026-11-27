@@ -480,10 +480,20 @@ class BatchScheduler:
             # request gate (P10: `slot()` has no production caller; this is the
             # lock every served request, batched or serial, passes through). A
             # request with no prefill pass never reaches `forward`'s hook.
-            # Synchronous, relative, a no-op when nothing is outstanding.
+            # Synchronous, relative, a no-op when nothing is outstanding, and
+            # best-effort: it can never fail a request.
             refund = getattr(self.engine.model, "_refund_expert_tier", None)
             if callable(refund):
-                refund()
+                try:
+                    refund()
+                except Exception as exc:     # noqa: BLE001 -- best-effort by design
+                    # A tier refund must never fail a request: the serial N=1
+                    # path below has no `try`, so a raise here would escape
+                    # `_run` past `_run_serial`'s report-to-client handling.
+                    # Same idiom as the re-base in decode_graphs._guarded --
+                    # caught, named, carried on; never silent.
+                    print(f"[Vaayu-VRAM] tier refund skipped "
+                          f"({type(exc).__name__}: {exc}); the request proceeds.")
             try:
                 # THE RULE. A batch of one must NEVER reach batched_generate --
                 # 3.24x regression on Qwen (573.88s vs 177.14s). This is the

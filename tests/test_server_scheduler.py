@@ -952,3 +952,24 @@ def test_the_scheduler_refund_is_a_noop_with_nothing_outstanding(monkeypatch):
 
 def test_the_scheduler_tolerates_a_model_without_the_helper(monkeypatch):
     _run_one_job_through_scheduler(RecordingModel(), monkeypatch)
+
+
+def test_a_raising_refund_cannot_fail_the_request(monkeypatch, capsys):
+    """The serial N=1 path has no `try` in `_run`: a refund that raised would
+    escape the scheduler task and strand the job. It must be swallowed with one
+    named line, and the generation must still run."""
+    from tests.test_vram_budget import _FakeTier, _fake_model, _patch_free
+    GiB = 1024 ** 3
+    tier = _FakeTier(usage=0, budget=3 * GiB)
+    _patch_free(monkeypatch, free=8 * GiB)
+    m = _fake_model(tier=tier, planned=3 * GiB)
+    m._vram_plan = object()
+
+    def _boom():
+        raise RuntimeError("set_budget exploded")
+    m._refund_expert_tier = _boom
+    ran = []
+    _run_one_job_through_scheduler(m, monkeypatch,
+                                   on_generate=lambda: ran.append(1))
+    assert ran == [1]
+    assert "tier refund skipped (RuntimeError: set_budget exploded)" in capsys.readouterr().out

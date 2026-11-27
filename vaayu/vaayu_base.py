@@ -6102,8 +6102,13 @@ class VaayuBaseModel(GenerationMixin):
         half-size tier, since prefill routes ~every expert and every miss is a
         disk read. Measured on MiniMax-M2.7 at 21,551 tokens: refunding only at
         the NEXT boundary (too late) cost warm TTFT 129.22 -> 219.05 s mean over
-        six sessions, with budget-vs-TTFT Spearman -0.9856 and
-        misses -> bytes -> TTFT r = 1.000 / 0.997; decode was unaffected.
+        six sessions, with budget-vs-TTFT Spearman -0.9856 (pooled RANK
+        correlation over all six sessions) and misses -> bytes -> TTFT
+        r = 1.000 / 0.997 (Pearson, linear); decode was unaffected. (The
+        Pearson -0.9978 quoted in the evidence document is budget-vs-TTFT
+        within the five CUT sessions only, n=5 over four distinct budgets, with
+        budget confounded with session order: the causal evidence is the
+        `8cbad32` control plus warm3's recovery, not either coefficient.)
         Refunding here is `8cbad32`'s proven warm behaviour (full budget through
         every prefill, 6/6 served over eighteen sessions) plus the cold
         protection, since the boundary still cuts afterwards.
@@ -6115,9 +6120,11 @@ class VaayuBaseModel(GenerationMixin):
         no longer has (S19 vi).
 
         LIMITATION: a request with no prefill pass at all -- a 100% prefix hit
-        runs its single position as a DECODE pass -- never reaches this hook, so
-        a cut persists across it. Same latch limitation already recorded for the
-        re-base itself; not chased here."""
+        runs its single position as a DECODE pass -- never reaches THIS hook.
+        This hook serves library callers; the server's gates cover that case:
+        `BatchScheduler._run` (the live gate every served request passes) and
+        `EngineHandle.slot()` (public API, no production caller) both call the
+        refund before the generation, whether or not a prefill pass follows."""
         tier = getattr(self, "_expert_vram_cache", None)
         _cut = int(getattr(self, "_rebase_cut", 0) or 0)
         if (tier is None or _cut <= 0 or not torch.cuda.is_available()

@@ -374,7 +374,10 @@ def test_forward_rebases_exactly_once_per_request(monkeypatch):
 # starves request N+1's PREFILL -- the one phase that cannot afford a half-size
 # tier. Measured on MiniMax-M2.7 at 21,551 tokens (6 warm sessions, `d1-warm2`
 # against the pre-fix control `d1-base8c` at 8cbad32): warm TTFT 129.22 ->
-# 219.05 s mean (1.70x), budget-vs-TTFT Spearman -0.9856, misses-vs-bytes
+# 219.05 s mean (1.70x), budget-vs-TTFT Spearman -0.9856 (pooled rank over all
+# six sessions; the Pearson -0.9978 is within the five cut sessions only, n=5,
+# budget confounded with session order -- causation rests on the `8cbad32`
+# control + warm3's recovery), misses-vs-bytes
 # r = 1.000, bytes-vs-TTFT r = 0.997, decode unaffected (0.6397 vs 0.6441).
 # Session 1 was unchanged at 0.97x -- the signature, since no cut exists yet.
 
@@ -573,7 +576,8 @@ def test_forward_refunds_only_on_the_first_prefill_pass_of_a_request(monkeypatch
 
 
 # ── D2 task 5c: the same refund at the server's request boundary ────────────
-# `engine.py`'s slot() is the true one-at-a-time gate. A request whose prompt
+# `engine.py`'s slot() is public API with NO production caller (P10); the live
+# gate is `BatchScheduler._run` (task 5d). A request whose prompt
 # extends cached KV by <=1 token has NO prefill pass (its single position runs
 # as a decode pass), so `forward`'s refund never fires for it and a cut latches.
 
