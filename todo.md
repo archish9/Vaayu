@@ -78,10 +78,11 @@ Status keys: `[ ]` pending · `[~]` in progress · `[!]` blocked · `[bug]` open
 Protocol: `CLAUDE.md` §6 (this ledger), §7 (all plans / RESULTS go in `docs/`, gitignored — so every row carries its
 own numbers), §8 (every change must reach the server; say if it is banked).
 
-**Suite floor (CURRENT, measured 2026-11-27 on branch `d2-cold-cell` at `e376fd9`): `4382 passed, 92 skipped, 0 failed`**
-(**4474 collected**), from the `4323 passed, 92 skipped / 4415 collected` floor at `main` `8cbad32` below: +59 passed, +59 collected,
-the new tests of the D2 cold-cell branch (`git diff --stat 8cbad32..e376fd9 -- tests/`). Reconcile by collected count at each commit.
-Gates were NOT all re-run at this commit: dense 70B and fused-EXL3 last at `1849878`, dense 1B at `416a31c` (row `COLD-FIRST-LONG-PREFILL-OOM`).
+**Suite floor (CURRENT, measured 2026-11-27 on branch `d2-cold-cell` at `d0dcfc7`): `4394 passed, 92 skipped, 0 failed`**
+(**4486 collected**, 382.20 s), from the `4323 passed, 92 skipped / 4415 collected` floor at `main` `8cbad32` below: +71 passed,
++71 collected, every one of them a new test of the D2 cold-cell branch (`git diff --stat 8cbad32..d0dcfc7 -- tests/`).
+Reconcile by collected count at each commit. **All three gates WERE re-run at the final-wave HEAD** — see the closed
+row's gates bullet below (dense 1B 6/6 ppl 11.90, dense 70B 6/6 ppl 8.87, fused-EXL3 3/3 ppl 5.98).
 Previous floor, for the record: `4323 passed, 92 skipped,
 0 failed` (371.92 s on the merged tree, `./venv/bin/python -m pytest -q`), reconciled **4415 collected** =
 the 4396 below + 19, every one of them in the only three test files `d2-tier-margin` touched
