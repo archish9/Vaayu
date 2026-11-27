@@ -292,8 +292,9 @@ speculative path is the one every dense load takes. Nothing here is banked.
       **(i) is the honest fix and does not cost the 0.7 s/hit or any output bits; (ii) is the cheap
       one.** Not model-specific: derive it (section 5).
 - [x] **Task 2 DONE 2026-11-25 (`cbb1bf4`)** — park unpinned. Both `pin_memory()` sites gone plus a THIRD
-      the brief's grep missed: `windowed_kv.py:186` allocated with `pin_memory=pin`, so `pin_memory()` with
-      parens never matched it. Task 2a landed in the same commit and is load-bearing, not hygiene: verified
+      the brief's grep missed: `windowed_kv.py:315` allocated with `pin_memory=pin`, so `pin_memory()` with
+      parens never matched it (**line corrected 2026-11-27: this row said `:186`, which is not the site;
+      `git show cbb1bf4^:vaayu/windowed_kv.py | grep -n pin` puts it at 315**). Task 2a landed in the same commit and is load-bearing, not hygiene: verified
       on this box (torch 2.11.0+cu130) that `.to('cpu', non_blocking=True).is_pinned()` is **True** — an
       async D2H ALLOCATES A PINNED DESTINATION, so dropping `.pin_memory()` alone would have left recurrent
       state pinned anyway. Suite `4294 passed, 92 skipped, 0 failed`, 4386 collected.
@@ -301,14 +302,45 @@ speculative path is the one every dense load takes. Nothing here is banked.
       a request that OMITS `stream` now returns `text/event-stream`, with `ttft_s` populated (11.47) and a
       `wire` block. `ttft_s` is recorded only on the streaming path (`server/engine.py:757-978`), so this
       unblocks every later TTFT measurement on this row.
-- [!] **Task 3 PARTIAL 2026-11-25 — the host-RAM claim is PROVED (see the fix-shape line above), but §4's
-      `>= 6 sessions` bar is NOT met and is NOT reachable on this row.** 1 of 10 served; a reproduction run
-      served 0 of 3. What stops it is **VRAM, not host RAM** — see `[bug]` PREFIX-PARK-DEVICE-ALLOC below
-      and the D2 row. Unblocks when D2 does. Tasks 4 (prefix-HIT restore pricing, ABBA) and 5 (the
-      load-time budget warning) are blocked behind the same thing: both need several long sessions to
-      survive in one boot.
+- [x] **Task 3 ATTEMPT 2 ACCEPTED 2026-11-27 — 10 of 10 sessions served at `PREFIX_COMPRESS=None`** (bar was
+      >= 6; unblocked by D2's closure the same day). Run folder `logs/run-2026-11-27T11-32-46Z`; artifacts
+      (`d1-a.csv`, `d1-a.json`, `preflight.json`, `driver.log`, and `task3-attempt2-RESULTS.md`) in
+      `docs/superpowers/specs/2026-11-25-D1-artifacts/` (`prompts-a.json`, 555 KB of filler, deliberately
+      not kept). Cell: `flash_attention_2`, `MAX_SEQ_LEN=32768`, `PREFIX_COMPRESS=None`, `PREFIX_SESSIONS=3`,
+      MiniMax-M2.7 EXL3, under `systemd-run --user --scope -p MemoryMax=28G` (`memory.max` 30,064,771,072).
+      4 warm-ups + 10 x 21,550-token distinct sessions, all status 200, `finish: length`, no error.
+      **Measured:** `shmem` 6.46 GB at t+19 s, then FLAT from t+20 s — spread 4,096 B (one page), never drops,
+      minimum 11,941,183,488 B (the expert arena alone). Peak `memory.current` **25,846,784,000 B (25.85 GB)**
+      at t+406 s against the 30.06 GB cap = **4.2 GB of margin**. Swap peak 0.87 GB; PSI some avg10 max 0.36.
+      **Zero** cgroup `oom-kill` and zero `oomd` in BOTH the user and system journals; zero `OutOfMemory`,
+      `VramPlan` or `Traceback` in `server.log`. Parked entry measures **+5.515 GB** of `anon` at `d1-a-0`
+      (per-request `memory.stat`), agreeing with the planner's **5.48 GB** entry figure; `anon` then settles
+      6.96-7.05 GB through session 9. This boot's plan: reserve 8.56 GiB, pinning 4.01, expert ceiling 5.95,
+      prefix budget 10.80 GB, elastic tier OFF (decode graphs installed); the page cache could not be evicted
+      (no root), so the budget is this boot's, not a constant. One `[Vaayu-Prefix] WARNING: prefix pool over
+      capacity`, at `d1-a-1`'s store. Reference, the 2026-11-24 arms this replaces: `PREFIX_COMPRESS=9`
+      served 6, peak 27.54 GB, survived; `PREFIX_COMPRESS=None` pinned served **2**, peak 30.06 GB = the cap
+      exactly, `shmem` -> 29.90, `anon` -> 0.02, OOM-KILLED. Approach B (16 k fallback) was SKIPPED by its own
+      gate: it fires only on a VRAM stop and there was none.
+      **What this does NOT prove (carry these forward):** (1) the `prefix_hit: true` rows do NOT void the arm —
+      the match is 39-41 tokens of 21,550 (0.19 %), the shared chat-template header, not reuse; the server
+      prefilled 21,509 new positions and the +5.515 GB step proves a full-length entry was parked.
+      (2) **Growth past ONE resident entry is NOT proved.** Budget 10.80 GB against a 5.48 GB entry means the
+      pool holds one, and the over-capacity WARNING fired at `d1-a-1`; what IS demonstrated is ten
+      single-entry store -> evict -> store cycles at 32 k with `shmem` flat. This arm is NOT a like-for-like
+      improvement on the packed arm — budgets and plans differ. (3) **The per-entry byte question is widened,
+      not closed:** +8.32 GB pinned, +6.32 unpinned at 1 Hz, +5.51 unpinned per-request. The per-request /
+      planner agreement is consistent with the 1 Hz figures having been sampling artefacts but does not
+      establish it; the ~2.8 GB gap stays unexplained. **Task 5 must size its floor warning off the planner's
+      entry figure, not off a cgroup delta.** (4) **HIT-restore cost is UNMEASURED** — all ten sessions were
+      cold stores; that is Task 4, still open.
+      Earlier, attempt 1: the host-RAM claim was PROVED but the `>= 6` bar was not reachable (1 of 10 served;
+      a reproduction served 0 of 3) because VRAM, not host RAM, stopped it — see `[bug]` PREFIX-PARK-DEVICE-ALLOC
+      and the D2 row. Plan: `docs/superpowers/plans/2026-11-27-D1-task3-attempt2-host-ram-ab.md`.
+      **This row stays OPEN:** Task 4 (prefix-HIT restore pricing, ABBA) and Task 5 (the load-time budget
+      warning) remain, plus the open bullets below.
 - [ ] **Task 4 is probably measurable TODAY at `MAX_SEQ_LEN=16384`, so "blocked on D2" must not quietly
-      become permanent** (added 2026-11-25). 16 k is the window Rudra actually runs, the one the ~13,926-
+      become permanent** (added 2026-11-25). **UPDATE 2026-11-27: Task 3 is now done at 32 k (10/10, above) and D2 is closed, so Task 4 is the next item on this row.** 16 k is the window Rudra actually runs, the one the ~13,926-
       token chain and the ~3.3 GiB-per-entry figures above are quoted for, and the handoff's own advice is
       "stay at the 16 k window — we have not reproduced any of this at that size". Every failure that
       blocks Task 4 was measured at 32,768 with 21.5k-token requests. Prefix-HIT restore pricing is the

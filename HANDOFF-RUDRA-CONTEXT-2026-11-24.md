@@ -1793,6 +1793,17 @@ guess at it in a document you plan against.
 - Nothing here asks Rudra for work, a config change, or a reply.
 
 
+### 17.5 Update 2026-11-27: the shipped default (`PREFIX_COMPRESS = None`) is now safe on a 32 GB box without the machine-local line
+
+Measured with the shipped uncompressed default at `MAX_SEQ_LEN=32768`, after D2 closed (`logs/run-2026-11-27T11-32-46Z`):
+**10 of 10** distinct 21,550-token sessions served, `shmem` FLAT (spread one 4,096 B page, minimum 11.94 GB = the expert
+arena), peak `memory.current` 25.85 GB against a 30.06 GB cap (**4.2 GB** of margin), zero cgroup `oom-kill`, zero `oomd`.
+So the machine-local `PREFIX_COMPRESS` line is no longer needed for survival. **R1 was released by D2 (§19), not by this
+row** — nothing here re-holds it, and the old "R1 remains held on D2" text in D1's design doc is stale. Scope, so it is not
+over-read: this shows ten single-entry store -> evict -> store cycles (the 10.80 GB prefix budget holds one 5.48 GB entry),
+NOT multi-entry residency; and **HIT-restore cost is still unmeasured** (§17.1's ~5 % estimate stands as arithmetic;
+D1's Task 4 will price it).
+
 ## 18. The repeated-long-request failure is FIXED; the COLD first long request is NOT. R1 STAYS HELD.
 
 > **SUPERSEDED by §19 (2026-11-27):** the cold first long request is now FIXED and R1 is RELEASED. §18.3's "it is not safe" is withdrawn by §19. Kept visible, with its correction.
