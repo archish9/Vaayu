@@ -342,11 +342,45 @@ speculative path is the one every dense load takes. Nothing here is banked.
       `PREFIX_COMPRESS = 9`, now a CAPACITY choice the box keeps by choice, no longer needed to survive; left unchanged.
       **This row stays OPEN:** Task 4 (prefix-HIT restore pricing, ABBA) and Task 5 (the load-time budget
       warning) remain, plus the open bullets below.
-- [ ] **Task 5 — load-time prefix-budget floor WARNING** (restored as its own item 2026-11-27): derive one
-      full-length entry's bytes at load and WARN when the prefix budget is below it; test parametrized over two
-      contrasting geometries (Qwen3-Next-like and MiniMax-like). **Must size off the planner's entry figure
-      (5.48 GB this boot), NOT a cgroup delta** — measured deltas disagree (+8.32 pinned / +6.32 unpinned 1 Hz /
-      +5.51 unpinned per-request; ~2.8 GB gap unexplained).
+- [x] **Task 5 — load-time prefix-budget floor WARNING — DONE 2026-11-27 (`82eabf2`, branch
+      `d1-task5-floor-warning`). FIRED ON DEVICE on the dense 70B load**, which is the first time the engine
+      says this at load instead of after a request: `prefix cache budget 1.76 GB is below ONE full-length
+      entry (2.68 GB)` (free RAM 5.52 - 3.76 reserve; the 70B's own pinned arena is why only 5.52 GB is left).
+      Entry derived, never hardcoded: `pooled_kv_bytes_per_token() * max_seq_len` = 80 x 2 x 8 x 128 x 2 =
+      327,680 B/token x 8192 = 2.684 GB. Silent on dense 1B (entry 2.15 GB vs a 21.80 GB budget), correctly.
+      `prefix_floor_warning()` in `vaayu_base.py`, called in the `else` of the existing `budget == 0` check so
+      the two can never both fire; WARNS, never refuses (CLAUDE.md §5 — since the park was unpinned an
+      over-floor pool swaps instead of dying). 9 new tests over two SYNTHETIC geometries
+      (`tests/test_prefix_floor_warning.py`); suite **4403 passed, 92 skipped, 0 failed** (4494 collected =
+      4486 + 9). Gates at this commit: dense 1B 6/6 (5.87 s), dense 70B 6/6 (90.66 s), fused-EXL3 3/3
+      (24.67 s) — the prefix pool is shared infra, so all three were required.
+      **§8: NO KNOB** — visibility, not policy; reachable through the server's only load path, PROVED on
+      device by both gate loads printing the line. NOT banked.
+      **The ~12 GB arena double-count was NOT built** (the re-scope's whole point): `compute_prefix_cache_budget`
+      and its call site are untouched, and the 1B load shows the budget is still exactly free − reserve
+      (25.55 − 3.76 = 21.80). Reviewed: spec PASS, quality APPROVED, 0 Critical, 0 Important, 3 Minor.
+      - [ ] **[minor] The arena regression guard does not cover the CALL SITE** (`tests/test_prefix_floor_warning.py`
+            pins `compute_prefix_cache_budget(free) == free − reserve`, which catches a subtraction INSIDE that
+            function but not one added at `vaayu_base.py:3841`, where the original plan put the risk). Mitigated
+            by on-device evidence, not by a test. Fix when something next touches that site.
+      - [ ] **[minor] The `__init__` call site has no unit test** — not cheaply testable (it needs a loaded
+            model, and a fake would only test the fake; extracting the block is a refactor this task must not
+            do). Closed in practice by the two gate loads above, which exercised both the firing and the
+            silent path on real models.
+      - [ ] **[minor] The entry size omits recurrent-state bytes on hybrid models, and an unset `max_seq_len`
+            yields entry 0 so nothing warns.** Both UNDERSTATE the entry, so the warning can never fire
+            spuriously — it can only stay silent when it should speak.
+      **Deviation from the brief, reviewed and ruled MORE CORRECT:** the entry is sized with
+      `pooled_kv_bytes_per_token()` rather than `geo_from_model`, because `geo_from_model` nets out the
+      windowed-layer discount and so leaves windowed layers uncharged, while a POOLED entry is stored at full
+      length (`vaayu_base.py:3381` already relies on this helper). Identical on non-windowed models; the
+      brief's path would have understated the entry on a windowed model like gpt-oss.
+      **Lead on the row's open ~2.8 GB gap, NOT a closure:** the derived full-length entry at
+      `max_seq_len=32768` is **8.32 GB**, exactly Attempt 1's "unexplained" PINNED delta, and 5.48 GB is the
+      SAME formula at 21,550 tokens (the compacted length). So the pinned park may have charged CAPACITY
+      length where the compacted park charges USED length. Still live as a rival explanation: the pre-fix code
+      did compact, so a transient double-allocation (`contiguous()` copy + `pin_memory()` copy) caught by the
+      1 Hz sampler fits the same numbers. Do not close the open item on this.
 - [ ] **Task 4 is probably measurable TODAY at `MAX_SEQ_LEN=16384`, so "blocked on D2" must not quietly
       become permanent** (added 2026-11-25). **UPDATE 2026-11-27: Task 3 is now done at 32 k (10/10, above) and D2 is closed, so Task 4 is the next item on this row.** 16 k is the window Rudra actually runs, the one the ~13,926-
       token chain and the ~3.3 GiB-per-entry figures above are quoted for, and the handoff's own advice is

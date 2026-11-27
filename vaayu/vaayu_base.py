@@ -862,6 +862,20 @@ def compute_prefix_cache_budget(free_ram_bytes: int) -> int:
     return max(0, int(free_ram_bytes) - _PREFIX_CACHE_RAM_RESERVE)
 
 
+def prefix_floor_warning(budget_bytes: int, entry_bytes: int, compressed: bool):
+    """Load-time WARNING text when the prefix budget cannot hold ONE full-length
+    pooled entry, else None. The pool keeps one entry whatever the budget, so it
+    then lives at its floor and swaps (D1). Budget 0 is left to the existing
+    budget-0 warning so the two never both fire; entry_bytes <= 0 is "unknown"."""
+    if budget_bytes <= 0 or entry_bytes <= 0 or budget_bytes >= entry_bytes:
+        return None
+    return (f"[Vaayu] WARNING: prefix cache budget {budget_bytes / 1e9:.2f} GB is below "
+            f"ONE full-length entry ({entry_bytes / 1e9:.2f} GB"
+            f"{', uncompressed -- an upper bound with prefix_compress' if compressed else ''}). "
+            f"The pool keeps one entry regardless, so a second long session evicts the "
+            f"first and the process may swap. Lower max_seq_len or free RAM.")
+
+
 def stage3_parity_kv(*, kv_constant_bytes: int, score_elem_bytes: float,
                      pooled_kv_per_token: int) -> int | None:
     """The per-token KV cost at which the reserve floor prices flash-attention
@@ -3843,6 +3857,16 @@ class VaayuBaseModel(GenerationMixin):
                 print("[Vaayu] WARNING: prefix cache budget is 0 GB — single-session "
                       "reuse still works, but concurrent sessions (parallel fan-out) "
                       "collapse to one resident entry. Free RAM here is below the reserve.")
+            else:
+                try:
+                    _entry = int(self.pooled_kv_bytes_per_token()) * int(self.max_seq_len or 0)
+                except Exception:
+                    _entry = 0     # D3: a sizing helper must not become the crash
+                _floor_msg = prefix_floor_warning(
+                    _pc_budget, _entry,
+                    getattr(self, "prefix_compress", None) is not None)
+                if _floor_msg:
+                    print(_floor_msg)
 
         # --- KV disk persistence tier (Subsystem A; ships dark) ---
         self._kv_writer = None
