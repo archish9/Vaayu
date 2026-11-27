@@ -78,7 +78,13 @@ Status keys: `[ ]` pending · `[~]` in progress · `[!]` blocked · `[bug]` open
 Protocol: `CLAUDE.md` §6 (this ledger), §7 (all plans / RESULTS go in `docs/`, gitignored — so every row carries its
 own numbers), §8 (every change must reach the server; say if it is banked).
 
-**Suite floor (CURRENT, measured 2026-11-27 on branch `d2-cold-cell` at `d0dcfc7`): `4394 passed, 92 skipped, 0 failed`**
+**Suite floor (CURRENT, measured 2026-11-27 on `main` at the `d1-task5-floor-warning` merge): `4403 passed,
+92 skipped, 0 failed`** (**4495 collected**, 373.19 s, FOREGROUND, run by the controller on the MERGED result --
+not a subagent-reported line). Reconciled as the 4486 floor below + **9**, every one of them in the single new
+file `tests/test_prefix_floor_warning.py` (`pytest --collect-only -q` on that file = 9). Gates at that commit:
+dense 1B 6/6 (5.87 s), dense 70B 6/6 (90.66 s), fused-EXL3 3/3 (24.67 s) -- the prefix pool is shared infra,
+so all three were required.
+Previous floor, for the record (measured 2026-11-27 on branch `d2-cold-cell` at `d0dcfc7`): `4394 passed, 92 skipped, 0 failed`
 (**4486 collected**, 382.20 s), from the `4323 passed, 92 skipped / 4415 collected` floor at `main` `8cbad32` below: +71 passed,
 +71 collected, every one of them a new test of the D2 cold-cell branch (`git diff --stat 8cbad32..d0dcfc7 -- tests/`).
 Reconcile by collected count at each commit. **All three gates WERE re-run at the final-wave HEAD** — see the closed
@@ -351,7 +357,7 @@ speculative path is the one every dense load takes. Nothing here is banked.
       `prefix_floor_warning()` in `vaayu_base.py`, called in the `else` of the existing `budget == 0` check so
       the two can never both fire; WARNS, never refuses (CLAUDE.md §5 — since the park was unpinned an
       over-floor pool swaps instead of dying). 9 new tests over two SYNTHETIC geometries
-      (`tests/test_prefix_floor_warning.py`); suite **4403 passed, 92 skipped, 0 failed** (4494 collected =
+      (`tests/test_prefix_floor_warning.py`); suite **4403 passed, 92 skipped, 0 failed** (4495 collected =
       4486 + 9). Gates at this commit: dense 1B 6/6 (5.87 s), dense 70B 6/6 (90.66 s), fused-EXL3 3/3
       (24.67 s) — the prefix pool is shared infra, so all three were required.
       **§8: NO KNOB** — visibility, not policy; reachable through the server's only load path, PROVED on
