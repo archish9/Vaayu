@@ -339,6 +339,11 @@ speculative path is the one every dense load takes. Nothing here is banked.
       and the D2 row. Plan: `docs/superpowers/plans/2026-11-27-D1-task3-attempt2-host-ram-ab.md`.
       **This row stays OPEN:** Task 4 (prefix-HIT restore pricing, ABBA) and Task 5 (the load-time budget
       warning) remain, plus the open bullets below.
+- [ ] **Task 5 — load-time prefix-budget floor WARNING** (restored as its own item 2026-11-27): derive one
+      full-length entry's bytes at load and WARN when the prefix budget is below it; test parametrized over two
+      contrasting geometries (Qwen3-Next-like and MiniMax-like). **Must size off the planner's entry figure
+      (5.48 GB this boot), NOT a cgroup delta** — measured deltas disagree (+8.32 pinned / +6.32 unpinned 1 Hz /
+      +5.51 unpinned per-request; ~2.8 GB gap unexplained).
 - [ ] **Task 4 is probably measurable TODAY at `MAX_SEQ_LEN=16384`, so "blocked on D2" must not quietly
       become permanent** (added 2026-11-25). **UPDATE 2026-11-27: Task 3 is now done at 32 k (10/10, above) and D2 is closed, so Task 4 is the next item on this row.** 16 k is the window Rudra actually runs, the one the ~13,926-
       token chain and the ~3.3 GiB-per-entry figures above are quoted for, and the handoff's own advice is
