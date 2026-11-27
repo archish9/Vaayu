@@ -184,8 +184,6 @@ def test_an_eviction_that_frees_too_little_still_refuses(name, gpu):
 def test_an_eviction_that_raises_is_a_clean_refusal(name, gpu):
     """D3: the admission guard must never itself be the thing that crashes. The real
     evict_until_free calls torch.cuda.mem_get_info() and empty_cache() unguarded."""
-    # Counts tier eviction attempts per refusal: pins ONE plan, so it calls
-    # `_assert_context_fits_once` (the guard now re-plans once after a reclaim).
     need = need_for(name)
     gpu["free"] = need - 256 * MB
     tier = FakeTier(2 * GB, gpu)
@@ -485,3 +483,22 @@ def test_a_refusal_after_a_failed_eviction_does_not_count_the_tier_again(name, g
     offered = _largest_s_within_budget(shape_for(name), gpu["free"] + gpu["pool"])
     assert offered < N_TOKENS
     assert f"max_seq_len={offered}" in str(e.value)
+
+
+@requires_cuda
+@pytest.mark.parametrize("name", ALL)
+def test_the_wrapper_replans_a_refusal_once_with_one_eviction_per_plan(name, gpu, capsys):
+    """The REAL wrapper over the REAL single plan (not a mocked `_once`): a refusal
+    that eviction cannot cure is planned twice -- one eviction attempt per plan, so
+    2 in all, never a loop and never a double-evict inside one plan -- and the second
+    refusal says a retry ran and how much it reclaimed."""
+    need = need_for(name)
+    gpu["free"] = need - 256 * MB
+    tier = FakeTier(2 * GB, gpu, fraction=0.5)
+    model = model_for(name, reserve=need, tier=tier)
+    with pytest.raises(VramPlanError) as ei:
+        VaayuBaseModel._assert_context_fits(model, N_TOKENS)
+    assert len(tier.calls) == 2, "one eviction attempt per plan, two plans"
+    msg = str(ei.value)
+    assert "re-planned once" in msg and "reclaimed 0.00 GiB" in msg
+    assert "re-planning once" in capsys.readouterr().out

@@ -56,8 +56,15 @@ def release_exception_frames(exc) -> None:
     wrapped layer-OOM RuntimeError's cause carries its own copy of the frames.
 
     Call it where the exception has left the model's frames and is about to be
-    handed across (every `bridge.put(("error", ...))`). A frame still executing
-    (the caller's own) is skipped by `clear_frames`, as it should be. Never raises.
+    handed across (every `bridge.put(("error", ...))`). A frame still executing (the
+    caller's own) is skipped: `traceback.clear_frames` SWALLOWS the RuntimeError that
+    clearing it raises, so walking `__context__` -- which can reach the `_pump`
+    frame where the exception was caught -- is safe by design, not by luck.
+    Never raises.
+
+    Server-bridge only, deliberately: a library caller of `model.generate` does not
+    pass here and relies on the admission net (`_assert_context_fits`' one re-plan
+    after gc.collect() + empty_cache(), which every `generate` entry reaches).
     """
     import traceback
     seen = set()

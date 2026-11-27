@@ -4480,7 +4480,13 @@ class VaayuBaseModel(GenerationMixin):
         and `gc.collect()` returned exactly those bytes. This defends against any
         cyclic retention, not just the one `release_exception_frames` breaks.
         Never on a path that admits (a collection is what the freeze avoids), and
-        never a loop: the second refusal stands, its text saying a retry ran."""
+        never a loop: the second refusal stands, its text saying a retry ran and how
+        many GiB the reclaim returned (0.00 = nothing was retained, the request
+        genuinely does not fit; more = something was holding memory).
+
+        Load-time probes may take the retry path: the width-2 batching probe is
+        refused by design, so one gc.collect() + empty_cache() runs at load, before
+        the gc freeze, and prints "reclaimed 0.00 GiB, re-planning once". Harmless."""
         from .vram_plan import VramPlanError
         _args = dict(N=N, expert_giveback_bytes=expert_giveback_bytes,
                      batched_prefill=batched_prefill, prompt_tokens=prompt_tokens)
@@ -4504,8 +4510,10 @@ class VaayuBaseModel(GenerationMixin):
             try:
                 return VaayuBaseModel._assert_context_fits_once(self, n_tokens, **_args)
             except VramPlanError as again:
+                _gib = max(0, _before - _after) / 1024 ** 3
                 again.args = (str(again) + "\nAdmission was re-planned once after "
-                              "gc.collect() + empty_cache(); the refusal stands.",)
+                              f"gc.collect() + empty_cache() reclaimed {_gib:.2f} GiB; the "
+                              f"refusal stands. ({'Nothing was retained: this request does not fit the card.' if _gib < 0.005 else 'Memory was held and released, and it still does not fit.'})",)
                 raise
 
     def _assert_context_fits_once(self, n_tokens: int, N: int = 1,
@@ -6133,13 +6141,19 @@ class VaayuBaseModel(GenerationMixin):
                   "nothing to evict, the tier stays at 0 for this request")
         return _new
 
-    def _release_failed_forward(self, held, batch) -> None:
+    def _release_failed_forward(self, held, batch, exc=None) -> None:
         """D2 (c): hand back what a forward that is dying still holds on the
         device -- the streamed layer's weights (its `free_from_gpu` sits after the
         compute, so a raise skips it), the hidden states, and the allocator's
         cache. Best-effort and silent on failure: it runs while another error is
         propagating and must never replace it. A no-op on CPU, and on a dense
-        model (no tier is touched here; the tier's budget is `_refund_expert_tier`'s)."""
+        model (no tier is touched here; the tier's budget is `_refund_expert_tier`'s).
+
+        The streamed layer's weights are freed on EVERY exit. The gc + empty_cache
+        runs only for a memory-class failure (anywhere in `exc`'s cause chain,
+        decode_graphs' predicate): a client disconnect (GeneratorExit /
+        CancelledError) is routine here, and a gc.collect() per cancellation on a
+        gc-frozen server is the cost the freeze exists to avoid."""
         try:
             if held is not None:
                 _layer, _moved = held
@@ -6150,7 +6164,14 @@ class VaayuBaseModel(GenerationMixin):
                   f"raised {type(_e).__name__}: {_e}")
         try:
             batch.clear()
-            clean_memory()
+            from .decode_graphs import _is_memory_error
+            _seen, _x, _mem = set(), exc, False
+            while _x is not None and id(_x) not in _seen and not _mem:
+                _seen.add(id(_x))
+                _mem = _is_memory_error(_x)
+                _x = _x.__cause__ or _x.__context__
+            if _mem:
+                clean_memory()
         except Exception as _e:            # noqa: BLE001
             print(f"[Vaayu-VRAM] WARNING: emptying the allocator after a failed "
                   f"forward raised {type(_e).__name__}: {_e}")
@@ -6833,7 +6854,7 @@ class VaayuBaseModel(GenerationMixin):
                     # per-token empty_cache() defeats the CUDA caching allocator.
                     if self._token_count == 0 and i % 40 == 39:
                         clean_memory()
-            except BaseException:
+            except BaseException as _failed:
                 # D2 (c): a request that dies mid-forward -- the layer-OOM raise
                 # above, a cancellation, anything -- must not leave the device
                 # holding what it was using, or the NEXT request is admitted
@@ -6845,7 +6866,7 @@ class VaayuBaseModel(GenerationMixin):
                 # truncated (I4) -- the original error propagates unchanged.
                 seq = layer_out = kwargs = _mask_args = _base = None
                 _kw_base.clear()
-                self._release_failed_forward(_held, batch)
+                self._release_failed_forward(_held, batch, _failed)
                 raise
             finally:
                 if getattr(self, "_prefill_stager_active", False):

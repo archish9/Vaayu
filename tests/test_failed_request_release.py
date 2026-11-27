@@ -209,3 +209,38 @@ def test_a_guard_with_nothing_to_check_never_collects(guard):
     fits.nothing_to_check = True
     assert fit(object(), 5) is None
     assert collects == []
+
+
+# ── the cancellation split of _release_failed_forward ───────────────────────
+
+class _Loader:
+    def __init__(self):
+        self.freed = []
+
+    def free_from_gpu(self, model, layer, moved, quantizer):
+        self.freed.append(layer)
+
+
+def _release(exc, monkeypatch):
+    import types
+    import vaayu.vaayu_base as vb
+    calls = []
+    monkeypatch.setattr(vb, "clean_memory", lambda *a, **k: calls.append(1))
+    m = types.SimpleNamespace(loader_strategy=_Loader(), model=None, hf_quantizer=None)
+    vb.VaayuBaseModel._release_failed_forward(m, ("layer", ["w"]), [1, 2], exc)
+    return m.loader_strategy.freed, calls
+
+
+def test_a_cancellation_frees_the_layer_but_never_runs_a_collection(monkeypatch):
+    for exc in (GeneratorExit(), asyncio.CancelledError(), KeyboardInterrupt()):
+        freed, calls = _release(exc, monkeypatch)
+        assert freed == ["layer"], f"{type(exc).__name__}: the layer's weights must be freed"
+        assert calls == [], f"{type(exc).__name__}: gc + empty_cache on a cancellation"
+
+
+def test_a_memory_class_failure_collects_even_when_wrapped(monkeypatch):
+    wrapped = RuntimeError("CUDA OOM on model.layers.1. Not retried: (test)")
+    wrapped.__cause__ = torch.OutOfMemoryError("CUDA out of memory. (test)")
+    freed, calls = _release(wrapped, monkeypatch)
+    assert freed == ["layer"] and calls == [1]
+    assert _release(RuntimeError("something else"), monkeypatch)[1] == []
