@@ -4470,6 +4470,48 @@ class VaayuBaseModel(GenerationMixin):
                              expert_giveback_bytes: int = 0,
                              batched_prefill: bool = False,
                              prompt_tokens: int | None = None) -> int | None:
+        """Admission guard with ONE re-plan after a reclaim (D2 (c)).
+
+        Runs `_assert_context_fits_once`. Only when that REFUSES (VramPlanError)
+        does it `gc.collect()` + `empty_cache()` and plan again, once: a request
+        that died mid-forward leaves its KV cache in a reference cycle, and the
+        server freezes gc after load (utils.py), so nothing else ever collects it
+        -- measured: 8.32 GB of dead KV, request 2 refused at max_seq_len=8192,
+        and `gc.collect()` returned exactly those bytes. This defends against any
+        cyclic retention, not just the one `release_exception_frames` breaks.
+        Never on a path that admits (a collection is what the freeze avoids), and
+        never a loop: the second refusal stands, its text saying a retry ran."""
+        from .vram_plan import VramPlanError
+        _args = dict(N=N, expert_giveback_bytes=expert_giveback_bytes,
+                     batched_prefill=batched_prefill, prompt_tokens=prompt_tokens)
+        try:
+            return VaayuBaseModel._assert_context_fits_once(self, n_tokens, **_args)
+        except VramPlanError:
+            _before = _after = 0
+            try:
+                import gc
+                if torch.cuda.is_available():
+                    _before = int(torch.cuda.memory_allocated())
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                    _after = int(torch.cuda.memory_allocated())
+            except Exception:                       # noqa: BLE001 -- best-effort reclaim
+                pass
+            print(f"[Vaayu-VRAM] admission refused {int(n_tokens)} tokens; reclaimed "
+                  f"{max(0, _before - _after) / 1024 ** 3:.2f} GiB with gc.collect() + "
+                  f"empty_cache() and re-planning once.")
+            try:
+                return VaayuBaseModel._assert_context_fits_once(self, n_tokens, **_args)
+            except VramPlanError as again:
+                again.args = (str(again) + "\nAdmission was re-planned once after "
+                              "gc.collect() + empty_cache(); the refusal stands.",)
+                raise
+
+    def _assert_context_fits_once(self, n_tokens: int, N: int = 1,
+                             expert_giveback_bytes: int = 0,
+                             batched_prefill: bool = False,
+                             prompt_tokens: int | None = None) -> int | None:
         """Refuse an oversized request HERE, where the prompt length is known.
 
         Without this, the wall surfaces as an OOM inside the layer loop ~30

@@ -175,7 +175,7 @@ def test_an_eviction_that_frees_too_little_still_refuses(name, gpu):
     tier = FakeTier(2 * GB, gpu, fraction=0.5)
     model = model_for(name, reserve=need, tier=tier)
     with pytest.raises(VramPlanError):
-        VaayuBaseModel._assert_context_fits(model, N_TOKENS)
+        VaayuBaseModel._assert_context_fits_once(model, N_TOKENS)
     assert len(tier.calls) == 1, "one attempt, no loop"
 
 
@@ -184,6 +184,8 @@ def test_an_eviction_that_frees_too_little_still_refuses(name, gpu):
 def test_an_eviction_that_raises_is_a_clean_refusal(name, gpu):
     """D3: the admission guard must never itself be the thing that crashes. The real
     evict_until_free calls torch.cuda.mem_get_info() and empty_cache() unguarded."""
+    # Counts tier eviction attempts per refusal: pins ONE plan, so it calls
+    # `_assert_context_fits_once` (the guard now re-plans once after a reclaim).
     need = need_for(name)
     gpu["free"] = need - 256 * MB
     tier = FakeTier(2 * GB, gpu)
@@ -296,6 +298,8 @@ def test_external_pressure_leaves_the_tier_no_room_to_overcommit(name, gpu):
 @pytest.mark.parametrize("name", ALL)
 def test_a_tier_that_cannot_be_capped_is_a_clean_refusal(name, gpu, capsys):
     """No admission on a promise that cannot be kept, and no crash either (D3)."""
+    # Counts tier eviction attempts per refusal: pins ONE plan, so it calls
+    # `_assert_context_fits_once` (the guard now re-plans once after a reclaim).
     need = need_for(name)
     gpu["free"] = need - 256 * MB
     tier = FakeTier(2 * GB, gpu)
@@ -305,7 +309,7 @@ def test_a_tier_that_cannot_be_capped_is_a_clean_refusal(name, gpu, capsys):
     tier.set_budget = boom
     model = model_for(name, reserve=need, tier=tier)
     with pytest.raises(VramPlanError):
-        VaayuBaseModel._assert_context_fits(model, N_TOKENS)
+        VaayuBaseModel._assert_context_fits_once(model, N_TOKENS)
     out = capsys.readouterr().out
     assert "still does not fit" in out and "capped" not in out
 
