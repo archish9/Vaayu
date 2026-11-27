@@ -318,7 +318,7 @@ speculative path is the one every dense load takes. Nothing here is banked.
       6.96-7.05 GB through session 9. This boot's plan: reserve 8.56 GiB, pinning 4.01, expert ceiling 5.95,
       prefix budget 10.80 GB, elastic tier OFF (decode graphs installed); the page cache could not be evicted
       (no root), so the budget is this boot's, not a constant. One `[Vaayu-Prefix] WARNING: prefix pool over
-      capacity`, at `d1-a-1`'s store. Reference, the 2026-11-24 arms this replaces: `PREFIX_COMPRESS=9`
+      capacity`, at `d1-a-1`'s store. Reference for comparison (NOT arms this supersedes; different budgets and plans), the 2026-11-24 arms: `PREFIX_COMPRESS=9`
       served 6, peak 27.54 GB, survived; `PREFIX_COMPRESS=None` pinned served **2**, peak 30.06 GB = the cap
       exactly, `shmem` -> 29.90, `anon` -> 0.02, OOM-KILLED. Approach B (16 k fallback) was SKIPPED by its own
       gate: it fires only on a VRAM stop and there was none.
@@ -337,6 +337,9 @@ speculative path is the one every dense load takes. Nothing here is banked.
       Earlier, attempt 1: the host-RAM claim was PROVED but the `>= 6` bar was not reachable (1 of 10 served;
       a reproduction served 0 of 3) because VRAM, not host RAM, stopped it — see `[bug]` PREFIX-PARK-DEVICE-ALLOC
       and the D2 row. Plan: `docs/superpowers/plans/2026-11-27-D1-task3-attempt2-host-ram-ab.md`.
+      **§8 (shipped vs banked): SHIPPED, not banked.** The unpin (`cbb1bf4`) is on `main`, so `config.py`'s default
+      `PREFIX_COMPRESS = None` is now safe at the measured shape. This box's gitignored `config_local.py` still sets
+      `PREFIX_COMPRESS = 9`, now a CAPACITY choice the box keeps by choice, no longer needed to survive; left unchanged.
       **This row stays OPEN:** Task 4 (prefix-HIT restore pricing, ABBA) and Task 5 (the load-time budget
       warning) remain, plus the open bullets below.
 - [ ] **Task 5 — load-time prefix-budget floor WARNING** (restored as its own item 2026-11-27): derive one

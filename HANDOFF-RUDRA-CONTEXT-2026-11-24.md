@@ -1793,7 +1793,11 @@ guess at it in a document you plan against.
 - Nothing here asks Rudra for work, a config change, or a reply.
 
 
-### 17.5 Update 2026-11-27: measured safe at the shipped `PREFIX_COMPRESS = None` — 10/10 single-entry sessions at 32 k, `shmem` flat, 4.2 GB under the cap
+### 17.5 Update 2026-11-27: measured at the shipped `PREFIX_COMPRESS = None` — 10/10 sessions of 21,550 tokens at `MAX_SEQ_LEN=32768`, one resident entry, `shmem` flat, 4.2 GB under the cap
+
+**This does NOT relax §19.1's 27,800-token cold-request clamp.** That clamp comes from D2 and stands. The 32,768 here is the
+`MAX_SEQ_LEN` window; the requests were **21,550 tokens**, all cold stores, one resident entry, on a single boot. They are
+different numbers — do not read 32 k as a request size.
 
 Measured with the shipped uncompressed default at `MAX_SEQ_LEN=32768`, after D2 closed (`logs/run-2026-11-27T11-32-46Z`):
 **10 of 10** distinct 21,550-token sessions served, `shmem` FLAT (spread one 4,096 B page, minimum 11.94 GB = the expert
