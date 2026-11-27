@@ -1736,6 +1736,8 @@ it lands near 5 % it is at or over that task's own trigger, and we will say so h
 
 ### 17.2 But a long SECOND session still fails, on VRAM — so the default is NOT yet safe for repeated long requests
 
+> **SUPERSEDED by §19 (2026-11-27):** the conclusion below ("R1 STAYS HELD", the cold first long request fails) no longer holds; the cold first long request now serves. Kept visible, with its correction.
+
 Being honest about the bar we set ourselves: the acceptance run was **six distinct 21,551-token sessions**,
 and it served **one**. What stops it is not host RAM any more, it is VRAM, and it is **D2**, not this row.
 Two separate unbudgeted device allocations were found, both of which fail once the expert VRAM tier has
@@ -1793,6 +1795,8 @@ guess at it in a document you plan against.
 
 ## 18. The repeated-long-request failure is FIXED; the COLD first long request is NOT. R1 STAYS HELD.
 
+> **SUPERSEDED by §19 (2026-11-27):** the cold first long request is now FIXED and R1 is RELEASED. §18.3's "it is not safe" is withdrawn by §19. Kept visible, with its correction.
+
 **2026-11-25, after §17.** One change shipped on Vaayu's side and two cells were measured. Read the second
 table before planning anything: the number §17.2 said was blocked is now fixed, and a DIFFERENT cell — the one
 §16.3 actually named as your release signal — still fails.
@@ -1832,3 +1836,79 @@ but unallocated. Host RAM was not a factor (peak RSS 14.25 GB against a 28 GiB c
   reproduced at that size.
 - **R6 and R2 remain clear to go**, and §11.7's order is otherwise unchanged.
 - Nothing here asks Rudra for work, a config change, or a reply.
+
+## 19. The cold first long request SERVES. R1 IS RELEASED — with a number, and with conditions. (Supersedes §17.2 and §18.3.)
+
+**2026-11-27.** Vaayu branch `d2-cold-cell`, commits `8a6a1f5..e376fd9` (not yet merged to `main` at the time of writing).
+§16.3 said Vaayu would say explicitly when a cold long first request is safe, and that this is the signal to ship R1.
+This is that statement. §17.2 and §18.3 concluded "R1 STAYS HELD"; both are withdrawn by this section.
+
+### 19.1 The number
+
+**A cold boot's first long request is safe up to 27,800 tokens (27,802 measured), on `PREFIX_COMPRESS=9` and on `None`,
+at `MAX_SEQ_LEN=32768`, provided no other process holds GPU memory.** Clamp to **27,800**.
+**27,800 is the largest cold request measured to serve. It is NOT a ceiling:** no N was bisected (~6-8 boots; the design spec's §7.2 explicitly
+did not choose it), so nothing here says what happens at 30 k or at 32,768. Do not clamp UP from it.
+
+| cold first request | `PREFIX_COMPRESS` | result |
+|---|---|---|
+| 21,550 tok, cells A, B | `None` | served, `finish: "length"`, ttft 126.32 / 126.77 s |
+| 27,802 tok, cells C, D and again C2, D2 | `9` (the pinned config) | served all four, ttft 166.64 / 163.03 s then 160.57 / 163.60 s, 16 tokens |
+| fresh boot, TWO consecutive 21,550-tok requests | `None` | both served (129.22 / 129.05 s); a shape never run before this work |
+
+Cell C2 and D2 ran on the untouched pinned `config_local.py`. Cold-at-`9` had never been run before this row.
+
+### 19.2 The conditions, stated plainly
+
+- **Conditional on no other process holding GPU memory.** rustdesk held **148 MiB** throughout every arm and is named in the
+  original OOM text; no arm ran with anything else on the card. A tenant with more than that is untested.
+- **The peak VRAM on the 27,802-token cells was 15.03-15.09 GB on a 16 GB card.** That is thin. The slack the fix leaves at
+  the prefill -> decode transition is ~205 MiB by construction; anything that adds more than that there re-opens this.
+- **Module-list forward only** has an on-device cold result (MiniMax-M2.7). Whole-layer and non-EXL3 forwards have no
+  checkpoint on this box.
+- A cold long request is **slow, not fast**: ttft 126-164 s at these sizes. The fix makes it serve; it does not make it quick.
+
+### 19.3 What is NOT proven
+
+- **The belt is unexercised on device.** The decode-graph fallback (refuse graphs, not the request, on a memory failure) fired
+  **zero** times in 58 requests (53 with the re-base line counted, 5 without retained stdout). The cells serve because of the
+  once-per-request re-base, not because the belt caught anything.
+- **Dense and fused-EXL3 are no-regression evidence only.** Dense 70B 6/6 ppl 8.87 and fused-EXL3 3/3 ppl 5.98 were last
+  measured at `1849878`, **not at HEAD** (`e376fd9`); dense 1B 6/6 ppl 11.90 at `416a31c`. Dense has no expert tier, so the fix
+  does not fire there; Qwen3.6-35B captures graphs and reaches the re-base as a no-op.
+- The cold-x2 and warm arms were not re-run after `e376fd9` (it changed only the error path and tests).
+
+### 19.4 The failure cascade, and the warm regression it caused — both fixed, both measured
+
+- **Warm TTFT.** The first version of the fix cost **1.70x warm TTFT** on sessions 2-6 (mean 129.22 -> 219.05 s against a control
+  at `8cbad32` flat at 128-141 s). Fixed: warm TTFT now 124.21-130.46 s, 0.98-1.00x of control. Warm 6/6, decode mean 0.6441 vs
+  0.6339 s/token (+1.6 %).
+- **The cascade.** Before: a request dying mid-decode left its **8.32 GB KV cache** as unreachable garbage (the server freezes gc
+  after load), so the NEXT long request was refused at `max_seq_len=8192` until restart. After: the next request is admitted at
+  **32768** and served. Fixed two ways: dead frame locals are cleared at the server's three error bridges, and admission re-plans
+  once after `gc.collect()` + `empty_cache()` on a refusal.
+- Not covered: a **library** caller invoking `model.generate` directly gets only the admission net; a host `MemoryError` takes
+  no collection. Neither is reachable through the server.
+
+### 19.5 Corrections to claims that were made earlier in this handoff and its sources
+
+§17.2 and §18.2 say the failing request "needs 20.00 MiB with 37.75 MiB free" and that every failure raises at
+`build_exl3_qmatrix`. Measured since: that raise is the FINAL one; the **initiating OOM is at CUDA graph `capture_end`**.
+The 20 MiB is an allocator **segment**; the real need is one 2,949,120 B contiguous block on the allocating stream, and the
+effective driver-free floor for a 20 MiB map brackets at (25.75, 43.75] MiB, which is why the figures looked contradictory.
+Also: 20 of the 70B's 80 layers are pinned (dense is exempt for want of an expert tier, not because `_resident` is false), and
+Qwen3.6-35B does capture decode graphs.
+
+### 19.6 CLAUDE.md section 8 (Vaayu's own rule), answered
+
+(1) **No knob** was added: not dying when a cache can be evicted is correctness, not policy; **you have nothing to configure**.
+(2) **Plumbed** through `forward`'s `_reset_now` hook, `forward`'s first-prefill-pass refund, `BatchScheduler._run`,
+`EngineHandle.slot()` and `_assert_context_fits`. (3) **Reachable at N=1**, the server's only mode (only `scheduler.py` calls
+the engine, all inside `_run`). (4) **Not banked.**
+
+### 19.7 What this changes for Rudra
+
+- **R1 may ship**, clamped to **27,800 tokens** for a cold first request. Rudra still clamps to advertised figures (D5), not to
+  prose; D5 will advertise the derived safe window and will need this number plus D1's.
+- Merge status: the fix is on branch `d2-cold-cell`; it reaches a running service only when merged and the server restarted.
+- R6 and R2 remain clear to go. Nothing here asks Rudra for a config change.
