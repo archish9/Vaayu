@@ -40,6 +40,44 @@ STREAM_GENERATE_OWNS = ("input_ids", "streamer", "max_new_tokens", "temperature"
                         "top_p", "do_sample", "use_cache")
 
 
+def release_exception_frames(exc) -> None:
+    """Drop the locals of every FINISHED frame an exception's traceback keeps alive.
+
+    D2 (c). A request that dies inside `model.generate` leaves a cycle:
+    exception -> traceback -> the dead frames (`generate`'s `kwargs`, `forward`'s
+    `past_key_values`, decode_graphs' `cache`) -> the request's KV cache. Nothing
+    live references it, but a cycle is only freed by a collection, and the server
+    freezes gc after load -- so the cache (8.32 GB on MiniMax at 21.5k tokens) sat
+    there when the NEXT request was admitted, and was refused at max_seq_len=8192.
+    `traceback.clear_frames` empties those frames' locals, which breaks the cycle
+    so the cache dies by refcount. The traceback itself, its line numbers and
+    `error.traceback`'s formatted text are untouched (formatting never reads
+    locals), so the diagnostics survive. Walks `__cause__`/`__context__`: the
+    wrapped layer-OOM RuntimeError's cause carries its own copy of the frames.
+
+    Call it where the exception has left the model's frames and is about to be
+    handed across (every `bridge.put(("error", ...))`). A frame still executing (the
+    caller's own) is skipped: `traceback.clear_frames` SWALLOWS the RuntimeError that
+    clearing it raises, so walking `__context__` -- which can reach the `_pump`
+    frame where the exception was caught -- is safe by design, not by luck.
+    Never raises.
+
+    Server-bridge only, deliberately: a library caller of `model.generate` does not
+    pass here and relies on the admission net (`_assert_context_fits`' one re-plan
+    after gc.collect() + empty_cache(), which every `generate` entry reaches).
+    """
+    import traceback
+    seen = set()
+    try:
+        while exc is not None and id(exc) not in seen:
+            seen.add(id(exc))
+            if exc.__traceback__ is not None:
+                traceback.clear_frames(exc.__traceback__)
+            exc = exc.__cause__ or exc.__context__
+    except Exception:                               # noqa: BLE001 -- cleanup only
+        pass
+
+
 class QueueFull(RuntimeError):
     """More requests are waiting than the configured depth allows."""
 
@@ -331,6 +369,19 @@ class EngineHandle:
                 # admission queue.
                 set_current_session(session_key)
                 try:
+                    # D2: hand back the tier re-base's outstanding cut at the
+                    # request boundary. A request with no prefill pass (a 100%
+                    # prefix hit decodes its one position) never reaches the
+                    # `forward` hook, which stays for library callers. Relative
+                    # and a no-op when nothing is outstanding; admission's own
+                    # cap runs after this and still wins.
+                    refund = getattr(self.model, "_refund_expert_tier", None)
+                    if callable(refund):
+                        try:
+                            refund()
+                        except Exception as exc:     # noqa: BLE001 -- best-effort
+                            print(f"[Vaayu-VRAM] tier refund skipped "
+                                  f"({type(exc).__name__}: {exc}); the request proceeds.")
                     yield
                 finally:
                     # The slot must outlive the generation on EVERY exit path.
@@ -695,6 +746,7 @@ class EngineHandle:
                 try:
                     bridge.put(("out", target(**kwargs)))
                 except BaseException as ex:         # noqa: BLE001 -- re-raised below
+                    release_exception_frames(ex)
                     bridge.put(("error", ex))
 
             thread = threading.Thread(target=_work, daemon=True)
@@ -833,6 +885,7 @@ class EngineHandle:
                                                  token_ids_out=new_ids, **kwargs):
                         bridge.put(("delta", chunk))
                 except BaseException as e:              # noqa: BLE001 -- re-raised below
+                    release_exception_frames(e)
                     bridge.put(("error", e))
                 finally:
                     bridge.put((DONE, None))
@@ -1066,6 +1119,7 @@ class EngineHandle:
                 for stream_id, tok in gen:
                     bridge.put(("tok", (stream_id, tok)))
             except BaseException as e:           # noqa: BLE001 -- re-raised below
+                release_exception_frames(e)
                 bridge.put(("error", e))
             finally:
                 # Explicit, never GC: this is the contract in the docstring

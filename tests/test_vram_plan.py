@@ -1547,3 +1547,54 @@ def test_a_load_too_small_without_the_margin_is_not_the_margins_fault():
     assert warn_tier_lost_to_margin(budget_bytes=0,
                                     expert_bytes=int(8.8 * MB),
                                     margin_bytes=int(1 * MB)) is None
+
+
+# ---- D2 cold cell: re-size the tier against free VRAM at each request -----
+from vaayu.vram_plan import rebased_tier_budget
+
+
+def test_rebase_caps_growth_at_measured_free():
+    # 1.0 GiB held, 0.5 GiB free, 0.2 GiB margin -> may grow by 0.3 GiB only
+    assert rebased_tier_budget(free_bytes=512 * MB, tier_usage=1024 * MB,
+                               planned_budget=3072 * MB,
+                               margin_bytes=200 * MB) == (1024 + 512 - 200) * MB
+
+
+def test_rebase_never_exceeds_the_planned_budget():
+    assert rebased_tier_budget(free_bytes=8 * GB, tier_usage=0,
+                               planned_budget=3 * GB,
+                               margin_bytes=200 * MB) == 3 * GB
+
+
+def test_rebase_sheds_when_free_is_under_the_margin():
+    # 2.0 GiB held, 50 MiB free, 200 MiB margin -> must give back 150 MiB
+    assert rebased_tier_budget(free_bytes=50 * MB, tier_usage=2048 * MB,
+                               planned_budget=3072 * MB,
+                               margin_bytes=200 * MB) == (2048 - 150) * MB
+
+
+def test_rebase_floors_at_zero_with_an_empty_tier_and_no_free():
+    assert rebased_tier_budget(free_bytes=0, tier_usage=0,
+                               planned_budget=3 * GB,
+                               margin_bytes=200 * MB) == 0
+
+
+def test_rebase_does_not_ratchet_across_requests():
+    # the SECOND call sizes against planned_budget, not against the first result:
+    # feed `first` back in as the held tier and the cap must still be planned_budget
+    first = rebased_tier_budget(free_bytes=100 * MB, tier_usage=2 * GB,
+                                planned_budget=3 * GB, margin_bytes=200 * MB)
+    second = rebased_tier_budget(free_bytes=3 * GB, tier_usage=first,
+                                 planned_budget=3 * GB, margin_bytes=200 * MB)
+    assert first < 2 * GB and second == 3 * GB
+
+
+def test_rebase_matches_the_measured_cold_boundary():
+    # The prefill->decode boundary of the cold cell that OOMs, measured on device
+    # 2026-11-26 (docs/superpowers/specs/2026-11-25-D2-artifacts/cold-probe-cold2.jsonl,
+    # `boundary` record): an empty tier, 1.98 GiB driver-free after a 21,550-token
+    # prefill, against a 3.10 GB planned budget and the 0.20 GiB tier margin.
+    # The number's authority is that measurement, not the formula: a regression anchor.
+    assert rebased_tier_budget(free_bytes=2_126_249_984, tier_usage=0,
+                               planned_budget=3_104_014_072,
+                               margin_bytes=214_748_364) == 1_911_501_620

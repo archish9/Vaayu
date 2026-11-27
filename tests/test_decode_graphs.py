@@ -3,6 +3,7 @@
 matters: the runner's output and cache state are BITWISE the stock forward's, token
 after token, through captures, replays, recaptures and refusals."""
 import gc
+import sys
 import types
 import weakref
 
@@ -923,3 +924,243 @@ def test_gc_is_disabled_during_a_capture():
     _decode(layers, _cache(1), runner)
     assert seen.get("inside") is False
     assert gc.isenabled()
+
+
+# --- D2: the belt -- a memory failure refuses graphs instead of killing the request ---
+
+@cuda
+@pytest.mark.parametrize("spec", [SPECS["attn+moe"], SPECS["state+moe"]], ids=["attn", "state"])
+def test_checked_makes_room_before_the_eager_reference(spec, capsys):
+    """D2's cold cell in miniature: the capture raises CUDA's out-of-memory at
+    `capture_end` (a torch.AcceleratorError), and the eager reference that
+    `_checked` falls back to is the call that then killed the request (the real one
+    raised in `build_exl3_qmatrix`). So the belt makes room BETWEEN the restore and
+    that reference, and the reference still runs exactly ONCE -- running it twice
+    would be a third execution of the layer, which corrupts every cache family
+    (I4). The ORDER assertion is what pins that: rebase, then eager.
+
+    The `sys.exc_info()` assertion inside the stub pins the OTHER half, the one
+    that makes the belt effective rather than merely non-fatal: the `except` block
+    must have ENDED before room is made and the reference runs. While a handler is
+    active CPython keeps the handled exception alive whatever is done with the
+    local name, and its traceback pins `_capture`'s frame -- so `cap`'s graphs and
+    `out` would still be holding the very device memory make-room is trying to
+    hand this call."""
+    layers = _stack(spec)
+    order = []
+    model = _model(layers)
+
+    def _rebase(**_kw):
+        order.append("rebase")
+
+    model._rebase_expert_tier = _rebase
+    runner = dg.install_decode_graphs(model)
+    with torch.inference_mode():
+        xs, cos, sin, pos = _inputs(1)
+        emb, ids = (cos[:, :1], sin[:, :1]), pos[:, :1]
+        ref_cache = _cache(1)
+        ref = layers[0](xs[0], use_cache=True, past_key_values=ref_cache,
+                        position_embeddings=emb, position_ids=ids)
+
+        def counting(seq, **kwargs):
+            assert sys.exc_info() == (None, None, None)   # the handler has ENDED
+            order.append("eager")
+            return layers[0](seq, **kwargs)
+
+        def oom_capture():
+            raise torch.AcceleratorError("CUDA error: out of memory")
+
+        cache = _cache(1)
+        assert not runner.begin_forward(batch=[torch.zeros(1, 4)], past_key_values=cache,
+                                        output_hidden_states=False)
+        assert runner.begin_forward(batch=[torch.zeros(1, 1)], past_key_values=cache,
+                                    output_hidden_states=False)
+        out = runner._checked("l0", counting, xs[0], dict(use_cache=True, past_key_values=cache,
+                                                          position_embeddings=emb,
+                                                          position_ids=ids), oom_capture)
+    assert order == ["rebase", "eager"]               # room FIRST, and the layer runs once
+    assert out is not None and torch.equal(out, ref)  # and the answer is stock's own
+    assert _same_caches(ref_cache, cache)             # the failed capture was undone
+    assert runner.stats["made_room"] == 1
+    # the capture's own failure is memory-class, so its refusal is transient (next request)
+    assert "l0" in runner._refused and "l0" in runner._transient_refused
+    assert "WARNING: decode graphs refused for l0 (capture failed" in capsys.readouterr().out
+
+
+@cuda
+def test_make_room_is_once_per_request_and_best_effort(capsys):
+    """Three properties of make-room, over both belted paths and two requests.
+
+    ONCE per request: the re-base prints a line on every call, including when it
+    changes nothing, and that log is the artifact users mail in -- so a request
+    whose capture fails on many layers must make room once, not once per layer. A
+    new request arms it again.
+
+    BEST-EFFORT: the second request's re-base itself raises out-of-memory. Making
+    room is for the reference, so it must not become a new raise site in front of
+    it: the reference still runs and the request is still answered -- and it says
+    so in one line, because a dropped error nobody can see in a mailed-in
+    logs/run-*/ folder is indistinguishable from a re-base that did nothing.
+
+    And the REFUSAL ORDER each path has always had: `_guarded` refuses before
+    running stock (so a reference that runs out of memory anyway still leaves the
+    layer and its WARNING on the record), `_checked` after.
+
+    The `sys.exc_info()` line pins the handler-end mechanism on BOTH belted paths
+    (`l0` runs through `_checked`, `l1` through `_guarded`): while the `except`
+    block is still active the thread keeps the exception -- and its traceback's
+    hold on `_capture`'s frame, `cap`'s graphs and `out` -- alive, which is the
+    very memory make-room is trying to hand this call."""
+    layers = _stack(SPECS["hybrid"])
+    model = _model(layers)
+    calls = []
+
+    def _rebase(**_kw):
+        calls.append(1)
+        if len(calls) == 2:            # the second request's re-base fails for want of memory
+            raise torch.OutOfMemoryError("CUDA out of memory. Tried to allocate 20.00 MiB")
+
+    model._rebase_expert_tier = _rebase
+    runner = dg.install_decode_graphs(model)
+
+    def oom_capture():
+        raise torch.AcceleratorError("CUDA error: out of memory")
+
+    with torch.inference_mode():
+        xs, cos, sin, pos = _inputs(2)
+        # (name, the belted path, whether that path has refused BEFORE it runs stock)
+        plan = ((("l0", runner._checked, False), ("l1", runner._guarded, True)),   # request 1
+                (("l2", runner._checked, False),))                                 # request 2
+        for t, entries in enumerate(plan):
+            cache = _cache(3)
+            assert not runner.begin_forward(batch=[torch.zeros(1, 4)], past_key_values=cache,
+                                            output_hidden_states=False)
+            assert runner.begin_forward(batch=[torch.zeros(1, 1)], past_key_values=cache,
+                                        output_hidden_states=False)
+            kw = dict(use_cache=True, past_key_values=cache,
+                      position_embeddings=(cos[:, t:t + 1], sin[:, t:t + 1]),
+                      position_ids=pos[:, t:t + 1])
+            for i, (name, path, refused_first) in enumerate(entries):
+                def stock(seq, _n=name, _i=i, _first=refused_first, **kwargs):
+                    assert sys.exc_info() == (None, None, None)   # the handler has ENDED
+                    assert (_n in runner._refused) is _first      # the order, both ways
+                    return layers[_i](seq, **kwargs)
+
+                assert path(name, stock, xs[t], kw, oom_capture) is not None
+            assert len(calls) == t + 1           # once in this request, however many layers
+    assert len(calls) == 2 and runner.stats["made_room"] == 2
+    out = capsys.readouterr().out
+    # The refusals carry the same TRANSIENT reason and re-arm every request, so the
+    # WARNING is printed once per REQUEST (two), not once per layer (three) and not
+    # once per process (one: the under-reporting this pinned before I3).
+    assert out.count("WARNING: decode graphs refused") == 2
+    assert "make-room re-base raised" in out     # best-effort, but never silent in a log
+
+
+@cuda
+def test_a_memory_refusal_is_cleared_at_the_next_request(capsys):
+    """Review Focus 5 / spec 5.3.8 (5): `_refused` is never cleared, so without
+    this one cold request would decode its tail layers eagerly for the life of the
+    process."""
+    runner = dg.install_decode_graphs(_model(_stack(SPECS["attn+dense"])))
+    runner._refuse_only("l3", "CUDA out of memory", transient=True)
+    assert "l3" in runner._refused
+    # a stock (prefill-shaped) forward = a new request
+    assert not runner.begin_forward(batch=[torch.zeros(1, 4)], past_key_values=None,
+                                    output_hidden_states=False)
+    assert "l3" not in runner._refused and not runner._transient_refused
+    assert "WARNING: decode graphs refused for l3" in capsys.readouterr().out
+
+
+@cuda
+def test_a_structural_refusal_is_not_cleared(capsys):
+    """The mirror of the test above: a refusal that is a property of the LAYER
+    (unbindable kwargs, bitwise disagreement, capture #3) stays permanent."""
+    runner = dg.install_decode_graphs(_model(_stack(SPECS["attn+dense"])))
+    runner._refuse_only("l4", "its graphs disagree bitwise with the stock forward")
+    assert not runner.begin_forward(batch=[torch.zeros(1, 4)], past_key_values=None,
+                                    output_hidden_states=False)
+    assert "l4" in runner._refused
+    assert "WARNING: decode graphs refused for l4" in capsys.readouterr().out
+
+
+@cuda
+def test_the_unchecked_replay_path_does_not_retry():
+    """Review Focus 5: the plain `rec.replay()` path holds no `_snapshot`, so a
+    memory failure there must PROPAGATE -- re-running a layer whose cache write
+    already landed corrupts every cache family (I4, `f54a799`), and the engine's
+    own "Not retried" error is the correct outcome. The belt covers the two
+    snapshotted paths only."""
+    layers = _stack(SPECS["attn+moe"])
+    calls = {"rebase": 0}
+    model = _model(layers)
+
+    def _rebase(**_kw):
+        calls["rebase"] += 1
+
+    model._rebase_expert_tier = _rebase
+    runner = dg.install_decode_graphs(model)
+    runner._checks["l0"] = dg._CHECK_TOKENS      # past the self-checks: unchecked replays
+    cache = _cache(1)
+    eager = []
+    with torch.inference_mode():
+        xs, cos, sin, pos = _inputs(4)
+        assert not runner.begin_forward(batch=[torch.zeros(1, 4)], past_key_values=cache,
+                                        output_hidden_states=False)
+        for t in range(3):                       # warm, capture, replay
+            assert runner.begin_forward(batch=[torch.zeros(1, 1)], past_key_values=cache,
+                                        output_hidden_states=False)
+            runner.run("l0", layers[0], xs[t],
+                       dict(use_cache=True, past_key_values=cache,
+                            position_embeddings=(cos[:, t:t + 1], sin[:, t:t + 1]),
+                            position_ids=pos[:, t:t + 1]))
+            runner.end_forward()
+        assert runner.stats["replays"] == 1 and "l0" not in runner._refused
+
+        def _oom():
+            raise torch.OutOfMemoryError("CUDA out of memory. Tried to allocate 20.00 MiB")
+
+        runner._records["l0"].steps.insert(0, _oom)   # the next replay runs out of memory
+
+        def counting(seq, **kwargs):
+            eager.append(1)
+            return layers[0](seq, **kwargs)
+
+        assert runner.begin_forward(batch=[torch.zeros(1, 1)], past_key_values=cache,
+                                    output_hidden_states=False)
+        with pytest.raises(torch.OutOfMemoryError):
+            runner.run("l0", counting, xs[3],
+                       dict(use_cache=True, past_key_values=cache,
+                            position_embeddings=(cos[:, 3:4], sin[:, 3:4]),
+                            position_ids=pos[:, 3:4]))
+    assert eager == [] and calls["rebase"] == 0       # no retry, and no make-room
+
+
+@cuda
+def test_a_structural_refusal_warns_once_for_the_process_a_transient_one_per_request(capsys):
+    """I3: `_warned` is cleared for the reasons a TRANSIENT refusal printed, at the
+    request boundary, and for no other."""
+    runner = dg.install_decode_graphs(_model(_stack(SPECS["attn+dense"])))
+
+    def new_request():
+        assert not runner.begin_forward(batch=[torch.zeros(1, 4)], past_key_values=None,
+                                        output_hidden_states=False)
+
+    for _ in range(3):
+        runner._refuse_only("l1", "CUDA out of memory", transient=True)
+        runner._refuse_only("l2", "its graphs disagree bitwise with the stock forward")
+        new_request()
+    out = capsys.readouterr().out
+    assert out.count("WARNING: decode graphs refused for l1 (CUDA out of memory)") == 3
+    assert out.count("WARNING: decode graphs refused for l2") == 1
+
+
+@cuda
+def test_the_belt_asks_the_rebase_for_a_shrink_only(capsys):
+    """I1: the belt's re-base must not be able to grow the tier back."""
+    seen = []
+    model = _model(_stack(SPECS["attn+dense"]))
+    model._rebase_expert_tier = lambda **kw: seen.append(kw)
+    runner = dg.install_decode_graphs(model)
+    runner._make_room()
+    assert seen == [{"shrink_only": True}]

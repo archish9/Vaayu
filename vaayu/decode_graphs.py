@@ -278,6 +278,19 @@ def _why(exc):
     return f"capture failed: {_exc_summary(exc)}"
 
 
+def _is_memory_error(exc):
+    """A failure for want of memory, whichever class the raising code used. D2's
+    cold cell raises BOTH shapes in one token: a torch.AcceleratorError ("CUDA
+    error: out of memory") from a graph's `capture_end`, then a
+    torch.OutOfMemoryError from the expert injection's `build_exl3_qmatrix`.
+    Neither class is the other's subclass (both are plain RuntimeErrors), so match
+    the one class we know plus CUDA's own text -- broad enough for both, narrow
+    enough that an unrelated RuntimeError still propagates untouched."""
+    if isinstance(exc, torch.OutOfMemoryError):
+        return True
+    return isinstance(exc, RuntimeError) and "out of memory" in str(exc).lower()
+
+
 def _cleanup_pool(pool):
     """Undo a failed `capture_end`'s effect on PyTorch's device caching allocator
     for `pool` -- but only as far as `capture_end` itself actually got. There is no
@@ -449,7 +462,12 @@ class DecodeGraphRunner:
         self._warming = False
         self._cache = None        # the CURRENT forward's cache; replays write here (I1)
         self._refused = set()
+        self._transient_refused = set()   # the memory-class subset of _refused: cleared
+                                          # at the next request (begin_forward)
+        self._made_room = False   # the belt's per-request latch (see _make_room)
         self._warned = set()
+        self._transient_warned = set()    # the `_warned` reasons a TRANSIENT refusal
+                                          # printed: re-armed with it at begin_forward
         self._checks = collections.Counter()
         self._request_captures = collections.Counter()
         self._disabled = False
@@ -479,6 +497,18 @@ class DecodeGraphRunner:
             # A prefill -- or any other stock forward -- starts a request: the
             # give-up rule counts captures between two of them.
             self._request_captures.clear()
+            # A memory failure is a property of the moment, not of the layer: one
+            # request that ran the card dry must not cost the PROCESS its graphs
+            # (`_refused` is never otherwise cleared). Structural refusals stay.
+            self._refused -= self._transient_refused
+            self._transient_refused.clear()
+            # A re-arming refusal must be visible per request: a persistently
+            # starved load otherwise prints ONE warning for the life of the process
+            # while the refusal, failed capture and eager fallback repeat. Structural
+            # reasons stay deduplicated for the process.
+            self._warned -= self._transient_warned
+            self._transient_warned.clear()
+            self._made_room = False    # the belt makes room once per request
             return False
         self._announce()
         self._token += 1
@@ -516,6 +546,12 @@ class DecodeGraphRunner:
             self.stats["replays"] += 1
             if checked:
                 return self._checked(name, layer, seq, kwargs, rec.replay)
+            # NOT belted (D2). `_checked` and `_guarded` make room before a stock
+            # reference they were ALREADY going to run; this path runs no reference
+            # and takes no `_snapshot`, so the only belt available here would be a
+            # second execution of the layer -- which corrupts every cache family
+            # (I4, `f54a799`). A memory failure propagates, and the engine's own
+            # "Not retried" error is the correct outcome. Same for `_warm_up`.
             return rec.replay()
         rec = None                         # drop the reference before popping (M1): its
         self._records.pop(name, None)      # graphs' blocks really return to the pool first
@@ -546,12 +582,24 @@ class DecodeGraphRunner:
         bitwise with stock's; the tensor returned is always stock's own output."""
         cache = self._cache
         before = _snapshot(cache)
+        failed = None
         try:
             out = _clone(step())
         except Exception as exc:
+            # Only a string and a flag leave this block, and the block ENDS before
+            # the eager reference runs: while the handler is active the thread holds
+            # the exception alive whatever is done with the local name, and its
+            # traceback pins `_capture`'s frame -- that capture's graphs and its
+            # output, device memory the reference below is about to need (D2).
+            failed = (_why(exc), _is_memory_error(exc))
+            del exc, step
+        if failed is not None:
+            why, mem = failed
             _restore(cache, before)
-            ref = layer(seq, **kwargs)
-            self._refuse_only(name, _why(exc))
+            if mem:
+                self._make_room()       # BEFORE the reference below, which is the call
+            ref = layer(seq, **kwargs)  # that killed D2's cold first long request
+            self._refuse_only(name, why, transient=mem)
             return ref
         after_step = _snapshot(cache)
         _restore(cache, before)
@@ -567,29 +615,108 @@ class DecodeGraphRunner:
         already did (a replayed state update, a KV write), then run stock once."""
         cache = self._cache
         before = _snapshot(cache)
+        failed = None
         try:
             return capture()
         except Exception as exc:
-            _restore(cache, before)
-            return self._refuse(name, layer, seq, kwargs, _why(exc))
+            failed = (_why(exc), _is_memory_error(exc))   # see `_checked`: the handler
+            del exc, capture                              # must END before stock runs
+        why, mem = failed
+        _restore(cache, before)
+        # Refused BEFORE the reference, as this path always did (it used to call
+        # `_refuse` here): if the reference runs out of memory anyway, the layer is
+        # still on record and the `capture failed: ...` WARNING is still in the
+        # logs/run-*/ folder the user mails in -- which is the one case where that
+        # stage-1 reason matters most.
+        self._refuse_only(name, why, transient=mem)
+        if mem:
+            self._make_room()          # see `_checked`: BEFORE the reference, not after
+        return layer(seq, **kwargs)
+
+    def _make_room(self):
+        """Room for the eager reference `_checked` / `_guarded` are about to run,
+        after a capture failed for want of memory. D2's cold first long request died
+        on that reference -- the capture raised CUDA's out-of-memory at `capture_end`
+        and the reference raised it again from the expert injection -- so the room is
+        made BETWEEN the restore and that one call. The reference still runs exactly
+        once: a second run of it would be a THIRD execution of the layer, which
+        corrupts every cache family (I4, `f54a799`, and the engine's own "Not
+        retried" error says the same).
+
+        Make room = the model's tier re-base called SHRINK-ONLY (the per-request
+        boundary re-base minus its refund branch), read off the model the
+        way `_charge` reads the tier, so a model without one (dense, a test double)
+        is a no-op. That re-base is a RELATIVE cut which refunds only what it took:
+        never `set_budget` from here (`_release_pool` says why -- an absolute restore
+        hands back bytes the card no longer has, S19 vi) and never a second eviction
+        mechanism (`set_budget` already evicts LRU to fit).
+
+        ONCE per request, not once per layer: the re-base prints a line on every
+        call, including when it changes nothing, and that log is the artifact users
+        mail in; this also bounds the belt to one `mem_get_info` per request. The
+        flag clears where `_request_captures` does.
+
+        The re-base is called `shrink_only=True`: the boundary's own re-base is
+        bidirectional (it refunds its outstanding cut when more is free than at the
+        boundary), and that first re-base's `empty_cache()` is exactly what makes
+        more free show up -- a bidirectional call here would hand the tier BACK the
+        bytes this belt exists to hand the reference. The belt needs a shrink.
+
+        `stats["made_room"]` counts this belt FIRING, not room obtained: a model
+        with no re-base at all still records one.
+
+        Best-effort by design: making room is for the caller's reference, so the
+        class we are already handling here must not become a NEW raise site in
+        front of it -- a memory error from the re-base itself is dropped and the
+        reference still gets its try. Anything else propagates. Dropped, but never
+        SILENT: in a mailed-in logs/run-*/ folder "the re-base raised" and "the
+        re-base did nothing" are otherwise indistinguishable."""
+        if self._made_room:
+            return
+        self._made_room = True
+        self.stats["made_room"] += 1
+        rebase = getattr(self._model, "_rebase_expert_tier", None)
+        if rebase is None:
+            return
+        why = None
+        try:
+            rebase(shrink_only=True)
+        except Exception as exc:
+            if not _is_memory_error(exc):
+                raise
+            why = _exc_summary(exc)    # not `_why`: that one reads "capture failed",
+                                       # and nothing captured here
+            del exc                    # as everywhere on this path: its traceback is
+                                       # itself memory the reference is about to want
+        if why is not None:            # printed with no handler live, as above
+            print(f"[Vaayu] WARNING: decode graphs: the make-room re-base raised {why}; "
+                  f"the stock forward runs anyway")
 
     def _refuse(self, name, layer, seq, kwargs, why):
         self._refuse_only(name, why)
         return layer(seq, **kwargs)
 
-    def _refuse_only(self, name, why):
+    def _refuse_only(self, name, why, *, transient=False):
         self._refused.add(name)
+        if transient:
+            self._transient_refused.add(name)
         self._records.pop(name, None)
         self.stats["refused"] += 1
         if why not in self._warned:
             self._warned.add(why)
+            if transient:
+                self._transient_warned.add(why)
             print(f"[Vaayu] WARNING: decode graphs refused for {name} ({why}); it decodes "
                   f"eagerly. Later layers refused for the same reason are not listed.")
 
     def _warm_up(self, layer, seq, kwargs):
         """The process's first eligible token runs eager ON the capture stream: the
         lazy state a capture cannot create (cuBLAS workspace for that stream, Triton
-        JIT) exists before the first capture."""
+        JIT) exists before the first capture.
+
+        NOT belted (D2): no `_snapshot` is taken here either, so a memory failure
+        propagates -- a second run of this layer would corrupt every cache family
+        (I4, `f54a799`)."""
         cur = torch.cuda.current_stream()
         self._stream.wait_stream(cur)
         with torch.cuda.stream(self._stream):

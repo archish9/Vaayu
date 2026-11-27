@@ -508,6 +508,12 @@ def _width2_admits(model) -> bool:
     if not callable(fit):
         return False
     from .vram_plan import VramPlanError
+    # Refused by design at every boot: tells the admission retry not to print
+    # "admission refused ... re-planning" under the line advertising the context.
+    try:
+        model._admission_probe = True
+    except Exception:
+        pass
     try:
         need = fit(int(model.max_seq_len), N=2,
                    expert_giveback_bytes=expert_giveback_bytes(model),
@@ -516,6 +522,11 @@ def _width2_admits(model) -> bool:
         return False
     except Exception:
         return False
+    finally:
+        try:
+            model._admission_probe = False
+        except Exception:
+            pass
     return need is not None
 
 

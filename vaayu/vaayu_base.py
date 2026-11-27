@@ -2853,6 +2853,8 @@ class VaayuBaseModel(GenerationMixin):
 
         self._vram_plan = None
         self._expert_tier_margin_bytes = 0
+        self._expert_tier_planned_budget = 0   # load-time tier ceiling; 0 = no tier
+        self._rebase_cut = 0                   # bytes the re-base itself has taken from the tier
         if device.startswith("cuda") and torch.cuda.is_available():
             from .vram_plan import (DEFAULT_ALLOC_FACTOR, VramShape,
                                     plan_vram, reserve_floor_bytes,
@@ -3641,6 +3643,10 @@ class VaayuBaseModel(GenerationMixin):
                         _vram_budget,
                         track_evicted_keys=bool(getattr(self, "enable_expert_usage", False)),
                     )
+                    # D2: the REAL post-pinning ceiling, remembered so each
+                    # request's boundary re-base sizes against the PLAN, never
+                    # against the budget a previous request left behind.
+                    self._expert_tier_planned_budget = _vram_budget
                     print(f"[Vaayu-MoE] Expert VRAM cache: {_vram_budget / 1e9:.1f} GB "
                           f"(~{int(_vram_budget // max(1, self._moe_geometry['expert_bytes']))} "
                           f"experts resident on GPU)")
@@ -4461,6 +4467,77 @@ class VaayuBaseModel(GenerationMixin):
         return self._vram_plan.pinning_budget if self._vram_plan else 0
 
     def _assert_context_fits(self, n_tokens: int, N: int = 1,
+                             expert_giveback_bytes: int = 0,
+                             batched_prefill: bool = False,
+                             prompt_tokens: int | None = None) -> int | None:
+        """Admission guard with ONE re-plan after a reclaim (D2 (c)).
+
+        Runs `_assert_context_fits_once`. Only when that REFUSES (VramPlanError)
+        does it `gc.collect()` + `empty_cache()` and plan again, once: a request
+        that died mid-forward leaves its KV cache in a reference cycle, and the
+        server freezes gc after load (utils.py), so nothing else ever collects it
+        -- measured: 8.32 GB of dead KV, request 2 refused at max_seq_len=8192,
+        and `gc.collect()` returned exactly those bytes. This defends against any
+        cyclic retention, not just the one `release_exception_frames` breaks.
+        Never on a path that admits (a collection is what the freeze avoids), and
+        never a loop: the second refusal stands, its text saying a retry ran and how
+        many GiB the reclaim returned (0.00 = nothing was retained, the request
+        genuinely does not fit; more = something was holding memory).
+
+        Load-time probes may take the retry path: the width-2 batching probe is
+        refused by design, so one gc.collect() + empty_cache() runs at load, before
+        the gc freeze, and stays quiet about it (`_admission_probe`, set by `batch._width2_admits`). Harmless."""
+        from .vram_plan import VramPlanError
+        # Explicit, not `self._assert_context_fits_once`: tests pass non-instance
+        # doubles, so a subclass override of the inner plan is deliberately not honoured.
+        _args = dict(N=N, expert_giveback_bytes=expert_giveback_bytes,
+                     batched_prefill=batched_prefill, prompt_tokens=prompt_tokens)
+        try:
+            return VaayuBaseModel._assert_context_fits_once(self, n_tokens, **_args)
+        except VramPlanError:
+            _before = _after = 0
+            _measured = False
+            import gc
+            try:
+                if torch.cuda.is_available():
+                    _before = int(torch.cuda.memory_allocated())
+            except Exception:                       # noqa: BLE001 -- best-effort reclaim
+                _before = None
+            gc.collect()
+            try:
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                    _after = int(torch.cuda.memory_allocated())
+                    _measured = _before is not None
+            except Exception:                       # noqa: BLE001 -- best-effort reclaim
+                pass
+            _gib = max(0, (_before or 0) - _after) / 1024 ** 3 if _measured else 0.0
+            _what = (f"reclaimed {_gib:.2f} GiB" if _measured
+                     else "could not measure the reclaim")
+            # The width-2 batching probe is refused by design at every boot; its
+            # retry is not news in the log users mail in (named, not hidden, below).
+            if not getattr(self, "_admission_probe", False):
+                print(f"[Vaayu-VRAM] admission refused {int(n_tokens)} tokens; {_what} "
+                      f"with gc.collect() + empty_cache() and re-planning once.")
+            try:
+                return VaayuBaseModel._assert_context_fits_once(self, n_tokens, **_args)
+            except VramPlanError as again:
+                if not _measured:
+                    _verdict = ("The reclaim could not be measured (no CUDA, or "
+                                "memory_allocated raised), so whether anything was "
+                                "retained is unknown.")
+                elif _gib < 0.005:
+                    _verdict = "Nothing was retained: this request does not fit the card."
+                else:
+                    _verdict = "Memory was held and released, and it still does not fit."
+                again.args = (str(again) + "\nAdmission was re-planned once after "
+                              f"gc.collect() + empty_cache() ({_what}; counts "
+                              "memory_allocated only, so cached bytes freed by "
+                              f"empty_cache are uncounted and this under-reports); the "
+                              f"refusal stands. ({_verdict})",)
+                raise
+
+    def _assert_context_fits_once(self, n_tokens: int, N: int = 1,
                              expert_giveback_bytes: int = 0,
                              batched_prefill: bool = False,
                              prompt_tokens: int | None = None) -> int | None:
@@ -6032,6 +6109,155 @@ class VaayuBaseModel(GenerationMixin):
             output.past_key_values = None
         return output
 
+    def _rebase_expert_tier(self, shrink_only: bool = False) -> Optional[int]:
+        """D2: re-apply the load-time tier inequality against driver-free VRAM
+        measured NOW (the prefill->decode boundary), so the tier fills only into
+        what is really free. `ExpertVRAMCache.put` is budget-only and a long
+        prefill has spent VRAM the load could not foresee. Returns the budget set,
+        or None when it did nothing (no CUDA, or no tier -- dense).
+
+        Deliberately no `empty_cache()` before reading free: the reserved-but-
+        unallocated bytes there belong to other streams (the decode graphs') and
+        are not reachable by the allocation that fails. Sized against the PLANNED
+        ceiling every time, so repeated requests never ratchet the tier down.
+
+        `shrink_only=True` skips the GROW branch (the refund of an outstanding
+        cut). The decode-graph belt's make-room passes it: the boundary re-base's
+        own `empty_cache()` is what makes MORE free show up on the belt's re-read,
+        and a grow there would hand the tier back the very bytes the belt is
+        making room for. The boundary keeps the bidirectional behaviour the
+        refund machinery is built around."""
+        tier = getattr(self, "_expert_vram_cache", None)
+        if (tier is None or not torch.cuda.is_available()
+                or getattr(self, "_elastic_tier", None) is not None):
+            # The elastic tier owns the budget per request (its grant covers the
+            # first decode forward); a re-fit here would bypass its callback.
+            return None
+        from .vram_plan import rebased_tier_budget
+        _free = int(torch.cuda.mem_get_info()[0])
+        _old = int(tier.budget_bytes)
+        _usage = int(tier.current_usage)
+        _margin = self._expert_tier_margin_bytes
+        _target = rebased_tier_budget(
+            free_bytes=_free, tier_usage=_usage,
+            planned_budget=self._expert_tier_planned_budget,
+            margin_bytes=_margin)
+        # RELATIVE: other writers (decode-graph pool charge, admission cap) lower
+        # budget_bytes too; only ever refund what THIS re-base took.
+        _new = _old
+        if _target < _old:
+            _new = _target
+            self._rebase_cut = getattr(self, "_rebase_cut", 0) + (_old - _target)
+            tier.set_budget(_new)
+            # Eviction only frees whole 20 MiB segments (partial-free physics):
+            # realise them now so the driver sees the bytes.
+            torch.cuda.empty_cache()
+        elif not shrink_only and _target > _old and getattr(self, "_rebase_cut", 0):
+            _give = min(self._rebase_cut, _target - _old)
+            _new = _old + _give
+            tier.set_budget(_new)
+            self._rebase_cut -= _give
+        _mib = 1024.0 ** 2
+        print(f"[Vaayu-VRAM] tier re-base: driver-free {_free / _mib:.0f} MiB, "
+              f"margin {_margin / _mib:.0f} MiB, "
+              f"budget {_old / _mib:.0f} -> {_new / _mib:.0f} MiB "
+              f"(planned {self._expert_tier_planned_budget / _mib:.0f} MiB)")
+        if _new == 0 and _usage == 0 and not getattr(self, "_rebase_warned", False):
+            self._rebase_warned = True
+            print("[Vaayu-VRAM] WARNING: driver-free VRAM at the prefill->decode "
+                  "boundary is below the tier margin and the tier is empty; "
+                  "nothing to evict, the tier stays at 0 for this request")
+        return _new
+
+    def _release_failed_forward(self, held, batch, exc=None) -> None:
+        """D2 (c): hand back what a forward that is dying still holds on the
+        device -- the streamed layer's weights (its `free_from_gpu` sits after the
+        compute, so a raise skips it), the hidden states, and the allocator's
+        cache. Best-effort and silent on failure: it runs while another error is
+        propagating and must never replace it. A no-op on CPU, and on a dense
+        model (no tier is touched here; the tier's budget is `_refund_expert_tier`'s).
+
+        The streamed layer's weights are freed on EVERY exit. The gc + empty_cache
+        runs only for a memory-class failure (anywhere in `exc`'s cause chain,
+        decode_graphs' predicate): a client disconnect (GeneratorExit /
+        CancelledError) is routine here, and a gc.collect() per cancellation on a
+        gc-frozen server is the cost the freeze exists to avoid."""
+        try:
+            if held is not None:
+                _layer, _moved = held
+                self.loader_strategy.free_from_gpu(
+                    self.model, _layer, _moved, self.hf_quantizer)
+        except Exception as _e:            # noqa: BLE001
+            print(f"[Vaayu-VRAM] WARNING: releasing the failed layer's weights "
+                  f"raised {type(_e).__name__}: {_e}")
+        try:
+            # `batch` may be a container the caller owns; harmless, the forward
+            # re-raises straight after this. A raise here is reported below as
+            # "emptying the allocator", so keep `clear()` to a plain list/dict.
+            batch.clear()
+            # A private predicate shared across modules on purpose: one definition of
+            # "memory-class" for the belt and for this release.
+            from .decode_graphs import _is_memory_error
+            _seen, _x, _mem = set(), exc, False
+            while _x is not None and id(_x) not in _seen and not _mem:
+                _seen.add(id(_x))
+                _mem = _is_memory_error(_x)
+                _x = _x.__cause__ or _x.__context__
+            if _mem:
+                clean_memory()
+        except Exception as _e:            # noqa: BLE001
+            print(f"[Vaayu-VRAM] WARNING: emptying the allocator after a failed "
+                  f"forward raised {type(_e).__name__}: {_e}")
+
+    def _refund_expert_tier(self) -> Optional[int]:
+        """D2: hand the re-base's outstanding cut back at the FIRST prefill pass
+        of a new request. Returns the budget set, or None when it did nothing
+        (no CUDA, no tier, an elastic tier, or nothing outstanding).
+
+        The cut `_rebase_expert_tier` makes at request N's prefill->decode
+        boundary protects N's decode, but left in force it is also the budget
+        request N+1's PREFILL runs under -- the one phase that cannot afford a
+        half-size tier, since prefill routes ~every expert and every miss is a
+        disk read. Measured on MiniMax-M2.7 at 21,551 tokens: refunding only at
+        the NEXT boundary (too late) cost warm TTFT 129.22 -> 219.05 s mean over
+        six sessions, with budget-vs-TTFT Spearman -0.9856 (pooled RANK
+        correlation over all six sessions) and misses -> bytes -> TTFT
+        r = 1.000 / 0.997 (Pearson, linear); decode was unaffected. (The
+        Pearson -0.9978 quoted in the evidence document is budget-vs-TTFT
+        within the five CUT sessions only, n=5 over four distinct budgets, with
+        budget confounded with session order: the causal evidence is the
+        `8cbad32` control plus warm3's recovery, not either coefficient.)
+        Refunding here is `8cbad32`'s proven warm behaviour (full budget through
+        every prefill, 6/6 served over eighteen sessions) plus the cold
+        protection, since the boundary still cuts afterwards.
+
+        RELATIVE, like `_release_pool`'s refund (decode_graphs.py): on top of the
+        budget as it stands NOW, never an absolute `set_budget` to the plan --
+        another writer (the decode-graph pool charge, an admission cap) may have
+        lowered it since, and an absolute restore would hand back bytes the card
+        no longer has (S19 vi).
+
+        LIMITATION: a request with no prefill pass at all -- a 100% prefix hit
+        runs its single position as a DECODE pass -- never reaches THIS hook.
+        This hook serves library callers; the server's gates cover that case:
+        `BatchScheduler._run` (the live gate every served request passes) and
+        `EngineHandle.slot()` (public API, no production caller) both call the
+        refund before the generation, whether or not a prefill pass follows."""
+        tier = getattr(self, "_expert_vram_cache", None)
+        _cut = int(getattr(self, "_rebase_cut", 0) or 0)
+        if (tier is None or _cut <= 0 or not torch.cuda.is_available()
+                or getattr(self, "_elastic_tier", None) is not None):
+            return None
+        _old = int(tier.budget_bytes)
+        _new = _old + _cut
+        tier.set_budget(_new)
+        self._rebase_cut = 0           # consumed: a second prefill refunds nothing
+        _mib = 1024.0 ** 2
+        print(f"[Vaayu-VRAM] tier refund: budget {_old / _mib:.0f} -> "
+              f"{_new / _mib:.0f} MiB (+{_cut / _mib:.0f} MiB the re-base took, "
+              f"returned for this request's prefill)")
+        return _new
+
     @torch.no_grad()
     def forward(
             self,
@@ -6299,15 +6525,33 @@ class VaayuBaseModel(GenerationMixin):
             # hit-rate telemetry excludes prefill's ~100%-miss pollution. (The old
             # guard here tested `_token_count == 0 and shape[1] == 1`, which is
             # unsatisfiable after prefill increments _token_count — it never ran.)
+            _already_reset = getattr(self, "_decode_stats_reset", False)
             _reset_now, self._decode_stats_reset = decode_stats_reset(
                 is_moe=self.is_moe,
                 has_expert_cache=self._expert_cache is not None,
                 is_prefill_pass=self._moe_prefill_pass,
-                already_reset=getattr(self, "_decode_stats_reset", False))
+                already_reset=_already_reset)
+            # D2: a prefill pass while the latch is still set is the FIRST prefill
+            # pass of a NEW request (the latch drops right here, and only a
+            # boundary crossing could have set it) -- so the outstanding re-base
+            # cut goes back BEFORE this prefill reads a single expert. Later
+            # prefill passes of the same request see `_already_reset` False.
+            if self._moe_prefill_pass and _already_reset:
+                try:
+                    self._refund_expert_tier()
+                except Exception as _e:      # noqa: BLE001 -- best-effort by design
+                    # `_rebase_cut` is zeroed only AFTER `set_budget` returns, so a
+                    # refund the scheduler's gate swallowed is still outstanding
+                    # here; retrying it unguarded would kill the request one layer
+                    # later. Same idiom as the scheduler: named, never silent.
+                    print(f"[Vaayu-VRAM] tier refund skipped "
+                          f"({type(_e).__name__}: {_e}); the request proceeds.")
             if _reset_now:
                 self._expert_cache.reset_stats()
                 if getattr(self, '_expert_vram_cache', None) is not None:
                     self._expert_vram_cache.reset_stats()
+                # D2: once per request, at the prefill->decode boundary.
+                self._rebase_expert_tier()
 
             # Prefill lookahead pipeline: stream upcoming layers' full expert
             # sets while earlier layers compute. Long prompts only (short ones
@@ -6371,6 +6615,10 @@ class VaayuBaseModel(GenerationMixin):
                 batch=batch, past_key_values=past_key_values,
                 output_hidden_states=output_hidden_states)
 
+            # D2 (c): the streamed layer whose weights this forward has put on the
+            # device and not yet taken off it -- (layer, moved_layers), or None.
+            # A request that dies mid-layer must hand it back (see the except below).
+            _held = None
             try:
                 for i, (layer_name, layer) in tqdm(enumerate(zip(self.layer_names, self.layers)),
                                                    desc=f'running layers({self.running_device})',
@@ -6493,6 +6741,7 @@ class VaayuBaseModel(GenerationMixin):
                             self.profiler.add_profiling_time('create_layer_from_safe_tensor', elapsed_time)
 
                     # Run layer
+                    _held = None if _layer_pinned else (layer, moved_layers)
 
                     for j, seq in enumerate(batch):
 
@@ -6620,6 +6869,7 @@ class VaayuBaseModel(GenerationMixin):
                         self.loader_strategy.free_from_gpu(
                             self.model, layer, moved_layers, self.hf_quantizer
                         )
+                    _held = None
 
                     # No per-layer record for a VRAM-resident layer on a forward
                     # that is ELIGIBLE for decode graphs (one token, N=1): every
@@ -6645,6 +6895,23 @@ class VaayuBaseModel(GenerationMixin):
                     # per-token empty_cache() defeats the CUDA caching allocator.
                     if self._token_count == 0 and i % 40 == 39:
                         clean_memory()
+            except BaseException as _failed:
+                # D2 (c): a request that dies mid-forward -- the layer-OOM raise
+                # above, a cancellation, anything -- must not leave the device
+                # holding what it was using, or the NEXT request is admitted
+                # against a card that looks full (measured on the cold cell: "the
+                # largest context that fits RIGHT NOW is max_seq_len=8192", from a
+                # planned 32768). The exception's traceback keeps this frame's
+                # locals alive for as long as anyone holds it, so drop them here.
+                # Releases only: the layer is NOT re-run and the KV cache is NOT
+                # truncated (I4) -- the original error propagates unchanged.
+                seq = layer_out = kwargs = _mask_args = _base = None
+                _kw_base.clear()
+                # Runs BEFORE the sibling `finally`'s synchronize(), so an async H2D
+                # may still be in flight when `clean_memory()` frees. Safe: the
+                # caching allocator synchronizes its own events before `cudaFree`.
+                self._release_failed_forward(_held, batch, _failed)
+                raise
             finally:
                 if getattr(self, "_prefill_stager_active", False):
                     self._prefill_stop.set()
