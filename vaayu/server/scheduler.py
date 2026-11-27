@@ -476,6 +476,14 @@ class BatchScheduler:
             return
         async with self.engine._lock:
             set_current_sessions([j.session_key for j in members])
+            # D2: hand back the tier re-base's outstanding cut at the live
+            # request gate (P10: `slot()` has no production caller; this is the
+            # lock every served request, batched or serial, passes through). A
+            # request with no prefill pass never reaches `forward`'s hook.
+            # Synchronous, relative, a no-op when nothing is outstanding.
+            refund = getattr(self.engine.model, "_refund_expert_tier", None)
+            if callable(refund):
+                refund()
             try:
                 # THE RULE. A batch of one must NEVER reach batched_generate --
                 # 3.24x regression on Qwen (573.88s vs 177.14s). This is the

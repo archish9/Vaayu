@@ -892,3 +892,63 @@ def test_a_fallback_member_the_engine_never_ran_gets_a_dispatch_error(monkeypatc
     assert [k for k, _p in out[1]] == ["dispatch_error"], (
         "member 1 got only the dispatcher's fan-out; it must be marked as "
         f"one so its route still writes the row -- got {out[1]!r}")
+
+
+# ── D2 task 5d: the tier refund fires at the scheduler's live gate ──────────
+# `engine.slot()` has no production caller since P10; `_run` is the gate every
+# served request passes through. These drive the SCHEDULER, not slot().
+
+def _run_one_job_through_scheduler(model, monkeypatch, on_generate=None):
+    engine = EngineHandle(model)
+
+    async def fake_stream(req, cancel=None, prepared=None, meter=None):
+        if on_generate:
+            on_generate()
+        yield ("delta", "hi")
+
+    monkeypatch.setattr(engine, "stream", fake_stream)
+    sched = BatchScheduler(engine, queue_depth=8, max_batch_size=2,
+                           prefill_chunk_size=512)
+
+    async def go():
+        await sched.start()
+        job = _job("s0")
+        await sched.submit(job)
+        await _drain(job)
+        await sched.stop()
+
+    asyncio.run(go())
+
+
+def test_the_scheduler_refunds_an_outstanding_cut_before_the_generation(monkeypatch):
+    import torch
+    from tests.test_vram_budget import _FakeTier, _fake_model, _patch_free
+    GiB = 1024 ** 3
+    tier = _FakeTier(usage=0, budget=1 * GiB - 500 * 1024 ** 2)   # cut, then capped
+    _patch_free(monkeypatch, free=8 * GiB)
+    m = _fake_model(tier=tier, planned=3 * GiB)
+    m._rebase_cut = 2 * GiB
+    m._vram_plan = object()
+    seen = {}
+    # No prefill pass runs (m.forward is never called): only the gate can refund.
+    _run_one_job_through_scheduler(
+        m, monkeypatch, on_generate=lambda: seen.update(
+            budget=tier.budget_bytes, cut=m._rebase_cut))
+    assert seen == {"budget": 3 * GiB - 500 * 1024 ** 2, "cut": 0}, seen  # relative, before generating
+    assert m._rebase_cut == 0 and len(tier.set_budget_calls) == 1
+
+
+def test_the_scheduler_refund_is_a_noop_with_nothing_outstanding(monkeypatch):
+    from tests.test_vram_budget import _FakeTier, _fake_model, _patch_free
+    GiB = 1024 ** 3
+    tier = _FakeTier(usage=0, budget=3 * GiB)
+    _patch_free(monkeypatch, free=8 * GiB)
+    m = _fake_model(tier=tier, planned=3 * GiB)
+    m._rebase_cut = 0
+    m._vram_plan = object()
+    _run_one_job_through_scheduler(m, monkeypatch)
+    assert tier.set_budget_calls == []
+
+
+def test_the_scheduler_tolerates_a_model_without_the_helper(monkeypatch):
+    _run_one_job_through_scheduler(RecordingModel(), monkeypatch)
