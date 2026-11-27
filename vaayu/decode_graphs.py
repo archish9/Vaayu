@@ -466,6 +466,8 @@ class DecodeGraphRunner:
                                           # at the next request (begin_forward)
         self._made_room = False   # the belt's per-request latch (see _make_room)
         self._warned = set()
+        self._transient_warned = set()    # the `_warned` reasons a TRANSIENT refusal
+                                          # printed: re-armed with it at begin_forward
         self._checks = collections.Counter()
         self._request_captures = collections.Counter()
         self._disabled = False
@@ -500,6 +502,12 @@ class DecodeGraphRunner:
             # (`_refused` is never otherwise cleared). Structural refusals stay.
             self._refused -= self._transient_refused
             self._transient_refused.clear()
+            # A re-arming refusal must be visible per request: a persistently
+            # starved load otherwise prints ONE warning for the life of the process
+            # while the refusal, failed capture and eager fallback repeat. Structural
+            # reasons stay deduplicated for the process.
+            self._warned -= self._transient_warned
+            self._transient_warned.clear()
             self._made_room = False    # the belt makes room once per request
             return False
         self._announce()
@@ -635,7 +643,8 @@ class DecodeGraphRunner:
         corrupts every cache family (I4, `f54a799`, and the engine's own "Not
         retried" error says the same).
 
-        Make room = the model's own per-request tier re-base, read off the model the
+        Make room = the model's tier re-base called SHRINK-ONLY (the per-request
+        boundary re-base minus its refund branch), read off the model the
         way `_charge` reads the tier, so a model without one (dense, a test double)
         is a no-op. That re-base is a RELATIVE cut which refunds only what it took:
         never `set_budget` from here (`_release_pool` says why -- an absolute restore
@@ -646,6 +655,12 @@ class DecodeGraphRunner:
         call, including when it changes nothing, and that log is the artifact users
         mail in; this also bounds the belt to one `mem_get_info` per request. The
         flag clears where `_request_captures` does.
+
+        The re-base is called `shrink_only=True`: the boundary's own re-base is
+        bidirectional (it refunds its outstanding cut when more is free than at the
+        boundary), and that first re-base's `empty_cache()` is exactly what makes
+        more free show up -- a bidirectional call here would hand the tier BACK the
+        bytes this belt exists to hand the reference. The belt needs a shrink.
 
         `stats["made_room"]` counts this belt FIRING, not room obtained: a model
         with no re-base at all still records one.
@@ -665,7 +680,7 @@ class DecodeGraphRunner:
             return
         why = None
         try:
-            rebase()
+            rebase(shrink_only=True)
         except Exception as exc:
             if not _is_memory_error(exc):
                 raise
@@ -689,6 +704,8 @@ class DecodeGraphRunner:
         self.stats["refused"] += 1
         if why not in self._warned:
             self._warned.add(why)
+            if transient:
+                self._transient_warned.add(why)
             print(f"[Vaayu] WARNING: decode graphs refused for {name} ({why}); it decodes "
                   f"eagerly. Later layers refused for the same reason are not listed.")
 

@@ -794,3 +794,29 @@ def test_poison_release_is_a_noop_off_cuda_and_without_a_tier(monkeypatch):
     m.layers[2] = m.dec[1] = _Boom()
     with pytest.raises(RuntimeError, match="CUDA OOM on layers.1"):
         run(m, new=1)
+
+
+def test_shrink_only_rebase_never_refunds_the_cut_but_the_boundary_does(monkeypatch):
+    """I1: the decode-graph belt re-reads free VRAM after the boundary's own
+    `empty_cache()` returned bytes to the driver; its call must not hand the
+    outstanding cut back to the tier."""
+    GiB = 1024 ** 3
+    tier = _FakeTier(usage=1 * GiB, budget=1 * GiB)        # cut by this request's boundary
+    _patch_free(monkeypatch, free=4 * GiB)                 # MORE free than at the boundary
+    m = _fake_model(tier=tier, planned=3 * GiB, margin=200 * MiB)
+    m._rebase_cut = 2 * GiB
+    assert m._rebase_expert_tier(shrink_only=True) == 1 * GiB
+    assert tier.budget_bytes == 1 * GiB and m._rebase_cut == 2 * GiB
+    assert tier.set_budget_calls == []
+    assert m._rebase_expert_tier() == 3 * GiB              # the boundary still refunds
+    assert m._rebase_cut == 0
+
+
+def test_shrink_only_rebase_still_shrinks(monkeypatch):
+    GiB = 1024 ** 3
+    tier = _FakeTier(usage=2 * GiB, budget=3 * GiB)
+    _patch_free(monkeypatch, free=100 * MiB)
+    m = _fake_model(tier=tier, planned=3 * GiB, margin=200 * MiB)
+    new = 2 * GiB + 100 * MiB - 200 * MiB
+    assert m._rebase_expert_tier(shrink_only=True) == new
+    assert m._rebase_cut == 3 * GiB - new

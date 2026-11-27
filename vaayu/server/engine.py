@@ -377,7 +377,11 @@ class EngineHandle:
                     # cap runs after this and still wins.
                     refund = getattr(self.model, "_refund_expert_tier", None)
                     if callable(refund):
-                        refund()
+                        try:
+                            refund()
+                        except Exception as exc:     # noqa: BLE001 -- best-effort
+                            print(f"[Vaayu-VRAM] tier refund skipped "
+                                  f"({type(exc).__name__}: {exc}); the request proceeds.")
                     yield
                 finally:
                     # The slot must outlive the generation on EVERY exit path.
