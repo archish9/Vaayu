@@ -170,6 +170,9 @@ class _FakeTier:
         self.current_usage = min(self.current_usage, self.budget_bytes)
         return 0
 
+    def reset_stats(self):      # the real tier's; `forward` calls it at the boundary
+        pass
+
 
 def _fake_model(tier, planned=0, margin=0):
     from vaayu.vaayu_base import VaayuBaseModel
@@ -363,3 +366,206 @@ def test_forward_rebases_exactly_once_per_request(monkeypatch):
     for _ in range(3):
         _pass(1)
     assert len(rebases) == 2
+
+
+# ── D2 Task 5b: refund the re-base's cut at the next request's prefill ───────
+# The cut made at request N's boundary protects N's decode, but left in force it
+# starves request N+1's PREFILL -- the one phase that cannot afford a half-size
+# tier. Measured on MiniMax-M2.7 at 21,551 tokens (6 warm sessions, `d1-warm2`
+# against the pre-fix control `d1-base8c` at 8cbad32): warm TTFT 129.22 ->
+# 219.05 s mean (1.70x), budget-vs-TTFT Spearman -0.9856, misses-vs-bytes
+# r = 1.000, bytes-vs-TTFT r = 0.997, decode unaffected (0.6397 vs 0.6441).
+# Session 1 was unchanged at 0.97x -- the signature, since no cut exists yet.
+
+
+def test_refund_returns_its_own_cut_on_top_of_the_budget_as_it_stands(monkeypatch):
+    """RELATIVE, exactly as `_release_pool`'s refund is: another writer (the
+    decode-graph pool charge, an admission cap) may have lowered the budget
+    since the cut, and an absolute restore to the plan would hand back bytes the
+    card no longer has (S19 vi)."""
+    GiB = 1024 ** 3
+    tier = _FakeTier(usage=0, budget=1 * GiB - 500 * MiB)   # cut, then charged
+    calls = _patch_free(monkeypatch, free=8 * GiB)
+    m = _fake_model(tier=tier, planned=3 * GiB, margin=200 * MiB)
+    m._rebase_cut = 2 * GiB                                  # what the re-base took
+    new = m._refund_expert_tier()
+    assert new == 1 * GiB - 500 * MiB + 2 * GiB == tier.budget_bytes
+    assert tier.set_budget_calls == [new]
+    assert new != 3 * GiB                                    # NOT the plan: relative
+    assert m._rebase_cut == 0                                # consumed exactly once
+    # Nothing is measured and nothing is evicted: the refund only hands bytes back.
+    assert calls == {"empty_cache": 0, "mem_get_info": 0}
+    assert m._refund_expert_tier() is None                   # a second call refunds nothing
+    assert tier.set_budget_calls == [new]
+
+
+def test_refund_is_a_noop_with_no_outstanding_cut(monkeypatch):
+    GiB = 1024 ** 3
+    tier = _FakeTier(usage=0, budget=3 * GiB)
+    _patch_free(monkeypatch, free=8 * GiB)
+    m = _fake_model(tier=tier, planned=3 * GiB, margin=200 * MiB)
+    assert m._refund_expert_tier() is None
+    assert tier.set_budget_calls == []
+
+
+def test_refund_is_a_noop_without_a_tier(monkeypatch):       # dense
+    _patch_free(monkeypatch, free=8 * 1024 ** 3)
+    m = _fake_model(tier=None, planned=0, margin=200 * MiB)
+    m._rebase_cut = 2 * 1024 ** 3
+    assert m._refund_expert_tier() is None                   # and no AttributeError
+
+
+def test_refund_is_a_noop_without_cuda(monkeypatch):
+    GiB = 1024 ** 3
+    tier = _FakeTier(usage=0, budget=1 * GiB)
+    _patch_free(monkeypatch, free=8 * GiB)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    m = _fake_model(tier=tier, planned=3 * GiB, margin=200 * MiB)
+    m._rebase_cut = 2 * GiB
+    assert m._refund_expert_tier() is None
+    assert tier.set_budget_calls == []
+
+
+def test_refund_leaves_an_elastic_tier_alone(monkeypatch):
+    """The elastic tier sizes the budget per request through its own callback;
+    a refund from here would bypass it (same guard as the re-base's)."""
+    GiB = 1024 ** 3
+    tier = _FakeTier(usage=0, budget=1 * GiB)
+    _patch_free(monkeypatch, free=8 * GiB)
+    m = _fake_model(tier=tier, planned=3 * GiB, margin=200 * MiB)
+    m._rebase_cut = 2 * GiB
+    m._elastic_tier = object()
+    assert m._refund_expert_tier() is None
+    assert tier.set_budget_calls == [] and m._rebase_cut == 2 * GiB
+
+
+def test_forward_keeps_its_no_grad_guard_past_the_refund():
+    from vaayu.vaayu_base import VaayuBaseModel
+    assert hasattr(VaayuBaseModel.forward, "__wrapped__")
+    assert not hasattr(VaayuBaseModel._refund_expert_tier, "__wrapped__")
+
+
+def _forward_fake(monkeypatch, tier, planned, margin):
+    """A MagicMock `self` carrying the REAL re-base and refund methods, halted by
+    `_Stop` just past the reset block (see test_forward_rebases_exactly_once)."""
+    from unittest import mock
+    from vaayu.vaayu_base import VaayuBaseModel
+
+    fake = mock.MagicMock()
+    type(fake).prefetching = mock.PropertyMock(side_effect=_Stop)
+    fake.prefill_chunk_size = 0
+    fake.is_moe = True
+    fake.speculator = None
+    fake.draft_tokens = 0
+    fake._decode_stats_reset = False
+    fake._moe_blocks = []
+    fake._batch_decode_active = False
+    fake._chunk_major_lens = None
+    fake._elastic_tier = None
+    fake._active_attn_impl = "flash_attention_2"
+    fake.running_device = "cpu"
+    fake.running_dtype = torch.float32
+    fake.max_seq_len = 64
+    fake._position_ids_cache_key = None
+    fake._rope_cache_key = None
+    fake._token_count = 0
+    fake._expert_cache = mock.MagicMock()
+    fake.profiling_mode = False
+    fake._fwd_executor = mock.MagicMock()
+    fake.layers = []
+    fake._moe_shard_names_cache = (fake._moe_blocks, frozenset())
+    fake._expert_vram_cache = tier
+    fake._expert_tier_planned_budget = planned
+    fake._expert_tier_margin_bytes = margin
+    fake._rebase_cut = 0
+    fake._rebase_warned = False
+    fake._rebase_expert_tier = lambda: VaayuBaseModel._rebase_expert_tier(fake)
+    fake._refund_expert_tier = lambda: VaayuBaseModel._refund_expert_tier(fake)
+    monkeypatch.setattr(torch, "arange", lambda *a, **k: torch.zeros(1, 1, dtype=torch.long))
+
+    def _pass(n_tokens):
+        try:
+            VaayuBaseModel.forward(fake, input_ids=torch.zeros(1, n_tokens, dtype=torch.long))
+        except _Stop:
+            return tier.budget_bytes      # the budget IN FORCE for this pass's layers
+        raise AssertionError("forward did not reach the halt point")
+
+    return fake, _pass
+
+
+def test_forward_runs_the_next_requests_prefill_at_the_planned_budget(monkeypatch):
+    """The regression this task exists for. Request 1's boundary cuts the tier;
+    that cut must NOT still be in force when request 2's prefill runs. Asserts
+    on the budget observed INSIDE each forward pass, which is what the prefill's
+    expert reads actually see.
+
+    Fails three ways: delete the refund (request 2's prefill stays cut), refund
+    at the boundary instead (request 1's decode loses its protection), refund
+    absolutely (the budget would read `planned`, not plan-minus-other-writers)."""
+    GiB = 1024 ** 3
+    tier = _FakeTier(usage=0, budget=3 * GiB)
+    _patch_free(monkeypatch, free=2 * GiB)          # a long prefill spent the rest
+    fake, _pass = _forward_fake(monkeypatch, tier, planned=3 * GiB, margin=200 * MiB)
+    _cut_to = 2 * GiB - 200 * MiB                   # rebased_tier_budget's answer
+
+    assert _pass(8) == 3 * GiB                      # request 1 prefill: full plan
+    assert _pass(1) == _cut_to                      # the boundary pass cuts, mid-pass
+    assert fake._rebase_cut == 3 * GiB - _cut_to
+    for _ in range(3):
+        assert _pass(1) == _cut_to                  # decode keeps the protection
+    # Request 2's prefill: refunded BEFORE its layer loop reads an expert, so the
+    # budget the halt point observes is the full plan again.
+    assert _pass(8) == 3 * GiB
+    assert fake._rebase_cut == 0
+    assert _pass(8) == 3 * GiB                      # a later prefill pass: no second refund
+    assert tier.set_budget_calls == [_cut_to, 3 * GiB]
+
+
+def test_forward_refund_is_relative_to_another_writers_charge(monkeypatch):
+    """Same drive, but the decode-graph pool charges the tier between the cut and
+    the next prefill. The refund hands back ITS cut only -- an absolute
+    `set_budget(planned)` would hand back the pool's bytes too."""
+    GiB = 1024 ** 3
+    tier = _FakeTier(usage=0, budget=3 * GiB)
+    _patch_free(monkeypatch, free=2 * GiB)
+    fake, _pass = _forward_fake(monkeypatch, tier, planned=3 * GiB, margin=200 * MiB)
+    _cut_to = 2 * GiB - 200 * MiB
+
+    _pass(8)
+    _pass(1)                                        # the boundary cuts
+    assert tier.budget_bytes == _cut_to
+    tier.set_budget(tier.budget_bytes - 500 * MiB)  # the graph pool's charge
+    _pass(8)                                        # request 2's prefill refunds
+    assert tier.budget_bytes == 3 * GiB - 500 * MiB
+    assert tier.budget_bytes != 3 * GiB
+
+
+def test_forward_refunds_only_on_the_first_prefill_pass_of_a_request(monkeypatch):
+    """The hook, counted at the call rather than at its effect: a refund on a
+    LATER prefill pass of the same request is only harmless because
+    `_rebase_cut` is already 0. Pin the condition itself -- the latch, not just
+    the bookkeeping -- so `if self._moe_prefill_pass:` alone fails here."""
+    GiB = 1024 ** 3
+    tier = _FakeTier(usage=0, budget=3 * GiB)
+    _patch_free(monkeypatch, free=2 * GiB)
+    fake, _pass = _forward_fake(monkeypatch, tier, planned=3 * GiB, margin=200 * MiB)
+    from vaayu.vaayu_base import VaayuBaseModel
+    refunds = []
+
+    def _counted():
+        refunds.append(tier.budget_bytes)
+        return VaayuBaseModel._refund_expert_tier(fake)
+    fake._refund_expert_tier = _counted
+
+    _pass(8)                       # request 1's first prefill: no boundary crossed yet
+    _pass(8)                       # ...a second prefill pass of the SAME request
+    assert refunds == []
+    _pass(1)                       # the boundary
+    for _ in range(2):
+        _pass(1)
+    assert refunds == []           # never from a decode pass
+    _pass(8)                       # request 2: first prefill pass -> exactly one refund
+    assert len(refunds) == 1
+    _pass(8)                       # ...its second prefill pass must NOT call it again
+    _pass(8)
+    assert len(refunds) == 1

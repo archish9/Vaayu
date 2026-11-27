@@ -6091,6 +6091,48 @@ class VaayuBaseModel(GenerationMixin):
                   "nothing to evict, the tier stays at 0 for this request")
         return _new
 
+    def _refund_expert_tier(self) -> Optional[int]:
+        """D2: hand the re-base's outstanding cut back at the FIRST prefill pass
+        of a new request. Returns the budget set, or None when it did nothing
+        (no CUDA, no tier, an elastic tier, or nothing outstanding).
+
+        The cut `_rebase_expert_tier` makes at request N's prefill->decode
+        boundary protects N's decode, but left in force it is also the budget
+        request N+1's PREFILL runs under -- the one phase that cannot afford a
+        half-size tier, since prefill routes ~every expert and every miss is a
+        disk read. Measured on MiniMax-M2.7 at 21,551 tokens: refunding only at
+        the NEXT boundary (too late) cost warm TTFT 129.22 -> 219.05 s mean over
+        six sessions, with budget-vs-TTFT Spearman -0.9856 and
+        misses -> bytes -> TTFT r = 1.000 / 0.997; decode was unaffected.
+        Refunding here is `8cbad32`'s proven warm behaviour (full budget through
+        every prefill, 6/6 served over eighteen sessions) plus the cold
+        protection, since the boundary still cuts afterwards.
+
+        RELATIVE, like `_release_pool`'s refund (decode_graphs.py): on top of the
+        budget as it stands NOW, never an absolute `set_budget` to the plan --
+        another writer (the decode-graph pool charge, an admission cap) may have
+        lowered it since, and an absolute restore would hand back bytes the card
+        no longer has (S19 vi).
+
+        LIMITATION: a request with no prefill pass at all -- a 100% prefix hit
+        runs its single position as a DECODE pass -- never reaches this hook, so
+        a cut persists across it. Same latch limitation already recorded for the
+        re-base itself; not chased here."""
+        tier = getattr(self, "_expert_vram_cache", None)
+        _cut = int(getattr(self, "_rebase_cut", 0) or 0)
+        if (tier is None or _cut <= 0 or not torch.cuda.is_available()
+                or getattr(self, "_elastic_tier", None) is not None):
+            return None
+        _old = int(tier.budget_bytes)
+        _new = _old + _cut
+        tier.set_budget(_new)
+        self._rebase_cut = 0           # consumed: a second prefill refunds nothing
+        _mib = 1024.0 ** 2
+        print(f"[Vaayu-VRAM] tier refund: budget {_old / _mib:.0f} -> "
+              f"{_new / _mib:.0f} MiB (+{_cut / _mib:.0f} MiB the re-base took, "
+              f"returned for this request's prefill)")
+        return _new
+
     @torch.no_grad()
     def forward(
             self,
@@ -6358,11 +6400,19 @@ class VaayuBaseModel(GenerationMixin):
             # hit-rate telemetry excludes prefill's ~100%-miss pollution. (The old
             # guard here tested `_token_count == 0 and shape[1] == 1`, which is
             # unsatisfiable after prefill increments _token_count — it never ran.)
+            _already_reset = getattr(self, "_decode_stats_reset", False)
             _reset_now, self._decode_stats_reset = decode_stats_reset(
                 is_moe=self.is_moe,
                 has_expert_cache=self._expert_cache is not None,
                 is_prefill_pass=self._moe_prefill_pass,
-                already_reset=getattr(self, "_decode_stats_reset", False))
+                already_reset=_already_reset)
+            # D2: a prefill pass while the latch is still set is the FIRST prefill
+            # pass of a NEW request (the latch drops right here, and only a
+            # boundary crossing could have set it) -- so the outstanding re-base
+            # cut goes back BEFORE this prefill reads a single expert. Later
+            # prefill passes of the same request see `_already_reset` False.
+            if self._moe_prefill_pass and _already_reset:
+                self._refund_expert_tier()
             if _reset_now:
                 self._expert_cache.reset_stats()
                 if getattr(self, '_expert_vram_cache', None) is not None:
